@@ -1,15 +1,8 @@
-using System;
 using System.Text;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine.UI;
 
-// A single-line text input (P5.2) — UITK's TextField. Editable text with a caret, character insert,
-// backspace/delete, arrow-key caret movement, Home/End, and a blinking caret while focused. Built on the
-// P3 focus + keyboard + TextInput pipeline. Multiline + selection are layered on a single-line core.
-//
-// Renders via a child Label (the text) + a caret Panel positioned at the caret's pixel x. Value is the
-// edited string; ValueChanged fires on every edit. Password mode masks the displayed glyphs.
 public class TextField : VisualElement, INotifyValueChanged<string>, IPostLayout
 {
     readonly Label _textLabel;
@@ -22,7 +15,6 @@ public class TextField : VisualElement, INotifyValueChanged<string>, IPostLayout
 
     public event Action<string, string> ValueChanged;
 
-    // Placeholder shown (dimmed) when empty + not focused.
     public string Placeholder { get; set; } = "";
     public bool IsPassword { get; set; }
     public char MaskChar { get; set; } = '•';
@@ -80,7 +72,7 @@ public class TextField : VisualElement, INotifyValueChanged<string>, IPostLayout
 
     void OnChar(char c)
     {
-        if (char.IsControl(c)) return;            // control chars handled in OnKey
+        if (char.IsControl(c)) return;
         if (_sb.Length >= MaxLength) return;
         _sb.Insert(_caretIndex, c);
         _caretIndex++;
@@ -107,7 +99,6 @@ public class TextField : VisualElement, INotifyValueChanged<string>, IPostLayout
                 if (_multiline) { _sb.Insert(_caretIndex, '\n'); _caretIndex++; Commit(); }
                 e.Handled = true; break;
             case Keys.V when e.Ctrl:
-                // paste hook — host can push clipboard text via TextInput; nothing to do here
                 break;
         }
     }
@@ -140,7 +131,7 @@ public class TextField : VisualElement, INotifyValueChanged<string>, IPostLayout
     public void OnAfterLayout()
     {
         if (!IsFocused) { _caret.Style.Display = DisplayStyle.None; return; }
-        // Position the caret at the pixel x of _caretIndex within the text.
+
         var font = UIFonts.Resolve(Style.FontFamily);
         float x = Style.FontSize * 0.05f;
         if (font != null)
@@ -156,7 +147,6 @@ public class TextField : VisualElement, INotifyValueChanged<string>, IPostLayout
         _caret.Style.Display = DisplayStyle.Flex;
     }
 
-    // Drive the caret blink (host/document can call per frame; optional polish).
     public void Tick(float dt)
     {
         if (!IsFocused) return;

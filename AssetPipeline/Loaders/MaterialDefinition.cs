@@ -1,9 +1,5 @@
 namespace BallisticEngine.AssetPipeline.Loaders;
 
-// .mat asset: { "version": 1, "shader": "<.shader ref>", "textures": { "Diffuse": "<ref>", ... },
-//              "transparent": false, "opacity": 1.0, "emissiveColor": [r,g,b], "emissiveIntensity": 1.0 }
-// Texture keys are TextureType names. Read by MaterialLoader, written by ModelImporter when it
-// generates materials from a model's source materials.
 public sealed class MaterialDefinition {
     public int Version { get; set; } = 1;
     public string Shader { get; set; }
@@ -14,30 +10,17 @@ public sealed class MaterialDefinition {
     public float[] EmissiveColor { get; set; }
     public float EmissiveIntensity { get; set; } = 1f;
 
-    // Scalar PBR factors from the source material (glTF-style). null = unstated; the loader
-    // falls back to its defaults. BaseColor is a linear RGBA tint multiplying the albedo map.
     public float[] BaseColor { get; set; }
     public float? Metallic { get; set; }
     public float? Roughness { get; set; }
 
-    // Normal map controls. NormalFlipY: DirectX-convention maps (G points down) need the flip,
-    // OpenGL-convention maps don't. null = DirectX assumed (the common case for game content).
     public float? NormalStrength { get; set; }
     public bool? NormalFlipY { get; set; }
 
-    // Metallic texture is (occlusion, roughness, metallic) packed RGB (Falcor/glTF "Specular"
-    // maps). null = auto-detect from the texture's file name ("spec").
     public bool? PackedOrm { get; set; }
 
-    // Alpha-cutout (masked) material: pixels below 0.5 diffuse alpha are discarded and the
-    // surface renders double-sided (foliage cards, fences). null = auto-detect from the
-    // diffuse texture's file name.
     public bool? Cutout { get; set; }
 
-    // CUSTOM surface-shader property values (shader props declared with semantic None). Keyed by the
-    // declared property NAME (e.g. "_RimColor"). All nullable + omitted when empty so a Standard .mat
-    // serializes byte-identically. Floats are scalars; colors/vectors are [r,g,b(,a)]; textures are refs.
-    // Unstated → the shader's declared default (resolved in MaterialLoader, the default authority).
     public Dictionary<string, float> CustomFloats { get; set; }
     public Dictionary<string, float[]> CustomVectors { get; set; }
     public Dictionary<string, string> CustomTextures { get; set; }

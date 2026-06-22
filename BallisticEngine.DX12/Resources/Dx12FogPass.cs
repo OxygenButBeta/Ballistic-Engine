@@ -1,27 +1,11 @@
-using System;
-using System.Numerics;
 using System.Runtime.InteropServices;
-using Vortice.Direct3D;        // PrimitiveTopology
+using Vortice.Direct3D;
 using Vortice.Direct3D12;
-using Vortice.Dxc;             // DxcShaderStage
-using Vortice.DXGI;            // Format, SampleDescription
+using Vortice.Dxc;
+using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// Volumetric fog: march the air toward the camera (shadowed sun + sky in-scatter) → (scatter, transmittance),
-// then composite over the scene color as dest = dest*transmittance + scatter. Reads scene depth + the shadow
-// cascades as SRVs.
-//
-// HALF-RES (BALLISTIC_DX12_FOG_HALFRES, default ON): the expensive per-pixel march runs at HALF resolution into
-// `fogHalf`, then a depth-aware upsample + composite (PSCombine) writes the full-res result into `fogScene`,
-// copied back into the scene color — ~¼ the march cost. The composite reproduces the OLD fixed-function blend
-// exactly (scene*transmittance + scatter), so the only change is the march resolution. Templated on the SSR
-// half-res march + depth-aware upsample (Dx12ReflectionsPass / Ssr.hlsl).
-//
-// FOG_HALFRES=0 takes the LEGACY path: a single full-res march that blends in place via the old blend PSO
-// (byte-identical to before this change) — kept as an A/B reference + safety escape hatch.
-//
-// Event = Fog (550). Runs after AerialPerspective(400), before SSR/Reflections(600).
 public sealed class Dx12FogPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.Fog;
     public string Name => "Fog";
@@ -40,8 +24,6 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
     const int ShadowMapSize = 2048;
     const int CascadeCount = 4;
 
-    // BALLISTIC_DX12_FOG_HALFRES: default ON (half-res march + depth-aware upsample); "0" = legacy full-res
-    // in-place blend (byte-identical to pre-change). Read once at process scope.
     static bool? fogHalfRes;
     static bool FogHalfRes => fogHalfRes ??= Environment.GetEnvironmentVariable("BALLISTIC_DX12_FOG_HALFRES") != "0";
 
@@ -65,27 +47,25 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
 
     [StructLayout(LayoutKind.Sequential)]
     struct FogCombineConstants {
-        public Matrix4x4 InvProjection;   // transposed on upload
+        public Matrix4x4 InvProjection;
         public Vector2 HalfTexel; public Vector2 Pad;
     }
 
     readonly Dx12Device dev;
-    ID3D12RootSignature fogRootSig;     // FogConstants CBV (b0) + FogCombine CBV (b1) + 4-SRV table (t0..t3) + 2 samplers
-    ID3D12PipelineState fogBlendPso;    // legacy full-res in-place blend (FOG_HALFRES=0)
-    ID3D12PipelineState fogMarchPso;    // half-res opaque march → fogHalf
-    ID3D12PipelineState fogCombinePso;  // depth-aware upsample + composite → fogScene
-    Dx12FrameCb<FogConstants> fogCb;    // N-buffered, rewritten per frame (P0b frame overlap)
+    ID3D12RootSignature fogRootSig;
+    ID3D12PipelineState fogBlendPso;
+    ID3D12PipelineState fogMarchPso;
+    ID3D12PipelineState fogCombinePso;
+    Dx12FrameCb<FogConstants> fogCb;
     Dx12FrameCb<FogCombineConstants> fogCombineCb;
-    Dx12DescriptorHeap fogSrvVisible;   // ring: march range (4) + combine range (4)
+    Dx12DescriptorHeap fogSrvVisible;
 
-    Dx12OffscreenTarget fogHalf;        // half-res (scatter.rgb, transmittance.a)
-    Dx12OffscreenTarget fogScene;       // full-res scratch: combine writes here, copied back to the scene color
+    Dx12OffscreenTarget fogHalf;
+    Dx12OffscreenTarget fogScene;
     int renderW, renderH;
 
     public unsafe Dx12FogPass(Dx12Device device, int width, int height) {
         dev = device;
-        // FogConstants CBV (b0) + FogCombine CBV (b1) + a 4-SRV table (depth t0, shadow t1, scene t2, fogHalf t3)
-        // + linear (s0) and point (s1) samplers. The march binds t0/t1 (t2/t3 unused); the combine binds t0/t2/t3.
         var cbv0 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var cbv1 = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All);
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 4, baseShaderRegister: 0);
@@ -119,7 +99,6 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
                 DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
             });
 
-        // Legacy in-place blend: dest = dest * srcAlpha(transmittance) + src(scatter).
         var blend = BlendDescription.Opaque;
         var rt0 = blend.RenderTarget[0];
         rt0.BlendEnable = true;
@@ -131,9 +110,9 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
         rt0.BlendOperationAlpha = BlendOperation.Add;
         blend.RenderTarget[0] = rt0;
 
-        fogBlendPso = MakePso(psMarch, blend);                       // full-res, blends in place (legacy)
-        fogMarchPso = MakePso(psMarch, BlendDescription.Opaque);     // half-res, opaque write → fogHalf
-        fogCombinePso = MakePso(psCombine, BlendDescription.Opaque); // full-res depth-aware upsample → fogScene
+        fogBlendPso = MakePso(psMarch, blend);
+        fogMarchPso = MakePso(psMarch, BlendDescription.Opaque);
+        fogCombinePso = MakePso(psCombine, BlendDescription.Opaque);
 
         fogCb = new Dx12FrameCb<FogConstants>(dev);
         fogCombineCb = new Dx12FrameCb<FogCombineConstants>(dev);
@@ -193,11 +172,10 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
         };
         fogCb.Write(fc);
 
-        if (!ctx.BarriersDerived) gbuffer.DepthToShaderResource();   // head transition (R2): emit our own
+        if (!ctx.BarriersDerived) gbuffer.DepthToShaderResource();
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
 
         if (!FogHalfRes) {
-            // --- LEGACY full-res in-place blend (byte-identical to pre-change). t0 depth, t1 shadow. ---
             dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
             dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(1), shadowMap.SrvCpu, heapType);
             target.RenderColorOnly(cl => {
@@ -212,12 +190,10 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
             return;
         }
 
-        // --- HALF-RES march → fogHalf (opaque write; the march fills every pixel incl. sky → no clear needed). ---
-        // March range = slots 0..3 (depth t0, shadow t1, t2/t3 unused but the table needs 4 contiguous SRVs).
         dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(1), shadowMap.SrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(2), gbuffer.DepthSrvCpu, heapType);   // filler
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(3), gbuffer.DepthSrvCpu, heapType);   // filler
+        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(2), gbuffer.DepthSrvCpu, heapType);
+        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(3), gbuffer.DepthSrvCpu, heapType);
         fogHalf.RenderColorOnly(cl => {
             cl.SetGraphicsRootSignature(fogRootSig);
             cl.SetPipelineState(fogMarchPso);
@@ -228,17 +204,15 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
             cl.DrawInstanced(3, 1, 0, 0);
         });
 
-        // --- COMBINE: depth-aware upsample of fogHalf + composite over the scene color → fogScene. ---
         Matrix4x4.Invert(ctx.Proj, out Matrix4x4 invProj);
         fogCombineCb.Write(new FogCombineConstants {
             InvProjection = Matrix4x4.Transpose(invProj),
             HalfTexel = new Vector2(1f / fogHalf.Width, 1f / fogHalf.Height),
         });
         fogHalf.ColorToShaderResource();
-        target.ColorToShaderResource();   // scene color as an SRV input to the combine (idempotent head)
-        // Combine range = slots 4..7 (depth t0, shadow t1 filler, scene t2, fogHalf t3).
+        target.ColorToShaderResource();
         dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(4), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(5), shadowMap.SrvCpu, heapType);       // filler
+        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(5), shadowMap.SrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(6), target.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(7), fogHalf.ColorSrvCpu, heapType);
         fogScene.RenderColorOnly(cl => {
@@ -253,7 +227,7 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
         });
 
         fogScene.ColorToShaderResource();
-        target.CopyColorFrom(fogScene);   // composited scene replaces the scene color (SSR pattern)
+        target.CopyColorFrom(fogScene);
     }
 
     public void Dispose() {

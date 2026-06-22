@@ -1,22 +1,9 @@
-using System;
 using System.Reflection;
 
 namespace BallisticEngine.UI;
 
-// Data-binding (P7.2) — wires an INotifyValueChanged<T> control to a property on a data source, one-way
-// or two-way, so a control reflects + edits backing game state without hand-wiring every callback (UITK
-// parity: binding-path). Reflection resolves the property ONCE at bind time (cached MemberInfo), not per
-// frame, so it stays off the audit's "no reflection in the hot path" rule — binding is a setup-time act.
-//
-//   Binding.Bind(toggle, settings, nameof(Settings.Muted));            // two-way
-//   Binding.Bind(label,  player,   nameof(Player.Name), oneWay:true);  // one-way (display)
-//
-// For a plain Label (no INotifyValueChanged<string>) use BindText.
 public static class Binding
 {
-    // Two-way bind a value control to source.<path>. Pushes the current source value into the control,
-    // then keeps them in sync: control change -> source set; (if the source raises changes) you can call
-    // Refresh to pull. Returns an IDisposable to unbind.
     public static IDisposable Bind<T>(INotifyValueChanged<T> control, object source, string path, bool oneWay = false)
     {
         if (control == null || source == null || string.IsNullOrEmpty(path))
@@ -25,7 +12,6 @@ public static class Binding
         var accessor = PropertyAccessor.For(source.GetType(), path);
         if (accessor == null) return Noop.Instance;
 
-        // initial pull: source -> control (silent so we don't echo back)
         if (accessor.TryGet(source, out object v) && v is T tv)
             control.SetValueWithoutNotify(tv);
 
@@ -38,7 +24,6 @@ public static class Binding
         return new Unbinder<T>(control, onChange);
     }
 
-    // One-way bind a Label's text to source.<path> (ToString of the value). Pull via Refresh.
     public static LabelBinding BindText(Label label, object source, string path)
     {
         var accessor = PropertyAccessor.For(source.GetType(), path);
@@ -68,13 +53,11 @@ public static class Binding
     sealed class Noop : IDisposable { public static readonly Noop Instance = new(); public void Dispose() { } }
 }
 
-// Cached property/field accessor (reflection once, then delegate-free get/set via MemberInfo). Supports a
-// dotted path one level deep ("Stats.Health") for nested objects.
 sealed class PropertyAccessor
 {
     readonly PropertyInfo _prop;
     readonly FieldInfo _field;
-    readonly PropertyAccessor _next;   // for dotted paths
+    readonly PropertyAccessor _next;
 
     PropertyAccessor(PropertyInfo p, FieldInfo f, PropertyAccessor next) { _prop = p; _field = f; _next = next; }
 

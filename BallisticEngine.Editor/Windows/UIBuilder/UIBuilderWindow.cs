@@ -1,19 +1,7 @@
-using System;
-using System.Linq;
-using System.Numerics;
 using BallisticEngine.UI;
 
 namespace BallisticEngine.Editor;
 
-// The visual UI Builder — a Unity-UI-Builder-style window for designing in-game UI: a palette of element
-// types (left, drag-to-canvas/hierarchy or click-to-add), a WYSIWYG canvas rendered through the REAL engine
-// UI backend (center, zoom/pan + state preview), and an inspector + hierarchy + StyleSheet (USS) editor
-// (right). The authored tree saves to .uxml + .uss that the player loads with UxmlLoader + the USS cascade,
-// so what you design is byte-for-byte what ships.
-//
-// Discovered + shown via [EditorWindowMeta]. The body is pure IEditorGui. All panes operate on one
-// UIBuilderDocument (the authoritative tree + selection + rules + undo). Implements IDisposable so the host
-// can free the canvas RT + UiHeap slot on teardown / hot-reload (the resource-leak fix).
 [EditorWindowMeta("UI Builder", "Window/UI Builder", order: 150, Icon = EditorIcons.Grid, Width = 1180, Height = 720)]
 internal sealed class UIBuilderWindow : EditorWindow, IDisposable
 {
@@ -22,7 +10,7 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
     readonly UIBuilderStylePanel _stylePanel = new();
     UIBuilderCanvas _canvas;
 
-    VisualElement _clipboard;   // copy/paste (a detached clone's UXML text)
+    VisualElement _clipboard;
     string _clipboardUxml;
 
     static readonly (string label, string icon, Func<VisualElement> make)[] Palette =
@@ -38,7 +26,7 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         ("ScrollView",EditorIcons.Maximize,() => new ScrollView()),
         ("ProgressBar",EditorIcons.Refresh,() => new ProgressBar()),
     };
-    const string PalettePayload = "UIB_PALETTE";   // drag-drop payload type (the element label)
+    const string PalettePayload = "UIB_PALETTE";
 
     public UIBuilderWindow()
     {
@@ -70,7 +58,7 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
     }
 
     public override void OnEnable() => _canvas ??= new UIBuilderCanvas();
-    public override void OnDisable() { }   // keep canvas across hide/show; freed in Dispose (host teardown)
+    public override void OnDisable() { }
 
     public void Dispose() { _canvas?.Dispose(); _canvas = null; }
 
@@ -89,9 +77,6 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         if (canvasW < 200) canvasW = gui.ContentRegionAvail.X - paletteW - gui.ItemSpacing.X;
         float bodyH = gui.ContentRegionAvail.Y;
 
-        // ImGui asserts (imgui_widgets.cpp:791) when a child/widget is given a zero dimension —
-        // happens when the window is collapsed/too short and avail space rounds to 0. Floor every
-        // size we pass so the panel layout degrades gracefully instead of crashing.
         if (bodyH < 1f || paletteW < 1f || canvasW < 1f || inspectorW < 1f) return;
 
         gui.BeginChild("##palette", new Vector2(paletteW, bodyH), border: true);
@@ -101,10 +86,8 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
 
         gui.BeginChild("##canvas", new Vector2(canvasW, bodyH), border: true);
         _canvas.Draw(gui, _doc, gui.ContentRegionAvail);
-        // Canvas is a drop target for palette items — drop at the cursor, into the container under it.
         if (gui.BeginDragDropTarget())
         {
-            // While hovering with a palette drag, show where it will land.
             if (_dragPaletteLabel != null)
                 _canvas.DrawDropPreview(gui, _doc, gui.Input.MousePos);
             string type = gui.AcceptDragDropPayloadString(PalettePayload);
@@ -126,7 +109,6 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         DrawUnsavedPrompt(gui);
     }
 
-    // ---- toolbar -------------------------------------------------------------
     void DrawToolbar(IEditorGui gui)
     {
         if (gui.SmallButton($"{EditorIcons.Add} New")) RequestNew();
@@ -157,7 +139,7 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         gui.SameLine(); gui.TextDisabled("x"); gui.SameLine();
         gui.SetNextItemWidth(60 * scale);
         if (gui.DragInt("##ch", ref h)) { _doc.CanvasHeight = Math.Clamp(h, 16, 4096); SyncRootSize(); }
-        // resolution presets
+
         gui.SameLine();
         if (gui.BeginCombo("##res", "Preset"))
         {
@@ -185,11 +167,10 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
     {
         _doc.Root.Style.Width = Length.Points(_doc.CanvasWidth);
         _doc.Root.Style.Height = Length.Points(_doc.CanvasHeight);
-        _doc.SyncInline(_doc.Root);   // persist into the root's inline store so the next resolve keeps it
+        _doc.SyncInline(_doc.Root);
         _doc.MarkDirty();
     }
 
-    // ---- keyboard shortcuts (Delete / Ctrl-D / Ctrl-C/V / arrows nudge) ------
     void HandleShortcuts(IEditorGui gui)
     {
         if (!gui.IsWindowFocusedIncludingChildren() || gui.WantTextInput) return;
@@ -202,7 +183,6 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.V) && _clipboardUxml != null)
             PasteClipboard();
 
-        // arrow nudge (absolute position; 1px, 10px with shift)
         if (sel != null && sel != _doc.Root)
         {
             float step = gui.KeyShift ? 10f : 1f;
@@ -232,8 +212,7 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         _doc.AddElement(parent, clone);
     }
 
-    // ---- palette (DRAG onto the canvas to place; double-click = quick add to center) ----------------------
-    string _dragPaletteLabel;   // the label of the palette item currently being dragged (for the drop preview)
+    string _dragPaletteLabel;
 
     void DrawPalette(IEditorGui gui)
     {
@@ -245,7 +224,6 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         foreach (var (label, icon, _) in Palette)
         {
             gui.Selectable($"{icon}  {label}");
-            // Double-click = quick-add to the canvas center (no precise placement needed).
             if (gui.IsMouseDoubleClicked(0) && gui.IsItemHovered())
                 DropPaletteAtCenter(label);
             if (gui.BeginDragDropSource())
@@ -257,7 +235,7 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
                 gui.EndDragDropSource();
             }
         }
-        if (!anyDragging) _dragPaletteLabel = null;   // drag ended / none active
+        if (!anyDragging) _dragPaletteLabel = null;
 
         gui.Spacing(); gui.Separator();
         gui.PushFont(EditorFont.Bold); gui.Text("Selection"); gui.PopFont();
@@ -270,11 +248,10 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
 
     static VisualElement MakeElement(string label) => Palette.First(p => p.label == label).make();
 
-    // Drop a dragged palette item at the cursor: into the container under it, absolutely positioned there.
     void DropPaletteOnCanvas(IEditorGui gui, string label)
     {
         if (!_canvas.TryDropTarget(gui.Input.MousePos, _doc, out var pt, out var parent))
-            parent = _doc.Root;   // dropped outside the canvas image → into the root at... center-ish
+            parent = _doc.Root;
         var el = MakeElement(label);
         SizeDefault(el);
         if (parent != null && _canvas.TryDropTarget(gui.Input.MousePos, _doc, out pt, out parent))
@@ -301,7 +278,6 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
 
     static bool IsLeaf(VisualElement el) => el is Label or Image or Slider or ProgressBar or Toggle;
 
-    // ---- hierarchy (select + drag-reorder/reparent) --------------------------
     void DrawHierarchy(IEditorGui gui)
     {
         gui.PushFont(EditorFont.Bold); gui.Text("Hierarchy"); gui.PopFont();
@@ -340,7 +316,6 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         gui.PopId();
     }
 
-    // Drag a hierarchy row as a source; drop onto another row to reparent (as a child, appended).
     void HierarchyDragDrop(IEditorGui gui, VisualElement el)
     {
         if (el != _doc.Root && gui.BeginDragDropSource())
@@ -355,7 +330,6 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
             int? h = gui.AcceptDragDropPayloadInt("UIB_NODE");
             if (h.HasValue && _dragNode != null && _dragNode != el)
                 _doc.Reparent(_dragNode, el, el.ChildCount);
-            // palette drop onto a hierarchy row → add as child
             string pal = gui.AcceptDragDropPayloadString(PalettePayload);
             if (pal != null) { var ne = MakeElement(pal); SizeDefault(ne); _doc.AddElement(el, ne); }
             gui.EndDragDropTarget();
@@ -370,7 +344,6 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         if (el is Panel) el.Style.BackgroundColor = new Color(0.25f, 0.27f, 0.32f, 1f);
     }
 
-    // ---- file ops + unsaved-changes guard ------------------------------------
     Action _pendingAfterPrompt;
 
     void RequestNew() => GuardUnsaved(() => _doc.NewDocument());
@@ -412,8 +385,6 @@ internal sealed class UIBuilderWindow : EditorWindow, IDisposable
         _doc.Save();
     }
 
-    // Save-As: pick a folder natively, then prompt for the filename via a modal (no IFileSaveDialog COM,
-    // which is vtable-fragile — folder pick + in-editor name field is crash-safe and gives naming control).
     string _saveDir, _saveName = "NewUI";
     bool _wantSaveAs;
     void OpenSaveAs()

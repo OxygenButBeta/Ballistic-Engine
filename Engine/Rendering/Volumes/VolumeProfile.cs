@@ -1,8 +1,5 @@
 namespace BallisticEngine;
 
-// A shareable set of VolumeComponents (Unity's VolumeProfile). Lives as a `.volume` JSON asset
-// loaded through AssetDatabase, so Volume.Profile serializes as a guid ref and several scenes /
-// volumes can share one grade. At most one component of each type.
 public sealed class VolumeProfile : BObject {
     readonly List<VolumeComponent> components = new();
 

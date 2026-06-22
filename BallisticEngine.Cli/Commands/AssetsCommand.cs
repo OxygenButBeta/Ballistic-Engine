@@ -2,10 +2,6 @@ using BallisticEngine.AssetPipeline;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal assets <action>` — GL-free asset-database queries over the .meta sidecars and text assets
-// (no import, no engine boot). The reverse-reference query is the agent's "what breaks if I touch
-// this" map: it scans every text asset (.scene/.mat/.volume/.cubemap/.shader/.asset/.prefab and
-// project.json) for both the guid: form and the path form of a reference.
 internal sealed class AssetsCommand : ICommand {
     public string Name => "assets";
     public string Summary => "Query assets: resolve path<->guid, reverse refs, list.";
@@ -17,7 +13,6 @@ internal sealed class AssetsCommand : ICommand {
           list    <project> [--ext .obj] [--folder Assets/Sub]     all assets with guids
         """;
 
-    // Text formats that can contain asset references.
     static readonly string[] RefBearingExtensions =
         [".scene", ".mat", ".volume", ".cubemap", ".shader", ".asset", ".prefab"];
 
@@ -35,8 +30,6 @@ internal sealed class AssetsCommand : ICommand {
         };
     }
 
-    // ---- resolve --------------------------------------------------------------
-
     static int Resolve(string root, string[] args) {
         if (args.Length != 1) throw new CliUsageException("resolve needs one asset reference");
         (string path, Guid guid, string? importer) = ResolveReference(root, args[0]);
@@ -44,7 +37,6 @@ internal sealed class AssetsCommand : ICommand {
         return 0;
     }
 
-    // "Assets/..." (load its .meta directly), "guid:<hex>" or bare 32-hex (scan the .meta files).
     static (string path, Guid guid, string? importer) ResolveReference(string root, string reference) {
         string assetsRoot = Path.Combine(root, "Assets");
 
@@ -69,20 +61,16 @@ internal sealed class AssetsCommand : ICommand {
         return (norm, m.Guid, m.Importer);
     }
 
-    // ---- refs -----------------------------------------------------------------
-
     static int Refs(string root, string[] args) {
         if (args.Length != 1) throw new CliUsageException("refs needs one asset reference");
 
-        // A guid that no longer resolves is still searchable — that's the broken-ref hunt
-        // ("what references the asset I deleted?"), so don't require resolution for guid form.
         string? path;
         Guid guid;
         if (AssetRef.IsGuidRef(args[0], out Guid wanted) ||
             (args[0].Length == 32 && Guid.TryParseExact(args[0], "N", out wanted))) {
             guid = wanted;
             try { (path, _, _) = ResolveReference(root, args[0]); }
-            catch { path = null; } // searching for a dangling guid is the point
+            catch { path = null; }
         }
         else {
             (path, guid, _) = ResolveReference(root, args[0]);
@@ -102,7 +90,6 @@ internal sealed class AssetsCommand : ICommand {
             if (guidHits + pathHits == 0) continue;
 
             string rel = Path.GetRelativePath(root, file).Replace('\\', '/');
-            // Skip the asset file itself; everything else (including generated siblings) counts.
             if (string.Equals(rel, path, StringComparison.OrdinalIgnoreCase)) continue;
 
             var via = new List<string>();
@@ -140,8 +127,6 @@ internal sealed class AssetsCommand : ICommand {
             yield return manifest;
     }
 
-    // ---- list -----------------------------------------------------------------
-
     static int List(string root, string[] args) {
         string? ext = null, folder = null;
         for (int i = 0; i < args.Length; i++) {
@@ -164,15 +149,14 @@ internal sealed class AssetsCommand : ICommand {
         return 0;
     }
 
-    // ---- shared (MapCommand also scans the sidecars) ---------------------------
-
     internal static IEnumerable<(string assetPath, MetaFile meta)> EnumerateMetas(string root) {
         string assetsRoot = Path.Combine(root, "Assets");
         if (!Directory.Exists(assetsRoot)) yield break;
         foreach (string metaPath in Directory.EnumerateFiles(assetsRoot, "*.meta", SearchOption.AllDirectories)) {
             MetaFile? meta;
             try { meta = MetaFile.Load(metaPath); }
-            catch { continue; } // a corrupt sidecar shouldn't kill a query; validate flags those
+            catch { continue; }
+
             if (meta is null) continue;
             string rel = Path.GetRelativePath(root, metaPath[..^".meta".Length]).Replace('\\', '/');
             yield return (rel, meta);

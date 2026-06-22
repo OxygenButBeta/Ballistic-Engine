@@ -2,24 +2,11 @@ using System.Text.Json;
 
 namespace BallisticEngine.AssetPipeline.Loaders;
 
-// .volume <-> VolumeProfile. Load builds the runtime profile from the JSON definition
-// (unknown components warn and are skipped; unknown/missing parameters keep defaults).
-// Save is the editor's write-back path: because AssetDatabase caches the loaded instance,
-// the inspector edits the live profile and persists it here in one step.
 public static class VolumeProfileLoader {
-    // Renamed volume components: profiles saved under the old name keep loading (and write
-    // back the new name on the next editor save).
     static readonly Dictionary<string, string> LegacyTypeNames = new() {
-        ["VolumetricLight"] = "VolumetricFog",
-        // The Lumen V2 GI volume was renamed to GiVolume when the world-space DDGI rewrite replaced it. A
-        // profile saved under the old "GlobalIllumination" type still loads → its shared dials (enabled,
-        // intensity, skyIntensity, multiBounce, aoStrength, quality) carry over by name; the Lumen-only fields
-        // (rayCount/probeOct/cardBudget/denoisePasses) simply drop (no slot to feed). Next Save persists GiVolume.
-        ["GlobalIllumination"] = "GiVolume",
+        ["VolumetricLight"] = "VolumetricFog", ["GlobalIllumination"] = "GiVolume",
     };
 
-    // Per-old-type parameter renames (none currently — the GI-consolidation renames were dropped with the
-    // legacy GI volumes). Kept as the extension point for future component renames.
     static readonly Dictionary<string, Dictionary<string, string>> LegacyParameterNames = new();
 
     public static VolumeProfile Load(BallisticProject project, string assetPath) {
@@ -30,11 +17,6 @@ public static class VolumeProfileLoader {
         }
         var profile = new VolumeProfile { Name = Path.GetFileNameWithoutExtension(assetPath) };
 
-        // MIGRATION (legacy GI stack → Lumen V2): reflections used to live INSIDE the GlobalIllumination
-        // component as `reflectionsMode`/`reflectionsIntensity`; they were split into the standalone
-        // `Reflections` component. A profile saved under the old shape has NO Reflections block, so its
-        // reflections override silently did nothing (the bridge gates `SsrEnabled` on the missing component).
-        // Carry the old fields out into a synthesized Reflections component below.
         ReflectionMode? legacyReflMode = null;
         float? legacyReflIntensity = null;
 
@@ -57,19 +39,14 @@ public static class VolumeProfileLoader {
 
             bool alreadyPresent = profile.Has(type);
             VolumeComponent component = profile.Add(type);
-            // A merge target (two old types → one new, e.g. SSGI + SSR → GlobalIllumination) stays active
-            // if EITHER source was active; a fresh component takes its source's Active straight.
             component.Active = alreadyPresent ? component.Active || componentDef.Active : componentDef.Active;
 
             if (componentDef.Parameters is null)
                 continue;
 
-            // Old-name → new-field renames for this on-disk type (GI consolidation); empty for the rest.
             LegacyParameterNames.TryGetValue(componentDef.Type, out Dictionary<string, string> paramRenames);
 
             foreach (VolumeComponent.ParameterSlot slot in component.Parameters) {
-                // Find the file key that feeds this slot: the renamed old name if one maps here, else the
-                // slot's own name. (A merge skips slots a source doesn't carry — its keys stay default.)
                 string fileKey = slot.Name;
                 if (paramRenames is not null)
                     foreach (var (oldName, newName) in paramRenames)
@@ -83,10 +60,6 @@ public static class VolumeProfileLoader {
             }
         }
 
-        // Finish the legacy-reflections migration: synthesize a Reflections component from the old
-        // GlobalIllumination.reflections* fields when the profile didn't already carry its own. Only when the
-        // old fields were actually present (so untouched/new profiles are byte-identical). The next editor Save
-        // persists the new shape and drops the stale GI fields.
         if ((legacyReflMode is not null || legacyReflIntensity is not null) && !profile.Has(typeof(Reflections))) {
             var refl = (Reflections)profile.Add(typeof(Reflections));
             if (legacyReflMode is { } m) { refl.mode.Value = m; refl.mode.Overridden = true; }
@@ -118,8 +91,6 @@ public static class VolumeProfileLoader {
         PipelineJson.Write(absolutePath, definition);
     }
 
-    // Subtype order matters: Clamped* derive from their base parameters, Color from Vector3 —
-    // matching the base class catches the whole family.
     static void ApplyValue(VolumeParameter parameter, JsonElement value, string assetPath, string name) {
         try {
             switch (parameter) {

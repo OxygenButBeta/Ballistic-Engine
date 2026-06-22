@@ -3,10 +3,6 @@ using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// DX12 cubemap (the engine's Texture3D = an environment cube, used by skybox + IBL). Uploads 6 faces
-// (+X,-X,+Y,-Y,+Z,-Z) into a TextureCube and creates a persistent cube SRV. Not on the Phase 2d minimal
-// opaque path (sky/IBL come later), but wired so CreateCubemap returns a real resource and the IBL phase
-// has its upload path ready. Faces are RGBA32F (HDR sky) or RGBA8.
 public sealed class Dx12Texture3D : Texture3D {
     public override int UID { get; protected set; }
     static int nextId = 1;
@@ -21,10 +17,8 @@ public sealed class Dx12Texture3D : Texture3D {
         Type = TextureType.SkyBox;
     }
 
-    // Public entry for the factory (UploadFaces is protected from this assembly — see Dx12Texture2D).
     public void UploadFacesPublic(TextureData[] faces) => UploadFaces(faces);
 
-    // `protected` (not `protected internal`): cross-assembly override rule (see Dx12Texture2D.Upload).
     protected override unsafe void UploadFaces(TextureData[] faces) {
         if (faces is null || faces.Length != 6 || !faces[0].IsValid)
             return;
@@ -37,7 +31,6 @@ public sealed class Dx12Texture3D : Texture3D {
             HeapProperties.DefaultHeapProperties, HeapFlags.None, desc, ResourceStates.CopyDest);
         resource.Name = $"Cube#{UID}";
 
-        // Footprints for all 6 subresources (one mip each).
         var footprints = new PlacedSubresourceFootPrint[6];
         var rowCounts = new uint[6];
         var rowSizes = new ulong[6];

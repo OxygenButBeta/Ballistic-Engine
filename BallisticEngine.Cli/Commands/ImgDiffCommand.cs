@@ -2,13 +2,6 @@ using System.Globalization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal imgdiff <a.bmp> <b.bmp>` — perceptual image comparison for the engine's own screenshots.
-// Per-pixel redmean color distance (a cheap perceptual weighting) after a 3x3 box prefilter that
-// absorbs one-pixel antialiasing shimmer, pooled into the DUAL budgets golden-image practice
-// needs: a global mean (overall drift) AND a windowed hotspot max (a small but broken region must
-// not hide in the average — Unreal's MaximumLocalError precedent). Optional heatmap BMP shows
-// WHERE the difference is — agents reason about the heatmap in one look instead of eyeballing
-// two screenshots.
 internal sealed class ImgDiffCommand : ICommand {
     public string Name => "imgdiff";
     public string Summary => "Perceptual diff of two BMP screenshots (+ heatmap).";
@@ -21,8 +14,8 @@ internal sealed class ImgDiffCommand : ICommand {
           --no-blur      skip the 3x3 antialiasing prefilter (exact per-pixel comparison)
         """;
 
-    const int HotspotBlock = 32;     // hotspot = worst mean error over any 32x32 block
-    const double VisibleThreshold = 0.05; // a pixel counts as "different" above this
+    const int HotspotBlock = 32;
+    const double VisibleThreshold = 0.05;
 
     public int Run(string[] args) {
         string? pathA = null, pathB = null, outPath = null;
@@ -48,7 +41,6 @@ internal sealed class ImgDiffCommand : ICommand {
         if (wa != wb || ha != hb)
             throw new Exception($"image sizes differ: {wa}x{ha} vs {wb}x{hb}");
 
-        // Byte-identical shortcut (the deterministic-capture common case).
         if (a.AsSpan().SequenceEqual(b)) {
             Json.Write(new {
                 identical = true, width = wa, height = ha,
@@ -62,7 +54,6 @@ internal sealed class ImgDiffCommand : ICommand {
             b = BoxBlur3(b, wa, ha);
         }
 
-        // Per-pixel redmean distance, normalized to 0..1.
         var error = new double[wa * ha];
         double sum = 0, max = 0;
         int differentPixels = 0;
@@ -70,7 +61,7 @@ internal sealed class ImgDiffCommand : ICommand {
             double bd = a[p] - b[p], gd = a[p + 1] - b[p + 1], rd = a[p + 2] - b[p + 2];
             double rMean = (a[p + 2] + b[p + 2]) * 0.5;
             double d = Math.Sqrt((2 + rMean / 256.0) * rd * rd + 4 * gd * gd + (2 + (255 - rMean) / 256.0) * bd * bd)
-                       / 764.83; // max possible redmean distance -> 0..1
+                       / 764.83;
             error[i] = d;
             sum += d;
             if (d > max) max = d;
@@ -78,7 +69,6 @@ internal sealed class ImgDiffCommand : ICommand {
         }
         double mean = sum / error.Length;
 
-        // Hotspot: worst block mean (catches a small broken region the global mean dilutes).
         double hotspot = 0;
         for (int by = 0; by < ha; by += HotspotBlock)
             for (int bx = 0; bx < wa; bx += HotspotBlock) {
@@ -111,8 +101,6 @@ internal sealed class ImgDiffCommand : ICommand {
         return failed ? 1 : 0;
     }
 
-    // 3x3 box filter per channel — absorbs the single-pixel edge shimmer that plagues raw
-    // pixel comparison without hiding real differences.
     static byte[] BoxBlur3(byte[] src, int width, int height) {
         var dst = new byte[src.Length];
         int rowBytes = width * 3;
@@ -135,8 +123,6 @@ internal sealed class ImgDiffCommand : ICommand {
         return dst;
     }
 
-    // Black -> red -> yellow -> white ramp; errors are amplified (x8, clamped) so subtle
-    // differences are visible at a glance.
     static void WriteHeatmap(string path, int width, int height, double[] error) {
         var pixels = new byte[width * height * 3];
         for (int i = 0; i < error.Length; i++) {

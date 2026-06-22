@@ -2,16 +2,8 @@ using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
 
-// Deterministic input playback for headless simulation: a timeline of [from, to) step intervals
-// per key/button/axis, indexed by the host's fixed step counter (bal simulate advances
-// CurrentStep before each UpdateFrame). Same input script + same scene = same run, every time —
-// the replay half of input record/replay, and the way an agent "plays" the game in a test:
-// hold W for two seconds, jump at step 30, assert the position numerically afterwards.
-//
-// Edge semantics mirror the live providers: IsKeyDown = the interval covers this step;
-// IsKeyPressed = covered now but not on the previous step.
 public sealed class ScriptedInput : IInputProvider {
-    readonly record struct Span(int From, int To); // [From, To) in fixed steps
+    readonly record struct Span(int From, int To);
 
     readonly Dictionary<Keys, List<Span>> keys = new();
     readonly Dictionary<MouseButton, List<Span>> buttons = new();

@@ -1,7 +1,3 @@
-using System;
-using System.Collections.Generic;
-using System.Threading;
-
 namespace Facebook.Yoga
 {
     public enum LayoutType
@@ -103,7 +99,6 @@ namespace Facebook.Yoga
                 return _data as T;
             }
 
-            // Legacy method kept for backward compatibility
             public TypedData<T> Get<T>() where T : EventTypedDataBase, new()
             {
                 if (_data is TypedData<T> typedData)
@@ -238,7 +233,6 @@ namespace Facebook.Yoga
                 int subscriberCount = _subscribers.Count;
                 if (subscriberCount == 0) return;
 
-                // Reuse thread-local buffer to avoid per-call allocation
                 buffer = t_subscriberBuffer ?? Array.Empty<Subscriber>();
                 if (buffer.Length < subscriberCount)
                 {
@@ -264,11 +258,9 @@ namespace Facebook.Yoga
                 }
                 catch
                 {
-                    // Swallow exceptions to match C++ behavior
                 }
             }
 
-            // Clear references to avoid leaking
             Array.Clear(buffer, 0, count);
         }
 
@@ -285,7 +277,7 @@ namespace Facebook.Yoga
             if (typeof(T) == typeof(NodeLayoutData))
                 return EventType.NodeLayout;
             
-            return EventType.NodeAllocation; // Default
+            return EventType.NodeAllocation;
         }
     }
 }

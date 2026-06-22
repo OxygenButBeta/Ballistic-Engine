@@ -1,8 +1,5 @@
 namespace BallisticEngine;
 
-// Maps the blended VolumeStack onto the renderer's live PostProcessSettings each frame.
-// This is the ONLY seam between the generic volume framework and the GL pipeline's flat
-// settings object — new VolumeComponents extend this mapping, nothing else.
 public static class VolumePostProcessing {
     public static void Apply(VolumeStack stack, PostProcessSettings fx) {
         if (stack.GetComponent<Exposure>() is { } exposure) {
@@ -80,9 +77,6 @@ public static class VolumePostProcessing {
             fx.VolumetricTint = volumetric.tint.Value;
         }
 
-        // VolumetricLighting supersedes VolumetricFog: same physical fog (reuses the fx.Volumetric* fields the
-        // fog pass already consumes) PLUS the independent god-ray and dust layers. Applied AFTER the legacy
-        // VolumetricFog block so when both somehow coexist in a profile, the unified override wins.
         if (stack.GetComponent<VolumetricLighting>() is { } vlit) {
             fx.VolumetricEnabled = vlit.enabled.Value;
             fx.VolumetricIntensity = vlit.intensity.Value;
@@ -123,10 +117,6 @@ public static class VolumePostProcessing {
             fx.DdgiAoStrength = gi.aoStrength.Value;
             fx.DdgiDebugProbes = gi.debugProbes.Value;
             fx.DdgiDebugRawIndirect = gi.debugRawIndirect.Value;
-            // Probe-grid bounds: SceneAuto (default) leaves Center/Extent zero → backend fits the scene AABB.
-            // Volume mode pulls the dominant GI volume's world box; a global volume (no box) leaves extent 0 →
-            // backend falls back to SceneAuto. The box is geometry, so it comes from VolumeManager (the blend
-            // stack can't carry it), not from the blended GiVolume component.
             fx.DdgiBoundsMode = (int)gi.boundsMode.Value;
             fx.DdgiBoundsCenter = default;
             fx.DdgiBoundsExtent = default;
@@ -136,12 +126,12 @@ public static class VolumePostProcessing {
                 fx.DdgiBoundsCenter = boxCenter;
                 fx.DdgiBoundsExtent = boxHalf;
             }
-            // Quality tier → probe grid resolution. Custom honours the per-axis counts.
+
             switch (gi.quality.Value) {
                 case GiQuality.High:        fx.DdgiGridX = 24; fx.DdgiGridY = 12; fx.DdgiGridZ = 24; break;
                 case GiQuality.Balanced:    fx.DdgiGridX = 16; fx.DdgiGridY = 8;  fx.DdgiGridZ = 16; break;
                 case GiQuality.Performance: fx.DdgiGridX = 10; fx.DdgiGridY = 6;  fx.DdgiGridZ = 10; break;
-                default: // Custom
+                default:
                     fx.DdgiGridX = gi.gridX.Value;
                     fx.DdgiGridY = gi.gridY.Value;
                     fx.DdgiGridZ = gi.gridZ.Value;
@@ -150,8 +140,6 @@ public static class VolumePostProcessing {
         }
 
         if (stack.GetComponent<Reflections>() is { } refl) {
-            // The mode dropdown IS the master gate: Off → SsrEnabled false (pass skipped); otherwise the
-            // technique enum picks SSR vs RT inside the pass. sampleRadianceCache only matters in RayTraced mode.
             fx.ReflectionMode = refl.mode.Value;
             fx.SsrEnabled = refl.mode.Value != ReflectionMode.Off;
             fx.SsrIntensity = refl.intensity.Value;

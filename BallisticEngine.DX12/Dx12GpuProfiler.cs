@@ -1,43 +1,28 @@
-using System;
-using System.Collections.Generic;
 using Vortice.Direct3D12;
 
 namespace BallisticEngine.DX12;
 
-// PIPELINED per-pass GPU timing (BALLISTIC_DX12_GPU_PROFILE=1). Unlike the legacy GpuTimerBegin/End (which
-// submits + WaitForGpu around every marker → serialises the whole frame, inflating every reading), this writes
-// timestamp queries INLINE into the open frame command list — zero extra submits, the frame stays fully
-// pipelined. ResolveQueryData is appended at EndFrame; the resolved ticks are read back N frames later (when the
-// GPU has surely passed them), so a reading is a few frames stale but otherwise the REAL GPU duration of each
-// pass as it runs in the shipping pipelined frame. This is the profiler the inline passes (geometry, shadows,
-// deferred, sky, IBL, aerial) lacked — the graph post-passes had TimePass, but those are recorded outside it.
-//
-// Usage: Begin(cl, "Name") ... End(cl) bracket a pass's commands in the frame list. Marks nest by pairing in
-// order (a flat stack per frame). At EndFrame the renderer calls ResolveInto(cl); the device readback +
-// Report() print the per-pass ms once the frame retires.
 public sealed class Dx12GpuProfiler : IDisposable {
     readonly Dx12Device dev;
     readonly bool enabled;
     public bool Enabled => enabled;
 
-    // Ring of N frames' worth of query data so a readback never reads a slot the GPU might still be writing.
     const int RingFrames = 3;
-    const int MaxMarks = 64;             // up to 64 begin/end PAIRS per frame
+    const int MaxMarks = 64;
     const int SlotsPerFrame = MaxMarks * 2;
 
-    ID3D12QueryHeap heap;                // [RingFrames * SlotsPerFrame] timestamp queries
-    ID3D12Resource readback;            // RingFrames * SlotsPerFrame ulong, CPU-readable
-    ulong frequency;                     // ticks/sec on the queue
+    ID3D12QueryHeap heap;
+    ID3D12Resource readback;
+    ulong frequency;
     bool avail;
 
-    // Per-frame recording state (the frame currently being recorded into the open frame list).
     readonly string[] names = new string[MaxMarks];
-    int markCount;                       // begin/end pairs recorded this frame
-    int ringIndex;                       // which ring frame this recording uses
-    readonly int[] pendingResolveRing = new int[RingFrames];   // ring index pending readback, by retire order
-    readonly int[] pendingResolveCount = new int[RingFrames];  // mark count for each pending ring frame
-    readonly ulong[] pendingFence = new ulong[RingFrames];     // frameFence target that retires each pending frame
-    int pendingHead, pendingTail;        // queue of frames awaiting readback
+    int markCount;
+    int ringIndex;
+    readonly int[] pendingResolveRing = new int[RingFrames];
+    readonly int[] pendingResolveCount = new int[RingFrames];
+    readonly ulong[] pendingFence = new ulong[RingFrames];
+    int pendingHead, pendingTail;
 
     public Dx12GpuProfiler(Dx12Device dev) {
         this.dev = dev;
@@ -53,30 +38,26 @@ public sealed class Dx12GpuProfiler : IDisposable {
         } catch { avail = false; }
     }
 
-    // Called at BeginFrame: pick this frame's ring slot and reset the per-frame mark list.
     public void BeginFrame(int frameCounter) {
         if (!avail) return;
         ringIndex = frameCounter % RingFrames;
         markCount = 0;
     }
 
-    // Bracket a pass. Begin writes the start timestamp, End the stop — both into the OPEN frame list, no submit.
     public void Begin(ID3D12GraphicsCommandList4 cl, string name) {
         if (!avail || markCount >= MaxMarks) return;
         names[markCount] = name;
         int slot = ringIndex * SlotsPerFrame + markCount * 2;
-        cl.EndQuery(heap, QueryType.Timestamp, (uint)slot);   // "begin" timestamp
+        cl.EndQuery(heap, QueryType.Timestamp, (uint)slot);
     }
 
     public void End(ID3D12GraphicsCommandList4 cl) {
         if (!avail || markCount >= MaxMarks) return;
         int slot = ringIndex * SlotsPerFrame + markCount * 2 + 1;
-        cl.EndQuery(heap, QueryType.Timestamp, (uint)slot);   // "end" timestamp
+        cl.EndQuery(heap, QueryType.Timestamp, (uint)slot);
         markCount++;
     }
 
-    // Called at EndFrame BEFORE the frame list closes: resolve THIS frame's queries into the readback buffer, and
-    // enqueue it for readback once `fenceTarget` (the value EndFrame signals) retires.
     public void ResolveInto(ID3D12GraphicsCommandList4 cl, ulong fenceTarget) {
         if (!avail || markCount == 0) return;
         int baseSlot = ringIndex * SlotsPerFrame;
@@ -86,7 +67,6 @@ public sealed class Dx12GpuProfiler : IDisposable {
         pendingResolveCount[pendingTail] = markCount;
         pendingFence[pendingTail] = fenceTarget;
         pendingTail = (pendingTail + 1) % RingFrames;
-        // Snapshot the names for this ring frame so a later readback labels correctly even after newer frames record.
         Array.Copy(names, 0, ringNames[ringIndex], 0, markCount);
     }
 
@@ -97,11 +77,9 @@ public sealed class Dx12GpuProfiler : IDisposable {
         return a;
     }
 
-    // Called once per frame (e.g. after EndFrame): read back any pending frame whose fence has retired and print
-    // its per-pass ms. Drains at most one per call (steady cadence). Returns the report line, or null.
     public unsafe string Drain(ulong completedFence) {
         if (!avail || pendingHead == pendingTail) return null;
-        if (pendingFence[pendingHead] > completedFence) return null;   // GPU hasn't finished this frame yet
+        if (pendingFence[pendingHead] > completedFence) return null;
         int ring = pendingResolveRing[pendingHead];
         int count = pendingResolveCount[pendingHead];
         pendingHead = (pendingHead + 1) % RingFrames;
@@ -115,14 +93,9 @@ public sealed class Dx12GpuProfiler : IDisposable {
         for (int i = 0; i < count; i++) {
             ulong begin = p[baseSlot + i * 2], end = p[baseSlot + i * 2 + 1];
             double ms = end > begin ? (end - begin) * 1000.0 / frequency : 0.0;
-            // A pass that FLUSHED + reopened the frame list mid-record (e.g. the Lumen scene's TLAS rebuild via
-            // ExecuteSyncImmediate) has its begin/end timestamps in DIFFERENT GPU submissions, so the delta spans a
-            // CPU↔GPU sync and is meaningless (reads as tens/hundreds of ms). Flag those instead of trusting the
-            // number — a single pass can't exceed a plausible frame budget, so >FlushGuardMs is a flush artefact,
-            // not a real pass cost. (The real per-pass cost is then measurable by an A/B toggle of that feature.)
             const double FlushGuardMs = 6.0;
             if (ms > FlushGuardMs) {
-                sb.Append($" {ringNames[ring][i]}=~flush?");   // span straddled a submit boundary — not a real reading
+                sb.Append($" {ringNames[ring][i]}=~flush?");
             } else {
                 total += ms;
                 sb.Append($" {ringNames[ring][i]}={ms:0.000}");

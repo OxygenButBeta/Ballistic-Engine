@@ -4,13 +4,9 @@
 public class SceneManager {
     public static HDCamera RenderCamera { get; set; }
 
-    // When false (edit mode), the scene renders but components do not tick.
     public static bool IsPlaying { get; private set; }
     public static void SetPlaying(bool playing) => IsPlaying = playing;
 
-    // Play-mode pause (Unity's pause button): while paused the simulation holds — Update skips the
-    // fixed/coroutine/tick passes — but the scene still renders so you can inspect a frozen frame.
-    // StepFrame advances exactly one frame while paused (frame-by-frame debugging). Cleared on Stop.
     public static bool IsPaused { get; set; }
     static bool stepRequested;
     public static void StepFrame() {
@@ -18,35 +14,18 @@ public class SceneManager {
             stepRequested = true;
     }
 
-    // Phase 5 wires these to the YAML scene serializer so Play snapshots edit-mode state
-    // and Stop restores it. Until then they may be null and play/stop is one-way.
     public static Func<Scene, string> SnapshotProvider { get; set; }
     public static Action<Scene, string> SnapshotRestorer { get; set; }
 
     static string snapshot;
 
-    // Set by SceneSerializer.Deserialize for its duration: while a scene rebuilds from YAML in
-    // play mode (live script reload), Entity.Attach must NOT fire OnBegin/OnEnabled — member
-    // values are applied after AddComponent, so user code would observe defaults. The reload
-    // path fires FireBegin itself once the whole scene is up.
     internal static bool SuppressPlayLifecycle;
 
-    // Wired by the bootstrap (Unity's "fix compile errors before entering playmode"): returns a
-    // human-readable reason play is currently blocked, or null when it's allowed. Engine layering
-    // keeps the script-compiler knowledge out of here — the bootstrap injects the check.
     public static Func<string> PlayBlocked { get; set; }
 
-    // ---- Scenes-in-build (Unity-style runtime scene loading) ----------------
-    //
-    // SceneManager lives in the Engine layer and may not reference AssetPipeline, so the bootstrap
-    // injects these the same way it does the snapshot delegates. SceneLoader reads + deserializes a
-    // scene by its project-relative path into the (already-cleared) current scene; BuildScenes is the
-    // ordered manifest list (index 0 = startup). Both null on a host that didn't wire scene loading.
     public static Action<string> SceneLoader { get; set; }
     public static IReadOnlyList<string> BuildScenes { get; set; } = [];
 
-    // Loads a scene from the build list by its name (file name without extension, Unity-style:
-    // LoadScene("Level2")). Logs and no-ops if no build scene matches. Works in both edit and play.
     public static void LoadScene(string name) {
         if (string.IsNullOrEmpty(name)) {
             Debugging.LogError("LoadScene: scene name is null or empty.");
@@ -65,7 +44,6 @@ public class SceneManager {
         LoadScenePath(path);
     }
 
-    // Loads a scene from the build list by its index (LoadScene(0) = startup scene).
     public static void LoadScene(int buildIndex) {
         if (buildIndex < 0 || buildIndex >= BuildScenes.Count) {
             Debugging.LogError(
@@ -79,8 +57,6 @@ public class SceneManager {
     static string SceneName(string projectRelativePath) =>
         Path.GetFileNameWithoutExtension(projectRelativePath);
 
-    // Tears the live scene down (mirrors StopPlay's teardown so renderers/physics release their
-    // sets), loads the new scene over it in edit mode, then re-enters play if we were playing.
     static void LoadScenePath(string projectRelativePath) {
         if (SceneLoader is null) {
             Debugging.LogError("LoadScene: no SceneLoader wired (host did not enable scene loading).");
@@ -105,7 +81,6 @@ public class SceneManager {
     static SceneManager instance;
 
     public SceneManager() {
-        // Generate the first scene
         instance = this;
         InsertScene(new Scene {
             Name = "Default Scene"
@@ -120,18 +95,6 @@ public class SceneManager {
         instance.activeScenes.Add(scene);
     }
 
-    // Defensively empty EVERY global render/registration set. scene.Clear() should already remove each
-    // renderer via OnDetach, but that is best-effort (an OnDetach that throws, an indirectly-managed
-    // renderer, or any edit-mode gap leaves a stale entry that keeps DRAWING — the "old scene's meshes
-    // stay on screen after a scene switch" bug). Every scene-teardown path (StopPlay, LoadScenePath,
-    // and the editor's ApplyNow) calls this so the asymmetry can't reappear. Must list ALL RuntimeSets
-    // the renderer iterates; add new ones here when a new renderable type is introduced.
-    // Fired AFTER every render set is emptied on a scene teardown (StopPlay / LoadScenePath / editor ApplyNow).
-    // The active backend subscribes to drop any per-scene CACHED GPU state that survives a swap because it is
-    // keyed by a cheap change-stamp, not by scene identity — e.g. the DX12 GPU-driven material table (stamped by
-    // renderer+submesh count), the Hi-Z prime, the shadow-cascade cache. Two scenes with matching counts would
-    // otherwise keep the first scene's table/cull state and the second scene renders wrong / culls everything.
-    // Engine layer raises it; the renderer layer (DX12) listens — no upward dependency.
     public static event Action RenderSetsCleared;
 
     public static void ClearAllRenderSets() {
@@ -153,11 +116,6 @@ public class SceneManager {
         return instance.activeScenes.Last();
     }
 
-    // Resolve a scene object (Entity, Behaviour, or SceneBehaviour) by its InstanceId, scanning the
-    // current scene. Used by BEvent persistent listeners to bind their authored target back to a live
-    // object after load. Returns null if nothing matches (target deleted / different scene) — callers
-    // treat that as a missing reference and skip, Unity-style. Linear scan; listener invokes cache
-    // the result, so this runs at most once per listener per resolve.
     public static BObject FindByInstanceId(Guid id) {
         if (id == Guid.Empty || instance.activeScenes.Count == 0)
             return null;
@@ -183,30 +141,16 @@ public class SceneManager {
         if (!IsPlaying)
             return;
 
-        // Paused: hold the simulation. A single StepFrame() request lets exactly one frame through
-        // (consume the request here so the next frame re-freezes). The scene still renders either way.
         if (IsPaused) {
             if (!stepRequested)
                 return;
             stepRequested = false;
         }
 
-        // Fixed-step pass first (Unity ordering): FixedTick on behaviours, then the physics
-        // world steps and writes simulated poses back to transforms. Zero or more times a frame.
-        // (The coroutine fixed pump runs inside Physics.Advance, before each step's FixedTick.)
         Physics.Advance(delta, FixedTickScenes);
 
-        // Network: drain the transport ONCE per frame (the socket pump, plan §8.2 IterateIncoming/
-        // Outgoing). No-op when Offline. The per-TICK network work (input capture, NetworkTick, the
-        // asymmetric down-state flush) does NOT live here — it runs inside the fixed-step loop above
-        // (FixedTickScenes → Network.PredictTick), bound to the existing 60 Hz accumulator (L2: one
-        // fixed tick = the network clock, no second clock). Running it per-frame would tie the net tick
-        // to render rate — the exact desync L2 exists to prevent.
         Network.Manager?.PollTransport();
 
-        // Pump coroutines/async continuations BEFORE the scene Tick so a resume scheduled last frame
-        // (and any await DelaySeconds that elapses this frame) runs with this frame's state, ahead of
-        // the components that may depend on it.
         Coroutine.Tick(delta);
 
         foreach (Scene scene in instance.activeScenes)
@@ -217,15 +161,9 @@ public class SceneManager {
         foreach (Scene scene in instance.activeScenes)
             scene.FixedUpdate(in step);
 
-        // The network prediction tick (plan §8.2) runs ONCE per fixed step, BEFORE the physics step that
-        // follows it in Physics.Advance — the canonical bracket "NetworkTick (sample input, predict, sim)
-        // → physics step". Bound to the existing 60 Hz accumulator (L2). No-op when Offline. The owner
-        // captures input + predicts here; the server drives state-authority NetworkTicks; the asymmetric
-        // down-state flush lands on the send boundary (the divisor cadence).
         Network.Manager?.PredictTick(step);
     };
 
-    // Enter play mode: snapshot the current (edit-mode) scene, then run component lifecycle.
     public static void StartPlay() {
         if (IsPlaying)
             return;
@@ -238,22 +176,16 @@ public class SceneManager {
         Scene scene = GetCurrentScene();
         snapshot = SnapshotProvider?.Invoke(scene);
 
-        Physics.BeginPlay(); // fresh world before components create bodies in OnEnabled
-        CoroutineRunner.Reset(); // no coroutines carry over from a previous session
+        Physics.BeginPlay();
+        CoroutineRunner.Reset();
         IsPlaying = true;
 
-        // Gameplay framework (plan §5): if the scene declares a GameMode, run the ordered phases
-        // (GameMode → Player → HUD → everyone-else) instead of the bare FireBegin. The runner drives the
-        // net strand in Phases 0-2 and fires the SINGLE Unity strand in Phase 3 (the B1/B2 fix). With NO
-        // GameMode this branch is never taken and play-start is byte-identical to before — the opt-in,
-        // zero-regression contract. GamePhaseRunner is engine code (Engine/Gameplay), so no injection.
         if (GamePhaseRunner.HasGameMode(scene))
             GamePhaseRunner.Run(scene);
         else
             scene.FireBegin();
     }
 
-    // Leave play mode: tear down components, clear runtime state, restore the snapshot.
     public static void StopPlay() {
         if (!IsPlaying)
             return;
@@ -264,9 +196,9 @@ public class SceneManager {
         RenderCamera = null;
         scene.Clear();
         ClearAllRenderSets();
-        Physics.EndPlay(); // after Clear so component teardown saw a live world
-        Network.Stop(); // tear down the loopback/host started by the phase runner — back to Offline
-        CoroutineRunner.Reset(); // abandon any in-flight coroutines/awaits — they don't survive Stop
+        Physics.EndPlay();
+        Network.Stop();
+        CoroutineRunner.Reset();
 
         IsPlaying = false;
         IsPaused = false;

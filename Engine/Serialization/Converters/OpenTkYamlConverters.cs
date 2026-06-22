@@ -4,9 +4,6 @@ using YamlDotNet.Serialization;
 
 namespace BallisticEngine.Serialization;
 
-// YamlDotNet doesn't know OpenTK's math structs; emit/parse them as flow maps,
-// e.g. position: {x: 0, y: 1, z: 2}.
-
 public sealed class Vector2YamlConverter : IYamlTypeConverter {
     public bool Accepts(Type type) => type == typeof(Vector2);
 

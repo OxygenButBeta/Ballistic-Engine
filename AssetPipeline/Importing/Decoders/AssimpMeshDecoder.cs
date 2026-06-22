@@ -2,34 +2,23 @@ using Assimp;
 
 namespace BallisticEngine.AssetPipeline;
 
-// A source material's texture bindings and scalar PBR factors, as authored in the model
-// file. Paths are the raw strings Assimp reports (absolute, relative, or bare filenames) —
-// the importer resolves them. Scalars are null when the source doesn't state them, so the
-// .mat writer can leave them out and the loader applies its own defaults.
 public sealed class DecodedMaterial {
     public string Name;
     public readonly Dictionary<TextureType, string> TexturePaths = new();
 
-    public Vector4? BaseColor;       // linear RGBA tint; multiplies the albedo map
-    public float? Metallic;          // glTF metallicFactor (or derived)
-    public float? Roughness;         // glTF roughnessFactor / converted shininess
-    public Vector3? EmissiveColor;   // linear RGB
+    public Vector4? BaseColor;
+    public float? Metallic;
+    public float? Roughness;
+    public Vector3? EmissiveColor;
     public float? Opacity;
 }
 
-// Whole-model decode result: merged geometry (one submesh per used source material, node
-// transforms baked into the vertices) plus the materials those submeshes reference.
-// SubMeshMaterials is parallel to Mesh.SubMeshes; Mesh.SubMeshes[i].MaterialRef is left null —
-// the importer fills it after it has generated .mat assets.
 public sealed class DecodedModel {
     public MeshData Mesh;
     public DecodedMaterial[] SubMeshMaterials;
 }
 
-// The only place in the engine that talks to Assimp.
 public static class AssimpMeshDecoder {
-    // Legacy single-mesh decode (meshIndex >= 0 in the importer settings). Geometry only,
-    // mesh-local space, no materials — exactly the pre-submesh pipeline behavior.
     public static MeshData Decode(string path, bool flipUVs = true, int meshIndex = 0) {
         AssimpContext context = new();
 
@@ -53,14 +42,6 @@ public static class AssimpMeshDecoder {
         return Combine([builder]).Mesh;
     }
 
-    // Whole-scene decode: walks the node hierarchy and bakes each node's world transform into
-    // its vertices. splitByNodes=false merges everything into one mesh with a submesh per used
-    // source material; splitByNodes=true emits one submesh per node mesh instead (named after
-    // the node, carrying its world transform), so the editor can instantiate the model as one
-    // entity per source object.
-    // scaleFactor: explicit uniform scale baked into every vertex. <= 0 means AUTO — derive it from
-    // the file's own units (FBX UnitScaleFactor: cm-authored content like Megascans comes in 100x too
-    // big otherwise; this is Unity's default "Use File Scale" / 0.01 behavior, applied for real).
     public static DecodedModel DecodeScene(string path, bool flipUVs = true, bool splitByNodes = false,
         float scaleFactor = 0f) {
         AssimpContext context = new();
@@ -77,40 +58,25 @@ public static class AssimpMeshDecoder {
         if (scene == null || scene.MeshCount == 0)
             throw new IOException($"Mesh import failed or no meshes found in '{path}'.");
 
-        // Convert the model's authoring units to engine meters. Auto mode reads the file's unit scale;
-        // an explicit positive scaleFactor overrides it. The factor seeds the root transform so it
-        // bakes uniformly into vertices AND node transforms (split-by-nodes children stay consistent).
         float unitScale = scaleFactor > 0f ? scaleFactor : AutoUnitScale(path);
         Matrix4 rootScale = Matrix4.CreateScale(unitScale);
 
-        // Z-UP FBX (photogrammetry/CAD exports — UpAxis=2 in the file's global settings): rotate
-        // -90° about X so up becomes +Y, matching what Unity's importer does. Without this every
-        // mesh lies tipped 90° relative to the transforms a converted Unity scene places it with
-        // (ground patches standing vertically like walls). Y-up FBX (UpAxis=1) is untouched.
         if (Path.GetExtension(path).Equals(".fbx", StringComparison.OrdinalIgnoreCase) &&
             FbxUnitScaleFactor.ReadUpAxis(path) == 2)
             rootScale = Matrix4.CreateRotationX(-MathF.PI / 2f) * rootScale;
 
-        // Builders in first-use order with the material index each submesh renders with.
-        // Merged mode reuses one builder per material; split mode creates one per node mesh
-        // and records the node hierarchy (pre-order, so a parent always precedes its children).
         var builders = new List<SubMeshBuilder>();
         var builderMaterials = new List<int>();
         var builderByMaterial = new Dictionary<int, SubMeshBuilder>();
         var nodes = new List<MeshNodeData>();
 
         void Traverse(Node node, Matrix4 parentWorld, int parentIndex) {
-            // Fold the unit scale into the ROOT node's local transform (parentIndex == -1) so it bakes
-            // into vertices via the world chain AND into the stored hierarchy the editor instantiates
-            // from (children are relative to a now-scaled root). Non-root locals stay as authored.
             Matrix4 local = parentIndex < 0 ? rootScale * ToOpenTK(node.Transform) : ToOpenTK(node.Transform);
             Matrix4 world = local * parentWorld;
 
             var nodeIndex = -1;
             if (splitByNodes) {
                 nodeIndex = nodes.Count;
-                // Normalize empty names to null — the artifact stores "" for none, so this
-                // keeps decode → write → read an exact round-trip.
                 nodes.Add(new MeshNodeData(string.IsNullOrEmpty(node.Name) ? null : node.Name,
                     parentIndex, local));
             }
@@ -122,8 +88,6 @@ public static class AssimpMeshDecoder {
 
                 SubMeshBuilder builder;
                 if (splitByNodes) {
-                    // Assimp splits multi-material source objects into one mesh per material;
-                    // suffix those so siblings stay distinguishable in the hierarchy.
                     builder = new SubMeshBuilder {
                         Name = node.MeshIndices.Count > 1 ? $"{node.Name}.{n}" : node.Name,
                         NodeTransform = world,
@@ -151,8 +115,6 @@ public static class AssimpMeshDecoder {
         if (builders.Count == 0)
             throw new IOException($"'{path}' contains meshes, but none are referenced by its node hierarchy.");
 
-        // One DecodedMaterial INSTANCE per source material (split mode repeats them across
-        // submeshes); the importer dedupes .mat generation by reference.
         var materialByIndex = new Dictionary<int, DecodedMaterial>();
         var materials = new DecodedMaterial[builders.Count];
         for (var i = 0; i < builders.Count; i++) {
@@ -171,31 +133,17 @@ public static class AssimpMeshDecoder {
         return model;
     }
 
-    // ---- Units -------------------------------------------------------------
-
-    // Derives the meters-per-authoring-unit factor from the file's own units. FBX's system unit is
-    // CENTIMETRES and the file records its scale in "UnitScaleFactor"; content authored in cm
-    // (Megascans, most DCC FBX exports) reads 1.0 and must be divided by 100 to land in engine
-    // metres — otherwise it imports 100x too big. Formats that are already metric (glTF/OBJ) -> 1
-    // (no change; byte-identical to the pre-units pipeline).
-    //
-    // AssimpNet 4.1.0 exposes no scene metadata, so we read UnitScaleFactor straight from the FBX
-    // (binary OR ASCII). On any parse failure we fall back to the cm default (0.01), which is correct
-    // for the overwhelming majority of FBX content and matches Unity's default behaviour.
     static float AutoUnitScale(string path) {
         var ext = Path.GetExtension(path).ToLowerInvariant();
         if (ext != ".fbx")
-            return 1f; // glTF/OBJ/DAE are metric; leave untouched
+            return 1f;
 
         double cmPerUnit = FbxUnitScaleFactor.Read(path) ?? 1.0;
         if (cmPerUnit <= 0 || double.IsNaN(cmPerUnit) || double.IsInfinity(cmPerUnit))
             cmPerUnit = 1.0;
-        return (float)(cmPerUnit / 100.0); // cm -> m
+        return (float)(cmPerUnit / 100.0);
     }
 
-    // ---- Materials ---------------------------------------------------------
-
-    // Exposed for the skin decoder, which merges by material the same way but in bind space.
     internal static DecodedMaterial DecodeMaterialPublic(Assimp.Scene scene, int materialIndex) =>
         DecodeMaterial(scene, materialIndex);
 
@@ -206,8 +154,6 @@ public static class AssimpMeshDecoder {
         Assimp.Material source = scene.Materials[materialIndex];
         var decoded = new DecodedMaterial { Name = source.HasName ? source.Name : $"Material {materialIndex}" };
 
-        // Assimp 4.x has no PBR slots; Specular/Shininess are the closest FBX carriers for
-        // metallic/roughness maps. Embedded textures ("*0" paths) are not supported.
         Map(source, decoded, TextureType.Diffuse, Assimp.TextureType.Diffuse);
         Map(source, decoded, TextureType.Normal, Assimp.TextureType.Normals, Assimp.TextureType.Height);
         Map(source, decoded, TextureType.Metallic, Assimp.TextureType.Specular);
@@ -219,12 +165,9 @@ public static class AssimpMeshDecoder {
         return decoded;
     }
 
-    // Scalar PBR factors. Untextured materials previously lost their authored look entirely
-    // (white, fully rough, dielectric); these carry the source factors into the .mat asset.
     static void DecodeScalars(Assimp.Material source, DecodedMaterial decoded) {
         if (source.HasColorDiffuse) {
             Color4D c = source.ColorDiffuse;
-            // Skip pure-white defaults: they carry no information and would just bloat the .mat.
             if (c.R < 0.999f || c.G < 0.999f || c.B < 0.999f || c.A < 0.999f)
                 decoded.BaseColor = new Vector4(c.R, c.G, c.B, c.A);
         }
@@ -238,7 +181,6 @@ public static class AssimpMeshDecoder {
         if (source.HasOpacity && source.Opacity < 0.999f)
             decoded.Opacity = source.Opacity;
 
-        // glTF-style PBR factors live in generic material properties, not typed accessors.
         if (TryGetFloat(source, "$mat.metallicFactor", out var metallic) ||
             TryGetFloat(source, "$mat.gltf.pbrMetallicRoughness.metallicFactor", out metallic) ||
             TryGetFloat(source, "$mat.reflectivity", out metallic))
@@ -247,9 +189,7 @@ public static class AssimpMeshDecoder {
         if (TryGetFloat(source, "$mat.roughnessFactor", out var roughness) ||
             TryGetFloat(source, "$mat.gltf.pbrMetallicRoughness.roughnessFactor", out roughness))
             decoded.Roughness = Math.Clamp(roughness, 0f, 1f);
-        else if (source.HasShininess && source.Shininess > 0f)
-            // Legacy Blinn-Phong shininess -> GGX roughness (Karis' mapping).
-            decoded.Roughness = Math.Clamp(MathF.Sqrt(2f / (source.Shininess + 2f)), 0.02f, 1f);
+        else if (source.HasShininess && source.Shininess > 0f) decoded.Roughness = Math.Clamp(MathF.Sqrt(2f / (source.Shininess + 2f)), 0.02f, 1f);
     }
 
     static bool TryGetFloat(Assimp.Material source, string key, out float value) {
@@ -274,23 +214,19 @@ public static class AssimpMeshDecoder {
         }
     }
 
-    // ---- Geometry ----------------------------------------------------------
-
-    // Accumulates transformed geometry for one output submesh.
     sealed class SubMeshBuilder {
         public string Name;
-        public Matrix4 NodeTransform = Matrix4.Identity; // node local->model (split mode only)
-        public int NodeIndex = -1;                       // into the decoded node table (split mode only)
+        public Matrix4 NodeTransform = Matrix4.Identity;
+        public int NodeIndex = -1;
         public readonly List<Vector3> Positions = new();
         public readonly List<Vector3> Normals = new();
-        public readonly List<Vector4> Tangents = new(); // w = bitangent handedness
+        public readonly List<Vector4> Tangents = new();
         public readonly List<Vector2> UVs = new();
         public readonly List<uint> Indices = new();
 
         public void Append(Assimp.Mesh mesh, Matrix4 world) {
             var baseVertex = (uint)Positions.Count;
 
-            // Row-vector convention: normals transform by the inverse-transpose of the linear part.
             var linear = new Matrix3(world);
             Matrix3 normalMatrix = linear;
             var mirrored = false;
@@ -313,8 +249,6 @@ public static class AssimpMeshDecoder {
 
                 if (hasTangents) {
                     Vector3 t = SafeNormalize(MulVector(ToVector3(mesh.Tangents[i]), in linear), Vector3.UnitX);
-                    // Handedness from the authored bitangent: mirrored UV islands flip it, and
-                    // reconstructing B = cross(N, T) without the sign shades inverted bumps there.
                     Vector3 b = SafeNormalize(MulVector(ToVector3(mesh.BiTangents[i]), in linear), Vector3.UnitY);
                     var w = Vector3.Dot(Vector3.Cross(n, t), b) < 0f ? -1f : 1f;
                     Tangents.Add(new Vector4(t, w));
@@ -337,7 +271,6 @@ public static class AssimpMeshDecoder {
                     continue;
 
                 if (mirrored) {
-                    // A mirroring transform flips winding; reverse it to keep faces front-facing.
                     Indices.Add(baseVertex + (uint)face.Indices[2]);
                     Indices.Add(baseVertex + (uint)face.Indices[1]);
                     Indices.Add(baseVertex + (uint)face.Indices[0]);
@@ -387,12 +320,6 @@ public static class AssimpMeshDecoder {
         };
     }
 
-    // ---- Math helpers ------------------------------------------------------
-
-    // Assimp matrices are column-vector (v' = M * v); OpenTK composes row-vector (v' = v * M).
-    // Transposing converts between the conventions. Internal so the skin decoder uses the SAME
-    // conversion for bone offset matrices and animation node transforms (mixing conventions
-    // explodes the skeleton).
     internal static Matrix4 ToOpenTKMatrix(in Assimp.Matrix4x4 m) => ToOpenTK(m);
 
     static Matrix4 ToOpenTK(in Assimp.Matrix4x4 m) => new(

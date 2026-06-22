@@ -1,12 +1,3 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// This source code is licensed under the MIT license found in the
-// LICENSE file in the root directory of this source tree.
-
-using System.Numerics;
-
-using System;
-using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
 namespace Facebook.Yoga
@@ -16,8 +7,6 @@ namespace Facebook.Yoga
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int ToUnderlying<TEnum>(TEnum e) where TEnum : struct, Enum
         {
-            // All Yoga enums are byte-backed. Read only 1 byte to avoid
-            // reading garbage from adjacent bytes under NativeAOT.
             return Unsafe.As<TEnum, byte>(ref e);
         }
 

@@ -1,11 +1,6 @@
 
 namespace BallisticEngine;
 
-// An entity component that contributes a VolumeProfile to the blended post-process stack
-// (Unity's Volume). Global volumes apply everywhere; local volumes apply inside an oriented
-// box around the entity (BoxSize scaled by the transform), fading in over BlendDistance
-// metres outside it. Higher Priority wins where volumes overlap; Weight scales the whole
-// contribution. The renderer evaluates the result through VolumeManager every frame.
 [Component("Volume")]
 public class Volume : Behaviour {
     [Tooltip("Global volumes affect rendering everywhere; local volumes only within their box.")]
@@ -27,12 +22,10 @@ public class Volume : Behaviour {
     [Tooltip("The shared .volume asset holding this volume's overrides.")]
     public VolumeProfile Profile { get; set; }
 
-    // OnAttach/OnDetach (not OnEnabled) so volumes work in the editor outside play mode.
     protected internal override void OnAttach() => VolumeManager.Register(this);
 
     protected internal override void OnDetach() => VolumeManager.Unregister(this);
 
-    // 1 inside the box (or always, when global), 0 beyond BlendDistance outside it.
     internal float ComputeInterpFactor(Vector3 cameraPosition) {
         if (IsGlobal)
             return 1f;
@@ -58,10 +51,6 @@ public class Volume : Behaviour {
         return BlendDistance > 0f ? Math.Clamp(1f - distance / BlendDistance, 0f, 1f) : 0f;
     }
 
-    // World-space axis-aligned box of a LOCAL volume (center + half-extent), for systems that need the volume's
-    // geometry (the DDGI probe grid confines itself to the GI volume's box). Returns false for a global volume
-    // (no box). v1: the probe lattice is axis-aligned, so a rotated volume is treated as its AABB (rotation
-    // ignored). Math mirrors ComputeInterpFactor / OnDrawGizmosSelected exactly.
     internal bool TryGetWorldBox(out Vector3 center, out Vector3 halfExtent) {
         center = default;
         halfExtent = default;

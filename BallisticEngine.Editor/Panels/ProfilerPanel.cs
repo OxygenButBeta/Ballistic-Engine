@@ -1,20 +1,10 @@
-using System.Numerics;
-
 namespace BallisticEngine.Editor;
 
-// Realtime frame profiler window (Window > Profiler): frame-time graph over the recorded
-// history plus a per-zone breakdown of one frame, fed by EditorProfilerBackend's ring buffer.
-// Pause freezes the history and unlocks scrubbing; Tracy (BALLISTIC_TRACY=1) remains the
-// deep-dive tool — this is the always-available overview.
-//
-// Phase-2 EditorWindow: the body draws through IEditorGui (no raw ImGui). The profiler backend is now a
-// FIELD (set once at construction) instead of a per-frame Draw arg — WindowShell's OnGui takes no extra
-// context, so window state that the body needs lives on the instance.
 internal sealed class ProfilerPanel : EditorWindow {
     readonly EditorProfilerBackend profiler;
 
     readonly float[] graph = new float[EditorProfilerBackend.HistorySize];
-    int inspectAge;   // 0 = latest completed frame; scrubbed while paused
+    int inspectAge;
 
     public ProfilerPanel(EditorProfilerBackend profiler) {
         this.profiler = profiler;
@@ -22,8 +12,6 @@ internal sealed class ProfilerPanel : EditorWindow {
         Title = "Profiler";
         Icon = null;
         DesiredSize = new Vector2(580, 500);
-        // BALLISTIC_PROFILER=1 opens the panel at startup — lets headless/agent runs screenshot
-        // frame timings without clicking through the Window menu.
         Open = Environment.GetEnvironmentVariable("BALLISTIC_PROFILER") == "1";
     }
 
@@ -35,7 +23,6 @@ internal sealed class ProfilerPanel : EditorWindow {
             return;
         }
 
-        // Header: pause/resume + headline numbers over the recorded window.
         if (gui.Button(profiler.Paused ? "Resume" : "Pause")) {
             profiler.Paused = !profiler.Paused;
             inspectAge = 0;
@@ -56,14 +43,12 @@ internal sealed class ProfilerPanel : EditorWindow {
         gui.SameLine();
         gui.TextDisabled($"avg {avg:0.00} ms   max {max:0.00} ms   ({available} frames)");
 
-        // Frame-time graph, oldest to newest.
         for (var i = 0; i < available; i++)
             graph[i] = (float)profiler.CompletedFrame(available - 1 - i).TotalMs;
         gui.PlotLines("##frametimes", graph, available, null,
             0f, (float)Math.Max(max * 1.25, 1.0),
             new Vector2(gui.ContentRegionAvail.X, 80 * scale));
 
-        // Scrubbing only makes sense over a frozen history.
         if (profiler.Paused)
             gui.SliderInt("Frame (0 = newest)", ref inspectAge, 0, available - 1);
         else
@@ -81,7 +66,6 @@ internal sealed class ProfilerPanel : EditorWindow {
             gui.TableSetupColumn("% Frame", EditorColumnFlags.WidthFixed, 70 * scale);
             gui.TableHeadersRow();
 
-            // Whole-frame row, then the recorded zones in begin order with depth indentation.
             gui.TableNextRow();
             gui.TableNextColumn();
             gui.Text("Frame");

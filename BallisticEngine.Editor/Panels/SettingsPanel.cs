@@ -1,18 +1,9 @@
-using System.Numerics;
-
 namespace BallisticEngine.Editor;
 
-// Project/editor Settings window (toggled from the Window menu). Edits EditorPrefs.Current live —
-// every change persists immediately and accent changes re-apply the theme through the supplied
-// callback. Open is owned by the base (the Window menu toggles it).
-//
-// Phase-2 EditorWindow: the body draws through IEditorGui (no raw ImGui). WindowShell owns Begin/End.
-// The custom ToggleSwitch widget stays an EditorWidgets helper call (a seam-adjacent draw-list widget).
 internal sealed class SettingsPanel : EditorWindow {
     readonly Action<System.Numerics.Vector4> applyAccent;
     readonly Action applyFrameLimit;
 
-    // Shared with the toolbar's FPS popup so both edit the same presets.
     public static readonly int[] FrameLimitOptions = [0, 30, 60, 120, 144, 240];
     public static readonly string[] FrameLimitLabels = ["VSync", "30", "60", "120", "144", "240"];
 
@@ -21,12 +12,11 @@ internal sealed class SettingsPanel : EditorWindow {
         this.applyFrameLimit = applyFrameLimit;
         DockKey = "win.settings";
         Title = "Settings";
-        Icon = null;             // Settings had no inline icon in its title
+        Icon = null;
         NoCollapse = true;
         DesiredSize = new Vector2(420, 460);
     }
 
-    // Label on the left, a modern sliding toggle right-aligned on the row. Returns true on change.
     static bool LabeledToggle(IEditorGui gui, string label, ref bool value) {
         gui.AlignTextToFramePadding();
         gui.TextUnformatted(label);
@@ -53,8 +43,6 @@ internal sealed class SettingsPanel : EditorWindow {
                 dirty = true;
             }
 
-            // UI scale (on top of the auto-detected DPI). RefreshScale() picks the new value up next
-            // frame and rebuilds the font/geometry — no explicit apply call needed.
             var uiScale = prefs.UiScale;
             if (gui.SliderFloat("UI scale", ref uiScale, 0.75f, 2f, "%.2fx")) {
                 prefs.UiScale = uiScale;

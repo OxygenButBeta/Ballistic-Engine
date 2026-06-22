@@ -1,18 +1,8 @@
-using System;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.Editor.Inspector;
 
-// INTEGRATION-TIME (compiled in the real editor; NOT in the headless test). The volume-profile path's
-// IInspectorGui: BeginRow draws the per-parameter override checkbox + label and disables the value cell
-// when not overridden (exactly VolumeProfileEditor.DrawParameter's chrome). The host loop owns the
-// 2-column table; per row it calls pipeline.Draw, then OR's in TakeOverrideChanged() so toggling an
-// override checkbox still marks the profile dirty even when the value itself didn't change.
-//
-// Phase-7: routes through the IEditorGui seam (EditorGui.Shared) instead of raw ImGui — zero ImGui import.
-// The double-click-to-type ScalarField helper stays a static call (the plan's pragmatic boundary; it owns
-// its own raw-ImGui widget). gui is the process-wide shared seam handle (the editor has one).
 public sealed class ImGuiVolumeGui : IInspectorGui {
     static IEditorGui gui => EditorGui.Shared;
 
@@ -52,7 +42,6 @@ public sealed class ImGuiVolumeGui : IInspectorGui {
 
     public void EndRow() { if (gatedByOverride) gui.EndDisabled(); }
 
-    // Volume params carry no Header/Space today; keep them inert inside the table.
     public void Header(string t) { }
     public void Space(float h) { }
     public void HelpBox(string t) { gui.TextDisabled(t); }
@@ -64,14 +53,14 @@ public sealed class ImGuiVolumeGui : IInspectorGui {
         return changed;
     }
     public bool SliderFloat(ref float v, float min, float max) {
-        gui.PushColor(EditorStyleColor.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
-        bool changed = ScalarField.SliderFloat("##v", ref v, min, max, "%.3f");   // double-click to type
+        gui.PushColor(EditorStyleColor.SliderGrab, EditorTheme.SliderGrabRest);
+        bool changed = ScalarField.SliderFloat("##v", ref v, min, max, "%.3f");
         gui.PopColor();
         return changed;
     }
     public bool DragFloat(ref float v, float speed) => ScalarField.DragFloat("##v", ref v, speed, 0, 0, "%.3f");
     public bool SliderInt(ref int v, int min, int max) {
-        gui.PushColor(EditorStyleColor.SliderGrab, EditorTheme.SliderGrabRest);   // EF11: legible value over the grab
+        gui.PushColor(EditorStyleColor.SliderGrab, EditorTheme.SliderGrabRest);
         bool changed = ScalarField.SliderInt("##v", ref v, min, max);
         gui.PopColor();
         return changed;

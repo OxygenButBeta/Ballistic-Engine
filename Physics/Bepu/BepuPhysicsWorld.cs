@@ -1,23 +1,15 @@
-using System.Numerics;
 using BepuPhysics;
 using BepuPhysics.Collidables;
-using BepuPhysics.CollisionDetection;
 using BepuPhysics.Constraints;
 using BepuPhysics.Trees;
 using BepuUtilities;
 using BepuUtilities.Memory;
 using static BallisticEngine.Bepu.BepuMath;
 using BepuMesh = BepuPhysics.Collidables.Mesh;
-using TkVector3 = System.Numerics.Vector3;   // engine math is System.Numerics now (was OpenTK)
+using TkVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.Bepu;
 
-// IPhysicsWorld over BepuPhysics 2 (pure managed .NET, no native binaries). This module is the
-// ONLY place in the repo allowed to reference BepuPhysics — everything engine-side goes through
-// the Abstraction/Physics interfaces, mirroring how AssetPipeline owns Assimp/Stb/Magick.
-//
-// The Simulation is created lazily and torn down wholesale on Reset() (play-mode enter/leave);
-// outstanding BepuBody wrappers are invalidated so stale component references become no-ops.
 public sealed class BepuPhysicsWorld : IPhysicsWorld {
     internal Simulation Simulation;
     readonly BufferPool bufferPool = new();
@@ -32,24 +24,14 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
 
     public IReadOnlyList<PhysicsContactEvent> ContactEvents => Contacts.Events;
 
-    // Wrappers and contact materials by handle value (bodies and statics have separate
-    // handle spaces). Material reads happen from narrowphase worker threads, but nothing
-    // mutates these during Step, so plain dictionaries are safe.
     readonly Dictionary<int, BepuBody> bodiesByHandle = new();
     readonly Dictionary<int, BepuBody> staticsByHandle = new();
     readonly Dictionary<int, ContactMaterial> bodyMaterials = new();
     readonly Dictionary<int, ContactMaterial> staticMaterials = new();
 
-    // Per-compound-child trigger flags, indexed by COMPOUND CHILD INDEX (= CompoundBuilder add
-    // order, 1:1 with the order children were added in TryBuildShape — NOT the description.Shapes
-    // index, since unsupported parts are skipped). A single body can mix solid and trigger children;
-    // the narrowphase consults this per child to decide solve-vs-overlap. Single-shape bodies get a
-    // one-element array (childIndex 0). Read on worker threads; never mutated during Step.
     readonly Dictionary<int, bool[]> bodyChildTriggers = new();
     readonly Dictionary<int, bool[]> staticChildTriggers = new();
 
-    // Live constraints (P6 joints). Tracked so Reset can invalidate outstanding wrappers; the handle
-    // itself lives in Bepu's solver.
     readonly List<BepuConstraint> constraints = new();
 
     internal readonly struct ContactMaterial {
@@ -66,22 +48,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         }
     }
 
-    // Maps an engine "bounciness" (0..1, Unity's coefficient of restitution) to a Bepu contact
-    // spring DAMPING RATIO so the measured rebound energy ≈ bounciness² (rebound apex ≈ b²·drop).
-    // Bepu's contact is a spring: damping ratio 1 = critically damped (no bounce), 0 = undamped
-    // (full bounce). The relationship between damping ratio and the realized restitution is highly
-    // non-linear at a fixed 30 Hz / 60 Hz-substepped solver, so this is an EMPIRICAL fit measured
-    // by the P1 restitution harness (e:/tmp/bal-phys-overhaul/measure): a near-undamped spring is
-    // needed before a 0.5 sphere rebounds meaningfully, and the curve is steep near the top. The
-    // piecewise-power fit below was tuned so b ∈ {0,.3,.5,.7,.9,1} land within ±0.05 of b² rebound.
-    // Restitution is applied at the VELOCITY level (see BepuContactTracker.ApplyRestitutionImpulse),
-    // not through the contact spring. Bepu's spring-based bounce saturates near a ~0.1 rebound ratio
-    // even fully undamped at this solver rate (measured: high frequency kills it, the substep budget
-    // can't represent the spring's oscillation) — so the spring stays CRITICALLY DAMPED for rock-
-    // solid resting/stacking, and a measured velocity-flip impulse on contact Enter provides the
-    // real coefficient-of-restitution bounce. This keeps Bepu's stability guarantees AND gives a
-    // true e²-energy rebound, which the spring model alone cannot.
-
     TkVector3 gravity = new(0f, -9.81f, 0f);
     internal Vector3 GravityNumerics = new(0f, -9.81f, 0f);
 
@@ -93,11 +59,8 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         }
     }
 
-    // Injected from the engine's LayerManager at bootstrap (see IPhysicsWorld). Read on narrowphase
-    // worker threads; only mutated single-threaded between steps, so the field read is safe.
     public Func<int, int, bool> LayerCollisionMatrix { get; set; }
 
-    // Consulted by the narrowphase before generating contacts. Null predicate = collide everything.
     internal bool LayersCollide(CollidableReference a, CollidableReference b) {
         Func<int, int, bool> matrix = LayerCollisionMatrix;
         if (matrix is null)
@@ -106,9 +69,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
     }
 
     void EnsureSimulation() {
-        // 4 substeps = 240Hz effective contact integration at the engine's 60Hz fixed step:
-        // contact springs (incl. the Bounciness approximation) actually resolve instead of
-        // sitting at the stability limit, and stacks stay solid with few velocity iterations.
         Simulation ??= Simulation.Create(
             bufferPool,
             new NarrowPhaseCallbacks { World = this },
@@ -121,7 +81,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             return;
 
         Simulation.Timestep(deltaTime, dispatcher);
-        Contacts.Flush(); // narrowphase workers recorded contacts during the timestep
+        Contacts.Flush();
     }
 
     public void Reset() {
@@ -147,8 +107,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         bufferPool.Clear();
     }
 
-    // ---- Bodies -------------------------------------------------------------
-
     public IPhysicsBody AddBody(in PhysicsBodyDescription description) {
         if (description.Shapes is null || description.Shapes.Length == 0)
             return null;
@@ -159,8 +117,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
                 out Vector3 centerOffset, out bool[] childTriggers))
             return null;
 
-        // Compound shapes are recentered around their center of mass; the body pose must sit
-        // there, while IPhysicsBody.Position keeps reporting the entity origin.
         Quaternion orientation = ToNumerics(description.Rotation);
         var pose = new RigidPose(
             ToNumerics(description.Position) + Vector3.Transform(centerOffset, orientation),
@@ -179,18 +135,9 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             staticChildTriggers[handle.Value] = childTriggers;
         }
         else {
-            // Continuous detection with a bounded speculative margin: a fast faller crosses
-            // more than its own size per 60Hz step and tunnels straight through thin one-sided
-            // meshes under speculative contacts alone. The sweep only runs when velocity
-            // outpaces the margin (≳6 m/s here), so slow/resting bodies pay nothing.
             var collidable = new CollidableDescription(shapeIndex, 0.1f,
                 ContinuousDetection.Continuous(1e-3f, 1e-3f));
 
-            // FreezeRotation: zero the inverse inertia tensor so NO torque can rotate the body —
-            // the standard way to build an upright character capsule. Without it a freely-rotating
-            // capsule converts the tiniest contact asymmetry into a roll, and friction turns that
-            // roll into a phantom sideways drift (a resting player slides off on its own). Mass
-            // (inverse mass) is untouched, so it still falls and responds to linear forces.
             if (description.Type == PhysicsBodyType.Dynamic && description.FreezeRotation)
                 inertia.InverseInertiaTensor = default;
 
@@ -212,7 +159,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         if (body is not BepuBody bepuBody || !bepuBody.Valid || Simulation is null)
             return;
 
-        Contacts.OnBodyRemoved(bepuBody); // queue Exits for anything it was touching
+        Contacts.OnBodyRemoved(bepuBody);
 
         if (bepuBody.IsStatic) {
             Simulation.Statics.Remove(bepuBody.StaticHandle);
@@ -227,7 +174,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             bodyChildTriggers.Remove(bepuBody.BodyHandle.Value);
         }
 
-        // Shapes are per-body in this engine (never shared), so dispose with the body.
         Simulation.Shapes.RecursivelyRemoveAndDispose(bepuBody.ShapeIndex, bufferPool);
         bepuBody.Invalidate();
     }
@@ -243,10 +189,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             : new ContactMaterial(0.6f, 0f);
     }
 
-    // Is child `childIndex` of this collidable a trigger? childIndex is the compound child index
-    // Bepu hands the per-child narrowphase (= our build order). Out-of-range / missing → not a
-    // trigger. A whole-body trigger (legacy PhysicsBodyDescription.IsTrigger) also makes every
-    // child a trigger via the material flag, so callers OR this with GetMaterial(...).IsTrigger.
     internal bool GetChildTrigger(CollidableReference collidable, int childIndex) {
         Dictionary<int, bool[]> source =
             collidable.Mobility == CollidableMobility.Static ? staticChildTriggers : bodyChildTriggers;
@@ -258,14 +200,10 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
                && triggers[childIndex];
     }
 
-    // Pose of either a body or a static — used by the contact tracker on narrowphase worker
-    // threads (read-only access to pose memory during collision detection is safe).
     internal RigidPose GetPose(CollidableReference collidable) =>
         collidable.Mobility == CollidableMobility.Static
             ? Simulation.Statics[collidable.StaticHandle].Pose
             : Simulation.Bodies[collidable.BodyHandle].Pose;
-
-    // ---- Shapes -------------------------------------------------------------
 
     bool TryBuildShape(in PhysicsBodyDescription description, out TypedIndex shapeIndex,
         out BodyInertia inertia, out Vector3 centerOffset, out bool[] childTriggers) {
@@ -279,7 +217,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
                       parts[0].LocalPosition == TkVector3.Zero &&
                       parts[0].LocalRotation == Quaternion.Identity;
 
-        // A mesh is concave: legal only as the sole shape of a non-dynamic body.
         if (parts.Length == 1 && parts[0].Shape is MeshShape meshShape) {
             if (description.Type == PhysicsBodyType.Dynamic) {
                 Debugging.LogError("Physics: mesh shapes are static/kinematic only; dynamic body rejected.");
@@ -291,7 +228,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             }
 
             shapeIndex = AddMesh(meshShape);
-            childTriggers = [parts[0].IsTrigger]; // single shape → child index 0
+            childTriggers = [parts[0].IsTrigger];
             return true;
         }
 
@@ -301,17 +238,12 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             return shapeIndex.Exists;
         }
 
-        // Multiple shapes or an offset single shape -> compound. Build the trigger flags in the SAME
-        // order children are actually added (skipped parts don't get a compound child, so this stays
-        // 1:1 with the compound's child index — the index Bepu hands the per-child narrowphase).
         var builder = new CompoundBuilder(bufferPool, Simulation.Shapes, parts.Length);
         var triggerList = new List<bool>(parts.Length);
         try {
             int added = 0;
             foreach (PhysicsShapePart part in parts) {
                 var localPose = new RigidPose(ToNumerics(part.LocalPosition), ToNumerics(part.LocalRotation));
-                // Weight children by volume so the compound's mass distribution follows the
-                // geometry (CompoundBuilder normalizes weights into the total mass).
                 float weight = MathF.Max(1e-4f, VolumeOf(part.Shape));
                 switch (part.Shape) {
                     case BoxShape box:
@@ -380,12 +312,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
     }
 
     TypedIndex AddMesh(MeshShape meshShape) {
-        // Bepu mesh triangles are ONE-SIDED, solid from the side OPPOSITE the right-handed
-        // winding normal — the reverse of the engine's render convention (OpenGL CCW front
-        // faces). Swap two indices so the RENDERED front face is the solid side, Unity-style:
-        // the surface you can see is the surface that collides; backfaces pass through.
-        // (Do NOT emit both windings to fake double-sided collision: a fast impact penetrates
-        // slightly and the flipped triangle then ejects the body out the back.)
         int triangleCount = meshShape.Indices.Length / 3;
         bufferPool.Take(triangleCount, out Buffer<Triangle> triangles);
         for (int i = 0; i < triangleCount; i++) {
@@ -399,7 +325,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         return Simulation.Shapes.Add(mesh);
     }
 
-    // Bepu shapes reject zero/negative dimensions; clamp to a millimeter.
     const float MinDimension = 1e-3f;
 
     static Box MakeBox(BoxShape box) => new(
@@ -420,8 +345,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         _ => 0f,
     };
 
-    // ---- Queries ------------------------------------------------------------
-
     struct ClosestRayHitHandler : IRayHitHandler {
         public float T;
         public Vector3 Normal;
@@ -430,14 +353,13 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         public int LayerMask;
         public BepuPhysicsWorld World;
 
-        // Filter by layer mask up front so excluded layers cost nothing past the broadphase.
         public bool AllowTest(CollidableReference collidable) =>
             LayerMask == ~0 || (LayerMask & (1 << World.GetMaterial(collidable).Layer)) != 0;
         public bool AllowTest(CollidableReference collidable, int childIndex) => true;
 
         public void OnRayHit(in RayData ray, ref float maximumT, float t, in Vector3 normal,
             CollidableReference collidable, int childIndex) {
-            maximumT = t; // clip subsequent tests to the nearest hit so far
+            maximumT = t;
             if (t > T)
                 return;
             T = t;
@@ -471,23 +393,16 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             ? staticsByHandle.GetValueOrDefault(collidable.StaticHandle.Value)
             : bodiesByHandle.GetValueOrDefault(collidable.BodyHandle.Value);
 
-    // ---- Constraints (joints, P6) -------------------------------------------
-
     public IPhysicsConstraint AddConstraint(in PhysicsConstraintDescription description) {
         if (Simulation is null)
             return null;
 
-        // Bepu constraints are body-to-body and need a DYNAMIC/KINEMATIC body handle (statics can't be
-        // constrained). BodyA must be a non-static body.
         if (description.BodyA is not BepuBody bodyA || !bodyA.Valid || bodyA.IsStatic) {
             Debugging.LogError("Physics: AddConstraint needs a non-static Rigidbody as body A.");
             return null;
         }
         BodyHandle handleA = bodyA.BodyHandle;
 
-        // Body B: either another non-static body, or a private kinematic ANCHOR body created at the
-        // world anchor point (Bepu can't constrain to a static, so a zero-mass kinematic stands in for
-        // "the world"). The anchor is shapeless — it exists only to host the constraint.
         BodyHandle handleB;
         BodyHandle anchorBody = default;
         bool hasAnchor = false;
@@ -495,9 +410,8 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             handleB = bodyB.BodyHandle;
         }
         else {
-            // World anchor at body A's world anchor position (so LocalAnchorB = 0 lines up).
             Vector3 worldAnchor = ToNumerics(bodyA.Position) +
-                Vector3.Transform(ToNumerics(description.LocalAnchorA), ToNumerics(bodyA.Rotation));
+                                  Vector3.Transform(ToNumerics(description.LocalAnchorA), ToNumerics(bodyA.Rotation));
             anchorBody = Simulation.Bodies.Add(
                 BodyDescription.CreateKinematic(new RigidPose(worldAnchor), default, -1f));
             handleB = anchorBody;
@@ -518,22 +432,16 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         return wrapper;
     }
 
-    // Wake a constrained body on joint removal and seed one step of gravity so Bepu doesn't instantly
-    // re-sleep it (a zero-velocity body that just lost its support would otherwise freeze in mid-air).
     void WakeAndNudge(BepuBody body) {
         if (body is null || body.IsStatic || !Simulation.Bodies.BodyExists(body.BodyHandle))
             return;
-        // A body that slept while a joint held it lives in a SLEEPING SET; just flipping Awake on the
-        // BodyReference doesn't pull it back into the active set, so the next Step still skips it.
-        // Simulation.Awakener does the real island transition. Then seed a step of gravity so Bepu
-        // doesn't immediately re-sleep a body whose velocity is still ~0.
         Simulation.Awakener.AwakenBody(body.BodyHandle);
         body.LinearVelocity += GravityNumerics * (1f / 60f);
     }
 
     static SpringSettings SpringFor(in PhysicsConstraintDescription d) =>
         d.Frequency > 0f ? new SpringSettings(d.Frequency, d.DampingRatio)
-                         : new SpringSettings(30f, 1f); // rigid default
+                         : new SpringSettings(30f, 1f);
 
     ConstraintHandle BuildConstraint(in PhysicsConstraintDescription d, BodyHandle a, BodyHandle b,
         SpringSettings spring) {
@@ -555,9 +463,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             }
 
             case PhysicsConstraintType.Fixed: {
-                // Weld locks the CURRENT relative pose of B in A's frame: LocalOffset = where B's
-                // origin sits in A-local right now, LocalOrientation = B's orientation in A-local.
-                // (Anchor offsets aren't used — a weld fixes the whole bodies, not two points.)
                 RigidPose poseA = Simulation.Bodies[a].Pose;
                 RigidPose poseB = Simulation.Bodies[b].Pose;
                 Quaternion invOrientA = Quaternion.Conjugate(poseA.Orientation);
@@ -603,19 +508,12 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         if (bepu.HasAnchor)
             Simulation.Bodies.Remove(bepu.AnchorBody);
 
-        // Wake the freed bodies AFTER removing the constraint: a body that slept while the joint held
-        // it in place (velocity ≈ 0) would otherwise stay asleep — and asleep bodies skip gravity
-        // integration, so it would hang frozen in mid-air instead of falling. Just setting Awake isn't
-        // enough: Bepu re-sleeps a zero-velocity body almost immediately, so also seed one step of
-        // gravity so the next timestep sees it moving and keeps it active.
         WakeAndNudge(bepu.BodyA);
         WakeAndNudge(bepu.BodyB);
 
         constraints.Remove(bepu);
         bepu.Invalidate();
     }
-
-    // ---- Shape-cast (sweep) -------------------------------------------------
 
     struct ClosestSweepHitHandler : ISweepHitHandler {
         public float T;
@@ -633,7 +531,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         public void OnHit(ref float maximumT, float t, in Vector3 hitLocation, in Vector3 hitNormal,
             CollidableReference collidable) {
             if (t < maximumT)
-                maximumT = t; // clip the traversal to the nearest hit so far
+                maximumT = t;
             if (t >= T)
                 return;
             T = t;
@@ -643,7 +541,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             Hit = true;
         }
 
-        // Shape already overlapping at the start of the sweep: treat as a zero-distance hit.
         public void OnHitAtZeroT(ref float maximumT, CollidableReference collidable) {
             maximumT = 0f;
             T = 0f;
@@ -663,14 +560,12 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         float dirLen = direction.Length();
         if (dirLen < 1e-6f || maxDistance <= 0f)
             return false;
-        TkVector3 dir = direction / dirLen; // unit velocity → sweep T equals travel distance
+        TkVector3 dir = direction / dirLen;
 
         var pose = new RigidPose(ToNumerics(position), ToNumerics(rotation));
         var velocity = new BodyVelocity { Linear = ToNumerics(dir) };
         var handler = new ClosestSweepHitHandler { T = float.MaxValue, LayerMask = layerMask, World = this };
 
-        // Bepu's Sweep is generic over the (unmanaged) convex shape type, so dispatch per kind.
-        // Concave meshes are not valid sweep shapes — reject them like a dynamic mesh body.
         switch (shape) {
             case BoxShape box:
                 Simulation.Sweep(MakeBox(box), pose, velocity, maxDistance, bufferPool, ref handler);
@@ -691,8 +586,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
 
         hit.Distance = handler.T;
         hit.Point = position + dir * handler.T;
-        // Sweep returns the contact location too; prefer it when present (more accurate than the
-        // shape-origin projection above for an off-axis touch).
         TkVector3 location = ToOpenTK(handler.Location);
         if (location.LengthSquared() > 0f)
             hit.Point = location;
@@ -702,12 +595,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         return true;
     }
 
-    // ---- Overlap queries ----------------------------------------------------
-
-    // Broadphase AABB sweep collecting collidables whose bounds intersect the query box, layer- and
-    // distance-filtered. v1 precision: the broadphase test is an AABB-vs-AABB overlap, then spheres
-    // do a precise center-distance refine; box queries return the AABB-level set (conservative, like
-    // Unity's OverlapBox NonAlloc fast path). Good for trigger/aggro/pickup volumes.
     struct OverlapCollector : IBreakableForEach<CollidableReference> {
         public BepuPhysicsWorld World;
         public int LayerMask;
@@ -735,9 +622,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         Vector3 c = ToNumerics(center);
         var r = new Vector3(radius);
 
-        // Gather the broadphase candidates, then refine: keep only bodies whose origin is within
-        // radius (a cheap, slightly loose sphere test — exact shape-vs-sphere would need per-shape
-        // closest-point math; this matches the conservative-then-refine contract above).
         int before = results.Count;
         var candidates = new List<IPhysicsBody>();
         QueryBounds(c - r, c + r, layerMask, candidates);
@@ -755,8 +639,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         if (Simulation is null)
             return 0;
 
-        // Rotated box -> its world AABB (the broadphase is AABB-based). Conservative for rotated
-        // queries; v1 accepts the slop (documented).
         Vector3 c = ToNumerics(center);
         Vector3 h = ToNumerics(halfExtents);
         System.Numerics.Quaternion q = ToNumerics(orientation);
@@ -770,12 +652,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
         return results.Count - before;
     }
 
-    // ---- Precise overlap (narrowphase shape test) ---------------------------
-
-    // Collects EVERY body the swept shape touches at (or very near) zero distance — i.e. true
-    // overlaps with the query shape, not just AABB candidates. A near-zero-distance sweep reports
-    // every initially-overlapping collidable through OnHit (t≈0) / OnHitAtZeroT; we keep all of them
-    // (layer-filtered, deduplicated) instead of clipping to the nearest like a cast.
     struct OverlapSweepCollector : ISweepHitHandler {
         public BepuPhysicsWorld World;
         public int LayerMask;
@@ -785,7 +661,7 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             LayerMask == ~0 || (LayerMask & (1 << World.GetMaterial(collidable).Layer)) != 0;
         public bool AllowTest(CollidableReference collidable, int child) => true;
 
-        const float OverlapEpsilon = 1e-3f; // a hit within this travel distance counts as an overlap
+        const float OverlapEpsilon = 1e-3f;
 
         void Add(CollidableReference collidable) {
             BepuBody body = World.Lookup(collidable);
@@ -795,8 +671,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
 
         public void OnHit(ref float maximumT, float t, in Vector3 hitLocation, in Vector3 hitNormal,
             CollidableReference collidable) {
-            // Do NOT lower maximumT — we want to keep visiting every overlapping leaf, not converge on
-            // the nearest. Only count hits already touching at the start of the sweep.
             if (t <= OverlapEpsilon)
                 Add(collidable);
         }
@@ -810,8 +684,6 @@ public sealed class BepuPhysicsWorld : IPhysicsWorld {
             return 0;
 
         var pose = new RigidPose(ToNumerics(position), ToNumerics(rotation));
-        // A short sweep in an arbitrary direction; only the zero-distance (initial overlap) hits are
-        // kept, so the direction is irrelevant. Velocity is unit so maxT is a distance.
         var velocity = new BodyVelocity { Linear = new Vector3(0f, -1f, 0f) };
         var handler = new OverlapSweepCollector { World = this, LayerMask = layerMask, Results = results };
         const float tinySweep = 1e-3f;

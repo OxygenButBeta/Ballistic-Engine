@@ -3,10 +3,6 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal map <project>` — the project overview an agent reads FIRST: scenes (with entity counts and
-// the startup flag), game-script components, and the asset inventory by importer and top-level
-// folder. GL-free; one command replaces the "read files alphabetically and guess" exploration that
-// burns agent turns on unfamiliar projects.
 internal sealed class MapCommand : ICommand {
     public string Name => "map";
     public string Summary => "Project overview: scenes, scripts, asset inventory.";
@@ -19,7 +15,6 @@ internal sealed class MapCommand : ICommand {
         BallisticProject project = BallisticProject.Open(root);
         SceneFile.BuildRegistryForRoot(root);
 
-        // Asset inventory from the .meta sidecars.
         int totalAssets = 0;
         var byImporter = new SortedDictionary<string, int>(StringComparer.Ordinal);
         var byTopFolder = new SortedDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -35,7 +30,6 @@ internal sealed class MapCommand : ICommand {
                 scenePaths.Add(path);
         }
 
-        // Scenes with entity counts (scene files are small text; parse failures report as -1).
         string? startup = project.Manifest?.StartupScene?.Replace('\\', '/');
         var scenes = scenePaths.Select(path => {
             int entities = -1, components = -1;
@@ -46,7 +40,8 @@ internal sealed class MapCommand : ICommand {
                 components = (doc?.Entities?.Sum(e => e.Components?.Count ?? 0) ?? 0)
                            + (doc?.SceneComponents?.Count ?? 0);
             }
-            catch { /* corrupt scene: counts stay -1; bal validate pinpoints why */ }
+            catch {
+            }
             return new {
                 path,
                 startup = string.Equals(path, startup, StringComparison.OrdinalIgnoreCase) ? true : (bool?)null,
@@ -55,7 +50,6 @@ internal sealed class MapCommand : ICommand {
             };
         }).ToList();
 
-        // Game-script components = registry entries that live outside the engine assembly.
         var engineAssembly = typeof(SceneManager).Assembly;
         var scriptComponents = ComponentRegistry.Menu
             .Concat(ComponentRegistry.SceneMenu)

@@ -2,9 +2,6 @@ using System.Runtime.InteropServices;
 
 namespace BallisticEngine.AssetPipeline;
 
-// CPU conversion of an equirectangular panorama (typically .hdr/.exr) into 6 cubemap faces,
-// in the renderer's face order: +X, -X, +Y, -Y, +Z, -Z. Output format matches the input
-// (RGBA8 or RGBA32F). Bilinear sampling.
 public static class EquirectToCubemap {
     public static TextureData[] Convert(in TextureData equirect, int faceSize) {
         faceSize = Math.Clamp(faceSize, 16, 4096);
@@ -26,7 +23,6 @@ public static class EquirectToCubemap {
 
         for (var y = 0; y < size; y++) {
             for (var x = 0; x < size; x++) {
-                // Face texel -> direction -> equirect uv.
                 var uc = (x + 0.5f) / size * 2f - 1f;
                 var vc = (y + 0.5f) / size * 2f - 1f;
                 Vector3 dir = FaceDirection(face, uc, vc).Normalized();
@@ -51,8 +47,6 @@ public static class EquirectToCubemap {
                         float s01 = srcFloats[(y1 * src.Width + x0) * 4 + c];
                         float s11 = srcFloats[(y1 * src.Width + x1) * 4 + c];
                         var value = Lerp(Lerp(s00, s10, tx), Lerp(s01, s11, tx), ty);
-                        // The cubemap uploads as half-float: radiance above fp16 max (~65504,
-                        // e.g. the sun disc) becomes Inf and tonemaps to NaN/black holes. Clamp.
                         dstFloats[dst + c] = float.IsFinite(value) ? Math.Min(value, 60000f) : 60000f;
                     }
                     else {
@@ -70,7 +64,6 @@ public static class EquirectToCubemap {
         return new TextureData(size, size, src.Format, pixels);
     }
 
-    // GL cubemap face conventions, order +X, -X, +Y, -Y, +Z, -Z.
     static Vector3 FaceDirection(int face, float u, float v) => face switch {
         0 => new Vector3(1f, -v, -u),
         1 => new Vector3(-1f, -v, u),

@@ -1,12 +1,5 @@
 namespace BallisticEngine;
 
-// Aerial perspective: the atmospheric scattering haze that distant opaque geometry picks up as it
-// recedes toward the horizon — the #1 cue that sells scale (far buildings/mountains desaturate and
-// shift toward the sky colour). The DX12 backend bakes a Hillaire-2020 froxel volume (a small 3D LUT
-// of accumulated single-scatter inscatter + transmittance from the camera) using the SAME Rayleigh/
-// Mie/ozone atmosphere the ProceduralSky shows, so geometry fades into exactly the colour of the sky
-// behind it — never a flat blue-white veil. ON by default at a calibrated strength; only applies while
-// a ProceduralSky drives the atmosphere.
 public sealed class AerialPerspective : VolumeComponent {
     [Tooltip("Master toggle. When off the scene gets no atmospheric distance haze.")]
     public readonly BoolParameter enabled = new(true);

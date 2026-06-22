@@ -1,8 +1,5 @@
 namespace BallisticEngine.AssetPipeline.Loaders;
 
-// Builds a cubemap directly from an equirectangular image asset (.hdr/.exr panorama).
-// Used when an image asset is requested AS a Texture3D — e.g. dragging an EXR onto a
-// Skybox component's Cubemap slot.
 public static class EquirectCubemapLoader {
     public const int DefaultFaceSize = 512;
 

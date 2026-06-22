@@ -1,19 +1,5 @@
-using System.Numerics;
-
 namespace BallisticEngine.Editor;
 
-// A worked EXAMPLE of the user-extensible editor-window API — the exact shape a game developer writes in
-// their GameEditorScripts assembly (Assets/Editor/). It demonstrates the whole contract:
-//
-//   1. Derive from the public EditorWindow base.
-//   2. Mark the class with [EditorWindowMeta(...)] — this alone makes it appear under the Window menu,
-//      gives it a toggle/checkmark, and a floating window through the shell. No ctor, no registration.
-//   3. Fill OnGui(IEditorGui) — draw with the seam ONLY. There is no `using Hexa.NET.ImGui` here, and a
-//      game-editor script could not import it anyway (the player never ships ImGui).
-//
-// This lives in the editor assembly so it also serves as a smoke test that discovery + the Window menu +
-// WindowShell standalone draw all work end-to-end. A real game window is identical but lives in
-// Assets/Editor/ and is compiled into the editor-only GameEditorScripts.dll.
 [EditorWindowMeta("Example Tool", "Window/Example Tool", order: 200, Icon = EditorIcons.Wrench, Width = 360, Height = 280)]
 internal sealed class ExampleEditorWindow : EditorWindow {
     int counter;
@@ -21,8 +7,6 @@ internal sealed class ExampleEditorWindow : EditorWindow {
     string note = "edit me";
     bool toggle;
 
-    // BALLISTIC_EXAMPLE_WINDOW=1 opens it at startup — lets a headless run exercise the discovery + draw
-    // path without clicking the Window menu (pure verification door; harmless when unset).
     public ExampleEditorWindow() =>
         Open = Environment.GetEnvironmentVariable("BALLISTIC_EXAMPLE_WINDOW") == "1";
 

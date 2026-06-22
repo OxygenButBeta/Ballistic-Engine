@@ -1,25 +1,7 @@
 namespace BallisticEngine;
 
-// DDGI global illumination override — the product control for the world-space probe-grid GI (the HW-RT diffuse
-// stack that replaced Lumen V2). When enabled, a uniform 3D probe grid covers the scene; each probe traces the
-// sphere with hardware ray tracing and stores octahedral irradiance + visibility moments, and every pixel
-// trilinearly gathers the probes around it. View-independent (one EMA feedback loop) — no screen-space temporal
-// or denoise. There is NO screen-space fallback: without hardware ray tracing the GI is unavailable (the
-// renderer hard-gates on it), so this override only takes effect on RT-capable hardware.
-//
-// Defaults mirror PostProcessSettings (a scene with no GI volume still gets DDGI on at the engine defaults).
-// Drives the DX12 DDGI pass via VolumePostProcessing.Apply → PostProcessSettings; the BALLISTIC_DX12_DDGI_*
-// env doors still override each dial for A/B.
-
-// Probe-grid density preset. A tier just picks the grid resolution (X×Y×Z) for a frame-time target — relight
-// cost is per-probe, so probe count is the dominant knob. Custom = author the three counts by hand.
 public enum GiQuality { High, Balanced, Performance, Custom }
 
-// Where the probe grid gets its bounds. SceneAuto fits the whole scene's world AABB (default — the
-// historical behaviour). Volume confines the grid to THIS GI volume's box, so a far stray object can't
-// inflate the AABB and starve the room of probes (the cause of visible probe blobs / corner stepping /
-// flickering buried probes in scenes with distant geometry). Volume mode needs a LOCAL volume (IsGlobal
-// off) with a box drawn around the lit area; a global volume has no box → falls back to SceneAuto.
 public enum GiBoundsMode { SceneAuto, Volume }
 
 public sealed class GiVolume : VolumeComponent {
@@ -70,10 +52,6 @@ public sealed class GiVolume : VolumeComponent {
              "along its normal. Higher = less self-shadow/acne but more leak through thin walls; lower = tighter " +
              "contact but risk of self-occlusion darkening. Default 0.2.")]
     public readonly ClampedFloatParameter normalBias = new(0.2f, 0f, 2f);
-
-    // NOTE: "reflections sample the GI" is controlled by the Reflections volume's `sampleRadianceCache` toggle
-    // (it feeds fx.DdgiReflections), NOT here — a duplicate dial on this component was dead (never plumbed) and
-    // was removed to avoid a knob that silently did nothing.
 
     [Tooltip("How much the AmbientOcclusion volume's GTAO darkens the GI's contact shading. DEFAULT 0: GTAO is " +
              "screen-space (ghosting under motion) and the RT trace already carries macro occlusion. 0 = none, 1 = full.")]

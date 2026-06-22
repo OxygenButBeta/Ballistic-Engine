@@ -1,40 +1,27 @@
-using System;
-using System.Collections.Generic;
-using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 using Vortice.Mathematics;
-using GLMatrix4 = System.Numerics.Matrix4x4;   // engine math is System.Numerics now
+using GLMatrix4 = System.Numerics.Matrix4x4;
 using GLVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.DX12;
 
-// Scene ray-tracing acceleration structures for the DXR effects (shadows/reflections/GI). Builds one BLAS
-// per unique mesh (over its whole position/index buffer — opaque, no per-submesh split needed for tracing)
-// and a TLAS over one instance per renderer (world matrix). Cached by a geometry stamp: a static scene
-// builds once; the TLAS rebuilds (cheap) when transforms/instances change, BLAS only when a new mesh
-// appears. Both SunTemple + Bistro are single whole-mesh renderers → 1 BLAS + 1 instance. The TLAS SRV
-// (a null-resource RaytracingAccelerationStructure view) is what the RT passes bind.
 public sealed class Dx12SceneAS : IDisposable {
     readonly Dx12Device dev;
     readonly ID3D12Device5 device5;
 
-    readonly Dictionary<Mesh, ID3D12Resource> blasByMesh = new();   // cached per mesh (never rebuilt)
+    readonly Dictionary<Mesh, ID3D12Resource> blasByMesh = new();
     ID3D12Resource tlas;
     int stamp = -1;
 
     public ulong TlasAddress => tlas?.GPUVirtualAddress ?? 0;
     public bool Valid => tlas != null;
 
-    // Per-instance accessors (same iteration order as Dx12RtGeometry → InstanceID() lines up). Lumen V2 P3
-    // reads each instance's world matrix to transform the mesh's object-space triangle vertices into world
-    // space for card lighting. Read-only snapshot of the last Ensure.
     public int InstanceCount => instances.Count;
     public Matrix4x4 InstanceWorld(int i) => instances[i].world;
     public int InstanceTriangleCount(int i) => instances[i].mesh.IndexBuffer.ElementCount / 3;
-    // The CPU mesh behind an instance — Lumen V2 #2A reads its object-space positions/normals/indices to build a
-    // per-mesh triangle clustering (the cluster radiance cache). Same instance order as the accessors above.
+
     public Mesh InstanceMesh(int i) => instances[i].mesh;
 
     public Dx12SceneAS(Dx12Device device) {
@@ -44,8 +31,6 @@ public sealed class Dx12SceneAS : IDisposable {
 
     readonly List<(Mesh mesh, Matrix4x4 world)> instances = new();
 
-    // Rebuild the AS if the scene geometry/instances changed since last frame (stamp compare). Cheap no-op
-    // for a static scene after the first build.
     public void Ensure(IEnumerable<IStaticMeshRenderer> renderers) {
         instances.Clear();
         var h = new HashCode();
@@ -68,7 +53,6 @@ public sealed class Dx12SceneAS : IDisposable {
     unsafe void Build() {
         if (instances.Count == 0) { tlas?.Dispose(); tlas = null; return; }
 
-        // 1. Ensure a BLAS exists for every unique mesh (build the missing ones).
         var toBuild = new List<(Mesh mesh, BuildRaytracingAccelerationStructureInputs inputs, ID3D12Resource result, ID3D12Resource scratch)>();
         foreach (var (mesh, _) in instances) {
             if (blasByMesh.ContainsKey(mesh)) continue;
@@ -95,7 +79,6 @@ public sealed class Dx12SceneAS : IDisposable {
             toBuild.Add((mesh, inputs, result, scratch));
         }
 
-        // 2. Instance descriptors (one per renderer, world matrix → DXR 3x4 row-major instance-to-world).
         int instSize = Marshal.SizeOf<RaytracingInstanceDescription>();
         ID3D12Resource instBuf = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties,
             HeapFlags.None, ResourceDescription.Buffer((ulong)((long)instSize * instances.Count)), ResourceStates.GenericRead);
@@ -119,14 +102,6 @@ public sealed class Dx12SceneAS : IDisposable {
         ID3D12Resource newTlas = AsBuffer(tlasPre.ResultDataMaxSizeInBytes, ResourceStates.RaytracingAccelerationStructure);
         ID3D12Resource tlasScratch = AsBuffer(tlasPre.ScratchDataSizeInBytes, ResourceStates.UnorderedAccess);
 
-        // 3. Record all builds (BLAS first, UAV barriers, then TLAS) in one submission.
-        // MUST be ExecuteSyncImmediate (submit + WaitForGpu NOW), NOT ExecuteSync: under the pipelined frame
-        // (P0a, default) ExecuteSync only RECORDS into the open frame list and returns without submitting — the
-        // build runs at EndFrame. But the scratch + instance buffers are disposed IMMEDIATELY below, so the
-        // deferred GPU build would read/write FREED memory → invalid AS → GPU HANG (DEVICE_HUNG, PageFaultVA=0,
-        // reproduced on the RX 9070 XT for RT-GI / RT-shadows). Immediate completes the build before we free its
-        // transient inputs. This is a once-per-stamp cost (static scene = first frame only), so the synchronous
-        // flush is fine — the AS must exist before any RT dispatch this frame anyway.
         dev.ExecuteSyncImmediate(cl => {
             foreach (var b in toBuild) {
                 cl.BuildRaytracingAccelerationStructure(new BuildRaytracingAccelerationStructureDescription {
@@ -149,7 +124,6 @@ public sealed class Dx12SceneAS : IDisposable {
         tlas = newTlas;
     }
 
-    // Create a shader-visible AS SRV (null-resource RaytracingAccelerationStructure view) at `dst`.
     public void CreateTlasSrv(CpuDescriptorHandle dst) {
         dev.Device.CreateShaderResourceView(null, new ShaderResourceViewDescription {
             Format = Format.Unknown, ViewDimension = ShaderResourceViewDimension.RaytracingAccelerationStructure,
@@ -162,8 +136,6 @@ public sealed class Dx12SceneAS : IDisposable {
         dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer(size, ResourceFlags.AllowUnorderedAccess), state);
 
-    // System.Numerics world (row-vector, translation in M41..M43) → DXR Matrix3x4 (row-major, column-vector
-    // instance-to-world) = transpose of the upper 3 rows.
     static Matrix3x4 ToDxrTransform(Matrix4x4 m) => new(
         m.M11, m.M21, m.M31, m.M41,
         m.M12, m.M22, m.M32, m.M42,

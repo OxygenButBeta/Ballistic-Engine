@@ -1,7 +1,5 @@
 namespace BallisticEngine.AssetPipeline;
 
-// Asset reference strings used inside .mat/.shader/.cubemap and project.json:
-// either an "Assets/..." path or a rename-proof "guid:<32 hex>" form.
 public static class AssetRef {
     const string GuidPrefix = "guid:";
 

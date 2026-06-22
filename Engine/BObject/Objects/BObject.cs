@@ -4,11 +4,6 @@
 /// B-Object is the base class for all objects in the engine.
 /// </summary>
 public abstract class BObject {
-    // InstanceId is a unique identifier for each instance of BObject. Settable (internal) so the
-    // scene serializer can RESTORE an entity's identity on load/undo: deserialization rebuilds
-    // entities as fresh objects, and without re-stamping the saved id every undo would orphan the
-    // editor selection (the old object is gone). Reassigned exactly once, right after Instantiate,
-    // before the object is ever used as a hash key — so Equals/GetHashCode stay consistent.
     public Guid InstanceId { get; internal set; } = Guid.NewGuid();
     public string Name = "BObject";
 

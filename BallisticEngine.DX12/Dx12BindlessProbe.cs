@@ -1,26 +1,17 @@
-using System;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
 using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// Self-test for the DX12 SM6.6 BINDLESS foundation (run with BALLISTIC_DX12_BINDLESS_TEST=1): creates a
-// 1x1 texture with a known RGBA, mirrors its SRV into Dx12Backend.BindlessHeap, then a compute shader
-// reads it via ResourceDescriptorHeap[index] (dynamic resources) and writes the texel back. Asserts the
-// readback equals the known value — proving the ...HeapDirectlyIndexed root flag + ResourceDescriptorHeap
-// indexing + shader-visible-heap binding work in Vortice 3.8.3, BEFORE wiring bindless into the GPU-driven
-// geometry pass (one ExecuteIndirect across materials). Kept as a permanent test door.
 public static class Dx12BindlessProbe {
     public static bool SelfTest(Dx12Device dev) {
-        byte[] known = { 200, 100, 50, 255 };   // R,G,B,A
+        byte[] known = { 200, 100, 50, 255 };
         bool ok = true;
-        ID3D12Resource tex = null;   // held alive past the dispatch (a local would be GC-finalized = freed)
+        ID3D12Resource tex = null;
         try {
-            // 1x1 R8G8B8A8_UNorm texture with the known texel (AllShaderResource for the compute read).
             int bindlessIdx = CreateKnownTexture(dev, known, out tex);
 
-            // Compute root sig: b0 = TexIndex (root const), u0 = Out (root UAV); directly-indexed heap flag.
             var idxConst = new RootParameter1(new RootConstants(0, 0, 1), ShaderVisibility.All);
             var uav = new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All);
             using ID3D12RootSignature rootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
@@ -38,9 +29,6 @@ public static class Dx12BindlessProbe {
             using ID3D12Resource outRb = dev.CreateReadbackBuffer(4 * sizeof(uint));
 
             dev.ExecuteSync(cl => {
-                // GOTCHA: SetDescriptorHeaps MUST precede SetComputeRootSignature when using
-                // ResourceDescriptorHeap — binding the bindless heap after the root sig read zeros (the
-                // heap the dynamic-resource flag references wasn't bound yet). This was THE bindless bug.
                 cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
                 cl.SetComputeRootSignature(rootSig);
                 cl.SetPipelineState(pso);
@@ -51,7 +39,7 @@ public static class Dx12BindlessProbe {
                 cl.CopyBufferRegion(outRb, 0, outBuf, 0, 4 * sizeof(uint));
             });
 
-            GC.KeepAlive(tex);   // must survive the GPU read above
+            GC.KeepAlive(tex);
             Span<uint> o = outRb.Map<uint>(0, 4);
             uint r = o[0], g = o[1], b = o[2], a = o[3];
             outRb.Unmap(0);
@@ -73,8 +61,6 @@ public static class Dx12BindlessProbe {
         return ok;
     }
 
-    // Create a 1x1 R8G8B8A8_UNorm texture with `rgba`, transition it to AllShaderResource (compute-readable),
-    // make a persistent SRV, mirror it into the bindless heap, and return the bindless index.
     static unsafe int CreateKnownTexture(Dx12Device dev, byte[] rgba, out ID3D12Resource texOut) {
         const Format fmt = Format.R8G8B8A8_UNorm;
         var desc = ResourceDescription.Texture2D(fmt, 1, 1, 1, 1);
@@ -101,9 +87,6 @@ public static class Dx12BindlessProbe {
             cl.ResourceBarrierTransition(tex, ResourceStates.CopyDest, ResourceStates.AllShaderResource);
         });
 
-        // Create the SRV in the persistent (CPU-only) SrvStore, then mirror it into the bindless heap via
-        // CopyDescriptorsSimple — the exact path the real material table uses (textures keep their SrvStore
-        // home; the bindless table is a copy). Confirms copy-into-bindless works for dynamic indexing.
         int srvIdx = Dx12Backend.SrvStore.Allocate();
         dev.Device.CreateShaderResourceView(tex, new ShaderResourceViewDescription {
             Format = fmt, ViewDimension = ShaderResourceViewDimension.Texture2D,

@@ -1,5 +1,3 @@
-using System;
-using System.Numerics;
 using BallisticEngine.DX12;
 using BallisticEngine.DX12.UI;
 using BallisticEngine.UI;
@@ -8,49 +6,31 @@ using Rect = BallisticEngine.UI.Rect;
 
 namespace BallisticEngine.Editor;
 
-// The design SURFACE of the UI Builder: renders the authored VisualElement tree pixel-perfect through
-// the REAL engine UI backend (Dx12UIRenderer) into an offscreen RT, shows that RT in the editor via
-// gui.Image(), then paints a selection box + drag/resize handles ON TOP with the editor draw-list and
-// routes mouse interaction back into the document.
-//
-// Why the real backend (vs ImGui draw-list approximations): rounded corners, gradients, SDF text,
-// box-shadow all render EXACTLY as the player will draw them — the builder is WYSIWYG, not an
-// approximation. The RT's SRV lives in Dx12Backend.UiHeap (the same heap the ImGui backend samples as
-// ImTextureID), so handing the RT to gui.Image is zero-copy.
-//
-// PERF: the RT is re-rendered ONLY when the document Version changes, the canvas size/zoom changes, or an
-// interaction is in progress — otherwise gui.Image re-samples the cached RT with zero GPU work (the
-// per-frame-flush fix). ROBUSTNESS: RenderDocument is exception-guarded so a bad element never escapes
-// OnGui (which would unbalance ImGui's begin/end and corrupt the whole editor frame), and the RT always
-// lands in PixelShaderResource so ImGui's sample is valid.
 public sealed class UIBuilderCanvas : IDisposable
 {
     readonly Dx12UIRenderer _ui;
     Dx12OffscreenTarget _rt;
     int _rtW, _rtH;
-    int _uiSlot = -1;            // UiHeap slot holding the RT's SRV (the ImGui texture id)
+    int _uiSlot = -1;
     nint _imguiHandle;
-    bool _rtInShaderState;       // true after a render: RT is in PixelShaderResource (sampled by ImGui)
-    int _renderedVersion = -1;   // doc.Version the RT currently reflects (-1 = never)
-    int _renderedW, _renderedH;  // physical RT size the last render used (re-render when the fit changes)
-    bool _renderValid;           // false until the first successful render (don't Image() a blank RT)
+    bool _rtInShaderState;
+    int _renderedVersion = -1;
+    int _renderedW, _renderedH;
+    bool _renderValid;
 
-    // View transform (zoom + pan), in addition to the fit-to-area base scale.
     float _zoom = 1f;
-    Vector2 _pan;                // screen-px offset
-    Vector2 _imgOrigin;          // top-left of the canvas image in screen space (after fit+pan)
-    float _imgScale = 1f;        // logical-px -> screen-px (fit * zoom)
+    Vector2 _pan;
+    Vector2 _imgOrigin;
+    float _imgScale = 1f;
 
-    // Live preview of an interaction pseudo-state on the selection (so :hover/:focus/:active rules show).
     public enum PreviewState { Normal, Hover, Focus, Active }
     public PreviewState Preview { get; set; } = PreviewState.Normal;
 
-    // Interaction state.
     enum DragMode { None, Move, ResizeE, ResizeS, ResizeSE, ResizeW, ResizeN, ResizeNW, ResizeNE, ResizeSW }
     DragMode _drag;
-    Vector2 _dragStartMouse;     // logical px at drag start
-    Rect _dragStartRect;         // selection's resolved rect at grab (logical, absolute)
-    Vector2 _grabInsetOffset;    // (rendered pos) - (computed absolute inset) at grab, so move is jump-free
+    Vector2 _dragStartMouse;
+    Rect _dragStartRect;
+    Vector2 _grabInsetOffset;
     bool _undoPushed;
     bool _panning;
 
@@ -76,7 +56,7 @@ public sealed class UIBuilderCanvas : IDisposable
         }, Dx12Backend.UiHeap.Cpu(_uiSlot));
         _imguiHandle = (nint)Dx12Backend.UiHeap.Gpu(_uiSlot).Ptr;
         _rtInShaderState = false;
-        _renderedVersion = -1;   // RT recreated → force a re-render
+        _renderedVersion = -1;
         _renderValid = false;
     }
 
@@ -88,15 +68,6 @@ public sealed class UIBuilderCanvas : IDisposable
         _renderValid = false;
     }
 
-    // Render the document tree into the RT. Resolves the USS cascade (so classes style the canvas) at the
-    // canvas's LOGICAL size, draws through the real UI backend, transitions the RT to a shader resource.
-    // Exception-guarded: any failure logs and still leaves the RT in PixelShaderResource so ImGui's later
-    // gui.Image sample is valid and OnGui never throws (which would corrupt the editor's ImGui frame).
-    // `physW/physH` is the on-SCREEN pixel size the image will occupy (fit * zoom * DPI). We render the RT
-    // at THAT resolution — not the logical canvas size — so gui.Image presents it 1:1 with no downscale (a
-    // logical-sized RT shown smaller was being bilinear-downsampled, which shredded small SDF text). The UI
-    // backend maps logical geometry across the full physical target (Flush scales by target/canvas), so
-    // text rasterizes at the real pixel density and stays crisp at any zoom.
     void RenderDocument(UIBuilderDocument doc, int physW, int physH)
     {
         float lw = doc.CanvasWidth, lh = doc.CanvasHeight;
@@ -106,12 +77,9 @@ public sealed class UIBuilderCanvas : IDisposable
         {
             if (_rtInShaderState) { _rt.ColorToRenderTarget(); _rtInShaderState = false; }
 
-            // Apply USS classes + inline overrides for real (the cascade), set the preview pseudo-state,
-            // then solve layout at the LOGICAL size (the RT's physical size is handled by Flush's scissor
-            // mapping = target/canvas, so geometry stays in logical px and the shader's InvCanvas matches).
             ApplyPreviewState(doc, true);
             doc.ResolveForRender();
-            ApplyPreviewState(doc, false);   // resolver may have reset classes; re-apply preview on top
+            ApplyPreviewState(doc, false);
             LayoutPass.Solve(doc.Root, lw, lh);
 
             _rt.RenderColorOnlyCleared(_ => { });
@@ -125,20 +93,14 @@ public sealed class UIBuilderCanvas : IDisposable
         catch (Exception e)
         {
             Debugging.LogError($"UI Builder canvas render failed: {e.Message}");
-            // Leave _renderValid as-is (show the last good frame); fall through to PSR transition so the
-            // RT is samplable regardless.
         }
         finally
         {
-            // Always end in PixelShaderResource so gui.Image samples a valid resource (never RENDER_TARGET).
             try { _rt.ColorToShaderResource(); } catch { }
             _rtInShaderState = true;
         }
     }
 
-    // Toggle the preview pseudo-state class on the selection (so :hover/:focus/:active USS rules apply in
-    // the canvas). `on` adds it before resolve; we call with false after resolve to leave the tree clean
-    // for serialization (the class would otherwise be written to disk).
     void ApplyPreviewState(UIBuilderDocument doc, bool on)
     {
         if (Preview == PreviewState.Normal || doc.Selection == null) return;
@@ -151,7 +113,6 @@ public sealed class UIBuilderCanvas : IDisposable
     {
         float lw = doc.CanvasWidth, lh = doc.CanvasHeight;
 
-        // Base fit (never auto-upscale past 1:1), times the user zoom.
         float fit = MathF.Min(size.X / MathF.Max(1f, lw), size.Y / MathF.Max(1f, lh));
         if (fit <= 0f || float.IsNaN(fit) || float.IsInfinity(fit)) fit = 1f;
         fit = MathF.Min(fit, 1f);
@@ -164,12 +125,9 @@ public sealed class UIBuilderCanvas : IDisposable
 
         _imgOrigin = area + (size - imgSize) * 0.5f + _pan;
 
-        // Render the RT at the on-screen PIXEL size (so gui.Image is 1:1 — no downscale blur on SDF text).
         int physW = (int)MathF.Round(Math.Clamp(imgSize.X, 16, 8192));
         int physH = (int)MathF.Round(Math.Clamp(imgSize.Y, 16, 8192));
 
-        // Re-render only when something changed (version / physical size / interacting / preview), else
-        // re-sample the cached RT — zero GPU work.
         bool interacting = _drag != DragMode.None;
         if (!_renderValid || _renderedVersion != doc.Version || _renderedW != physW || _renderedH != physH
             || interacting || _previewDirty)
@@ -181,7 +139,6 @@ public sealed class UIBuilderCanvas : IDisposable
         gui.SetCursorScreenPos(_imgOrigin);
         if (_renderValid) gui.Image(_imguiHandle, imgSize);
 
-        // Full-area invisible button captures clicks/drags/wheel.
         gui.SetCursorScreenPos(area);
         gui.Input.InvisibleButton("##uicanvas", size);
         bool hovered = gui.IsItemHovered();
@@ -199,18 +156,12 @@ public sealed class UIBuilderCanvas : IDisposable
     Vector2 ScreenToLogical(Vector2 screen) => (screen - _imgOrigin) / MathF.Max(1e-4f, _imgScale);
     Vector2 LogicalToScreen(Vector2 logical) => _imgOrigin + logical * _imgScale;
 
-    // ---- palette drop (drag from the palette, drop onto the canvas at the cursor) ----------------------
-    // True when `screenPos` is over the canvas image, with the logical drop point + the container the point
-    // is inside (a Panel/ScrollView under the cursor, else the root). The window uses this to drop a NEW
-    // element at the cursor: parented to that container, absolutely positioned at the local drop point — so
-    // "where you drop is where it lands", not a guessy flex append.
     public bool TryDropTarget(Vector2 screenPos, UIBuilderDocument doc, out Vector2 logical, out VisualElement parent)
     {
         logical = ScreenToLogical(screenPos);
         parent = null;
         if (logical.X < 0 || logical.Y < 0 || logical.X > doc.CanvasWidth || logical.Y > doc.CanvasHeight)
             return false;
-        // The deepest CONTAINER under the point (skip leaf controls — you drop INTO panels, not into a label).
         VisualElement hit = LayoutPass.HitTest(doc.Root, logical);
         parent = ContainerOf(hit) ?? doc.Root;
         return true;
@@ -223,8 +174,6 @@ public sealed class UIBuilderCanvas : IDisposable
         return null;
     }
 
-    // Draw a drop indicator (a marker at the cursor + a highlight on the target container) while a palette
-    // drag hovers the canvas. Called by the window during the drag-drop target block.
     public void DrawDropPreview(IEditorGui gui, UIBuilderDocument doc, Vector2 screenPos)
     {
         if (!TryDropTarget(screenPos, doc, out _, out var parent)) return;
@@ -246,13 +195,12 @@ public sealed class UIBuilderCanvas : IDisposable
         {
             float old = _zoom;
             _zoom = Math.Clamp(_zoom * MathF.Pow(1.1f, wheel), 0.1f, 8f);
-            // Zoom toward the cursor: keep the logical point under the mouse fixed.
             Vector2 m = gui.Input.MousePos;
             Vector2 logicalAtMouse = (m - _imgOrigin) / MathF.Max(1e-4f, _imgScale);
             float newScale = _imgScale / old * _zoom;
             _pan += (m - _imgOrigin) - logicalAtMouse * newScale;
         }
-        // Middle-drag pan.
+
         if (gui.Input.MouseDragging(2)) { _pan += gui.Input.MouseDelta; _panning = true; }
         if (gui.Input.MouseReleased(2)) _panning = false;
     }
@@ -273,8 +221,6 @@ public sealed class UIBuilderCanvas : IDisposable
             else if (inCanvas)
             {
                 VisualElement hit = LayoutPass.HitTest(doc.Root, mouseLogical);
-                // Repeat-click on the already-selected element selects its PARENT (click-through to
-                // containers), Unity-style. Alt-click also selects parent directly.
                 if (hit != null && hit == doc.Selection && hit.Parent != null && !gui.KeyShift)
                     doc.Selection = hit.Parent;
                 else if (hit != null && gui.KeyCtrl && hit.Parent != null)
@@ -285,7 +231,6 @@ public sealed class UIBuilderCanvas : IDisposable
                 if (doc.Selection != null && doc.Selection != doc.Root)
                     BeginDrag(doc, DragMode.Move, mouseLogical);
             }
-            // click in letterbox margin = inert (no deselect)
         }
 
         if (_drag != DragMode.None && doc.Selection != null && gui.Input.MouseDown(0))
@@ -301,7 +246,7 @@ public sealed class UIBuilderCanvas : IDisposable
 
         if (gui.Input.MouseReleased(0))
         {
-            if (_drag != DragMode.None && _undoPushed) doc.SyncInline(doc.Selection);  // commit inline overrides
+            if (_drag != DragMode.None && _undoPushed) doc.SyncInline(doc.Selection);
             _drag = DragMode.None; _undoPushed = false;
         }
     }
@@ -312,15 +257,11 @@ public sealed class UIBuilderCanvas : IDisposable
         _dragStartMouse = mouseLogical;
         _dragStartRect = doc.Selection.ResolvedRect;
         _undoPushed = false;
-        // Capture the offset between where the element is RENDERED and where its absolute inset would place
-        // it, so switching relative->absolute on first move doesn't jump (accounts for parent padding/border).
         var el = doc.Selection;
         Vector2 parentContent = ContentOrigin(el.Parent);
         _grabInsetOffset = new Vector2(_dragStartRect.X - parentContent.X, _dragStartRect.Y - parentContent.Y);
     }
 
-    // The parent's CONTENT-box origin (border-box origin + border + padding left/top) — the reference an
-    // absolutely-positioned child's left/top is measured from. Falls back to (0,0) for a null parent.
     static Vector2 ContentOrigin(VisualElement parent)
     {
         if (parent == null) return Vector2.Zero;
@@ -394,7 +335,7 @@ public sealed class UIBuilderCanvas : IDisposable
 
         uint accent = gui.ColorU32(new Vector4(1f, 0.62f, 0.16f, 1f));
         dl.AddRect(min, max, accent, 0f, 1.5f);
-        if (doc.Selection == doc.Root) return;   // no resize handles on the root canvas
+        if (doc.Selection == doc.Root) return;
 
         foreach (var (_, p) in Handles(r))
         {
@@ -402,7 +343,6 @@ public sealed class UIBuilderCanvas : IDisposable
             dl.AddRect(p - new Vector2(HandleR), p + new Vector2(HandleR), gui.ColorU32(new Vector4(0, 0, 0, 0.6f)), 2f, 1f);
         }
 
-        // Size readout during a drag.
         if (_drag != DragMode.None)
         {
             string txt = $"{(int)r.Width} x {(int)r.Height}";
@@ -410,7 +350,6 @@ public sealed class UIBuilderCanvas : IDisposable
         }
     }
 
-    // Headless verification hook: render + save BMP without an editor window.
     public void RenderToBmp(UIBuilderDocument doc, string bmpPath)
     {
         int pw = (int)MathF.Round(Math.Clamp(doc.CanvasWidth, 16, 4096));

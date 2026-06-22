@@ -1,45 +1,26 @@
-using System.Collections.Generic;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine.UI;
 
-// Turns raw input from the engine Input facade into VisualElement events for one UI panel (P3). Owned by
-// the UIDocument; Update(root, panelRect, logicalSize) runs once per frame after layout.
-//
-// Subsystems:
-//   * Pointer (P3.1): hover Enter/Leave (bubbling) + :hover state; per-button (L/M/R) Down/Up/Click that
-//     bubble; PointerMove; pointer CAPTURE so a press that drags outside the element still streams Move/Up
-//     to it (sliders, scrollbars, window drag); double-click detection.
-//   * Wheel (P3.6): PointerWheel bubbles from the hovered element (feeds ScrollView).
-//   * Focus (P3.2): click focuses the nearest Focusable; Tab/Shift-Tab walk the focus ring; Esc blurs;
-//     :focus state class. Focused element receives keyboard.
-//   * Keyboard (P3.3): KeyDown/KeyUp (edge-detected via Input.IsKeyPressed) + TextInput chars (the host
-//     pushes typed chars via QueueChar — the OpenTK char callback, since the Input facade has no char API).
-//
-// IsHovered/IsPressed/IsFocused setters already flip the hover/active/focus classes + request a restyle
-// (see VisualElement), so this module only sets those flags — it never touches classes directly.
 public sealed class UIInputModule
 {
     readonly PointerEvent _event = new();
     readonly KeyEvent _keyEvent = new();
 
     VisualElement _hovered;
-    VisualElement _captured;                 // element holding pointer capture (press target until release)
+    VisualElement _captured;
     VisualElement _focused;
-    readonly VisualElement[] _pressedBy = new VisualElement[3]; // press target per button (L/M/R)
+    readonly VisualElement[] _pressedBy = new VisualElement[3];
 
     Vector2 _lastLocal;
     bool _hadLocal;
 
-    // double-click bookkeeping (left button)
     VisualElement _lastClickTarget;
     float _timeSinceLastClick = 999f;
     const float DoubleClickSeconds = 0.3f;
 
-    // typed chars pushed by the host this frame (OpenTK OnTextInput) — drained to the focused element.
     readonly Queue<char> _typedChars = new();
 
-    // edge detection for keys we route to UI (the focused element gets all keys; we poll a working set).
     readonly HashSet<Keys> _keysDownLast = new();
     static readonly Keys[] WatchedKeys =
     {
@@ -49,8 +30,6 @@ public sealed class UIInputModule
 
     public VisualElement Focused => _focused;
 
-    // Host pushes a typed character (from the window's text-input callback). Drained to the focused
-    // element as TextInput each Update. Kept here so the UI layer needs no new Input-facade API.
     public void QueueChar(char c) => _typedChars.Enqueue(c);
 
     public VisualElement Update(VisualElement root, Rect panelScreenRect, Vector2 logicalSize, float dt = 0f)
@@ -65,7 +44,6 @@ public sealed class UIInputModule
         float sy = panelScreenRect.Height > 0 ? logicalSize.Y / panelScreenRect.Height : 1f;
         Vector2 local = new((mouse.X - panelScreenRect.X) * sx, (mouse.Y - panelScreenRect.Y) * sy);
 
-        // While captured, the captured element is the logical hit even outside its box (drag tracking).
         VisualElement hit = inside ? LayoutPass.HitTest(root, local) : null;
 
         UpdatePointerMove(local);
@@ -123,7 +101,6 @@ public sealed class UIInputModule
     {
         int idx = (int)pb;
 
-        // Press
         if (Input.IsMouseButtonPressed(mb))
         {
             _pressedBy[idx] = hit;
@@ -132,19 +109,18 @@ public sealed class UIInputModule
                 if (isPrimary)
                 {
                     hit.IsPressed = true;
-                    _captured = hit;                 // capture for drag tracking (P3.1)
-                    SetFocus(NearestFocusable(hit)); // click focuses (P3.2)
+                    _captured = hit;
+                    SetFocus(NearestFocusable(hit));
                 }
                 _event.Reset(local, pb, hit);
                 hit.Bubble(_event, static (n, e) => n.FirePointerDown(e));
             }
             else if (isPrimary)
             {
-                SetFocus(null);                      // click on empty space blurs
+                SetFocus(null);
             }
         }
 
-        // Release
         if (!Input.IsMouseButtonDown(mb) && _pressedBy[idx] != null)
         {
             var pressed = _pressedBy[idx];
@@ -159,7 +135,6 @@ public sealed class UIInputModule
             _event.Reset(local, pb, pressed);
             pressed.Bubble(_event, static (n, e) => n.FirePointerUp(e));
 
-            // Click = release over the SAME element the press started on (web rule).
             if (ReferenceEquals(hit, pressed))
             {
                 _event.Reset(local, pb, pressed);
@@ -169,12 +144,11 @@ public sealed class UIInputModule
                 {
                     if (pressed is Button b && b.Enabled) b.InvokeClick();
 
-                    // double-click (P3.1): a second click on the same target within the window.
                     if (ReferenceEquals(pressed, _lastClickTarget) && _timeSinceLastClick <= DoubleClickSeconds)
                     {
                         _event.Reset(local, pb, pressed);
                         pressed.Bubble(_event, static (n, e) => n.FirePointerDoubleClick(e));
-                        _lastClickTarget = null;          // reset so a triple-click doesn't double-fire
+                        _lastClickTarget = null;
                         _timeSinceLastClick = 999f;
                     }
                     else
@@ -196,8 +170,6 @@ public sealed class UIInputModule
         target.Bubble(_event, static (n, e) => n.FirePointerWheel(e));
     }
 
-    // ---- focus (P3.2) ----
-
     public void SetFocus(VisualElement el)
     {
         if (ReferenceEquals(el, _focused)) return;
@@ -213,13 +185,10 @@ public sealed class UIInputModule
         return null;
     }
 
-    // ---- keyboard (P3.3) ----
-
     void UpdateKeyboard()
     {
         if (!Input.Enabled) return;
 
-        // Tab / Shift-Tab move focus through the ring even with nothing focused.
         if (Input.IsKeyPressed(Keys.Tab))
         {
             bool shift = Input.IsKeyDown(Keys.LeftShift) || Input.IsKeyDown(Keys.RightShift);
@@ -265,15 +234,12 @@ public sealed class UIInputModule
 
     void DrainText()
     {
-        // Pull chars from the central Input facade (host pushes via Input.PushTypedChar) AND the local
-        // QueueChar path (tests). Both feed the focused element; if nothing is focused, drop them.
         while (Input.TryReadTypedChar(out char fc)) _typedChars.Enqueue(fc);
         if (_focused == null) { _typedChars.Clear(); return; }
         while (_typedChars.Count > 0)
             _focused.FireTextInput(_typedChars.Dequeue());
     }
 
-    // The focus ring: all Focusable elements in tree order, sorted by (TabIndex, order). Built per Tab.
     void MoveFocus(int dir)
     {
         var ring = new List<VisualElement>();
@@ -300,7 +266,6 @@ public sealed class UIInputModule
         for (int i = 0; i < kids.Count; i++) CollectFocusable(kids[i], into);
     }
 
-    // Clears all transient state — call when the panel hides so stale hover/press/focus don't survive.
     public void Reset()
     {
         if (_hovered != null) { _hovered.IsHovered = false; _hovered = null; }

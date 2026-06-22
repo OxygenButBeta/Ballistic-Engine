@@ -1,78 +1,50 @@
-using System;
-using System.Numerics;
 using Vortice.Direct3D12;
-using Vortice.DXGI;
-using BallisticEngine;
 
 namespace BallisticEngine.DX12;
 
-// DDGI probe grid — the world-space irradiance cache (the ONE durable substrate the DDGI pass owns).
-//
-// A uniform 3D grid of probes covers the scene's world AABB (padded one cell so surfaces on the boundary are
-// bracketed). Each probe stores its diffuse irradiance in an OCTAHEDRAL cell of OctRes×OctRes float4 texels:
-// irradiance[probe*OctTexels + ty*OctRes+tx]. The relight pass writes the current buffer (UAV) EMA-blended
-// over the previous (SRV); the sample pass reads the current. Two buffers ping-pong by frame → a single
-// world-space EMA feedback loop (NEVER pooled, the whole "radiance cache"). View-independent: no reprojection,
-// no screen-space history → the entire ghosting/disocclusion class never arises.
-//
-// D1: irradiance only. D3 adds a parallel visibility buffer (mean depth, depth²) for the Chebyshev leak fix.
 public sealed class Dx12DdgiProbeGrid : IDisposable
 {
-    public const int OctRes = 8;                  // octahedral cell edge (texels) per probe (irradiance, RTXGI std)
-    public const int OctTexels = OctRes * OctRes; // 64 float4 irradiance texels per probe
-    public const int VisRes = 16;                 // octahedral cell edge for the visibility moments (sharper)
-    public const int VisTexels = VisRes * VisRes; // 256 float2 (mean depth, mean depth²) per probe
+    public const int OctRes = 8;
+    public const int OctTexels = OctRes * OctRes;
+    public const int VisRes = 16;
+    public const int VisTexels = VisRes * VisRes;
 
     readonly Dx12Device dev;
 
     public Dx12DdgiProbeGrid(Dx12Device device) { dev = device; }
 
-    // ---- grid layout (set on Ensure; default 16x8x16 = 2048 probes) ----
     public int CountX { get; private set; }
     public int CountY { get; private set; }
     public int CountZ { get; private set; }
     public int ProbeCount => CountX * CountY * CountZ;
 
-    // probe (ix,iy,iz) world pos = GridOrigin + (ix,iy,iz) * ProbeSpacing.
     public Vector3 GridOrigin { get; private set; }
     public Vector3 ProbeSpacing { get; private set; }
 
-    // ---- irradiance cache (ping-pong) ----
     ID3D12Resource irradA, irradB;
     bool writeB;
     public ID3D12Resource IrradianceWrite => writeB ? irradB : irradA;
-    public ID3D12Resource IrradianceRead  => writeB ? irradA : irradB;   // previous frame
+    public ID3D12Resource IrradianceRead  => writeB ? irradA : irradB;
     public ulong IrradianceWriteGpu => IrradianceWrite?.GPUVirtualAddress ?? 0;
     public ulong IrradianceReadGpu  => IrradianceRead?.GPUVirtualAddress ?? 0;
 
-    // ---- visibility moments cache (ping-pong, D3) — float2 (mean dist, mean dist²) per oct texel for the
-    // Chebyshev (variance-shadow) leak test the sample pass uses to reject probes occluded from the surface. ----
     ID3D12Resource visA, visB;
     public ID3D12Resource VisibilityWrite => writeB ? visB : visA;
     public ID3D12Resource VisibilityRead  => writeB ? visA : visB;
     public ulong VisibilityWriteGpu => VisibilityWrite?.GPUVirtualAddress ?? 0;
     public ulong VisibilityReadGpu  => VisibilityRead?.GPUVirtualAddress ?? 0;
 
-    // ---- probe state (occupancy-aware placement, set once on Ensure via GpuSceneQuery) ----
-    // float4 per probe: xyz = world-space RELOCATION offset (nudge from the nominal grid position into free
-    // space, so probes buried in walls/floors move out), w = active flag (1 = trace+sample, 0 = probe sits in
-    // solid with nowhere to go → relight skips it, sample weights it 0 so it can't leak). NOT ping-pong: it is
-    // static for a static layout (rebuilt only when the grid re-fits). Read by both relight and sample.
     ID3D12Resource probeState;
     public ID3D12Resource ProbeState => probeState;
     public ulong ProbeStateGpu => probeState?.GPUVirtualAddress ?? 0;
-    public bool StatePlaced { get; private set; }   // false until the relocation pass has filled probeState
+    public bool StatePlaced { get; private set; }
 
     public bool HistoryValid { get; private set; }
     public bool Valid { get; private set; }
 
-    // Last-fitted layout stamp (re-fit only on a real change → static scene fits once).
     int dimStamp = -1;
     Vector3 lastMin, lastMax;
 
-    // Fit the grid to the scene world AABB (from the scene AS instances — exactly the traced geometry), OR to an
-    // explicit volume box when useVolumeBounds is set, and (re)allocate the irradiance buffers when the layout
-    // changes. Returns Valid.
     public bool Ensure(Dx12FrameContext ctx, int reqX, int reqY, int reqZ,
                        bool useVolumeBounds = false, Vector3 volMin = default, Vector3 volMax = default)
     {
@@ -82,15 +54,11 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
         Vector3 min, max;
         if (useVolumeBounds)
         {
-            // GI volume box drives the bounds — a static, authored box. Distant stray geometry can't inflate it
-            // (the probe-density fix) and it never shifts frame-to-frame (the flicker fix: a stable AABB → no
-            // per-frame re-fit → no placement re-run → buried probes don't blink active↔inactive).
             min = Vector3.Min(volMin, volMax);
             max = Vector3.Max(volMin, volMax);
         }
         else
         {
-            // Scene world AABB: 8-corner transform of every instance's local mesh bounds.
             min = new Vector3(float.MaxValue);
             max = new Vector3(float.MinValue);
             for (int i = 0; i < sceneAS.InstanceCount; i++)
@@ -111,14 +79,8 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
                 }
             }
         }
-        if (min.X > max.X) { Valid = false; return false; }   // no valid geometry
+        if (min.X > max.X) { Valid = false; return false; }
 
-        // Layout change detector: grid dims OR a meaningful AABB shift → re-fit (and realloc if probe count grew).
-        // Bump the shift threshold to ~2% of the grid extent (min 0.05) instead of a fixed 1cm: a tiny AABB jitter
-        // (float drift in the 8-corner transform across frames) used to flip layoutChanged → StatePlaced=false →
-        // the next frame relit all probes as active before placement re-ran → buried probes flickered. A relative,
-        // larger threshold ignores that jitter; a real layout change still clears it. (Volume bounds are static, so
-        // this mostly matters for the scene-AABB path.)
         int dims = (reqX & 0x3ff) | ((reqY & 0x3ff) << 10) | ((reqZ & 0x3ff) << 20);
         float moveEps = MathF.Max(0.05f, 0.02f * Vector3.Distance(min, max));
         bool aabbMoved = Vector3.Distance(min, lastMin) > moveEps || Vector3.Distance(max, lastMax) > moveEps;
@@ -126,24 +88,22 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
 
         if (layoutChanged)
         {
-            // Probe spacing brackets the AABB with reqN probes; pad half a cell each side so boundary surfaces
-            // sit strictly inside the grid (a surface exactly on the AABB face must still have 8 bracketing probes).
             Vector3 size = Vector3.Max(max - min, new Vector3(0.01f));
             var counts = new Vector3(MathF.Max(reqX, 2), MathF.Max(reqY, 2), MathF.Max(reqZ, 2));
-            Vector3 spacing = size / (counts - Vector3.One);   // probes at both faces; (N-1) gaps span the AABB
+            Vector3 spacing = size / (counts - Vector3.One);
 
             CountX = reqX; CountY = reqY; CountZ = reqZ;
             ProbeSpacing = spacing;
-            GridOrigin = min;   // probe 0 sits at the AABB min corner; probe (N-1) at the max corner
+            GridOrigin = min;
 
             int needProbes = ProbeCount;
             if (irradA == null || CurrentCapacityProbes < needProbes)
             {
                 Realloc(needProbes);
-                HistoryValid = false;   // fresh buffers → no usable history this frame
+                HistoryValid = false;
             }
             dimStamp = dims; lastMin = min; lastMax = max;
-            StatePlaced = false;   // layout moved → the relocation/classification result is stale, re-run it
+            StatePlaced = false;
         }
 
         Valid = irradA != null;
@@ -159,11 +119,11 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
     void Realloc(int probeCount)
     {
         irradA?.Dispose(); irradB?.Dispose(); visA?.Dispose(); visB?.Dispose(); probeState?.Dispose();
-        long irrBytes = (long)probeCount * OctTexels * 16;   // float4
-        long visBytes = (long)probeCount * VisTexels * 8;    // float2
+        long irrBytes = (long)probeCount * OctTexels * 16;
+        long visBytes = (long)probeCount * VisTexels * 8;
         irradA = MakeBuffer(irrBytes); irradB = MakeBuffer(irrBytes);
         visA = MakeBuffer(visBytes);   visB = MakeBuffer(visBytes);
-        probeState = MakeBuffer((long)probeCount * 16);      // float4 (offset.xyz, active)
+        probeState = MakeBuffer((long)probeCount * 16);
         CurrentCapacityProbes = probeCount;
         writeB = false;
         states.Clear();
@@ -171,13 +131,8 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
         states[probeState] = ResourceStates.UnorderedAccess;
     }
 
-    // Probe nominal world position (grid lattice, BEFORE relocation). The relocated position is this + offset.
     public Vector3 ProbePos(int ix, int iy, int iz) => GridOrigin + new Vector3(ix, iy, iz) * ProbeSpacing;
 
-    // Occupancy-aware placement (run once per layout, on the CPU via GpuSceneQuery — NOT per frame). For each
-    // probe: classify its lattice position; nudge probes that sit in solid out to the nearest free space; mark a
-    // probe that is solid AND can't be nudged free as inactive. Fills probeState (offset.xyz, active) and uploads
-    // it. `query` shares the DDGI scene AS (same TLAS the relight traces) so this needs no second AS build.
     public unsafe void PlaceProbes(Dx12Device device, GpuSceneQuery query)
     {
         if (probeState == null || StatePlaced) return;
@@ -189,22 +144,11 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
                 for (int ix = 0; ix < CountX; ix++, p++)
                     pts[p] = ProbePos(ix, iy, iz);
 
-        // Probe radius for classify/nudge: a couple of cells reaches a wall from inside a cell without scanning
-        // the whole scene (cheaper rays, and a probe should relocate to its OWN cell's free space, not far away).
         float radius = 2.0f * MathF.Max(ProbeSpacing.X, MathF.Max(ProbeSpacing.Y, ProbeSpacing.Z));
 
-        // CPU readback (Map) — MUST run with the pipelined frame CLOSED (caller guarantees this; see RunPending
-        // placement). Inside an open frame list ExecuteSync only records, so the readback would read garbage and
-        // desync the fence → device removed.
         GpuSceneQuery.SpaceClass[] cls = query.ClassifySpace(pts, radius);
         Vector3[] nudged = query.NudgeToFreeSpace(pts, radius);
 
-        // Cap the relocation. The sample gathers from the probe's MOVED position (offset is fed to the trilinear
-        // bracketing), so a relocation can spill into the neighbour cell without corrupting the gather — letting a
-        // probe buried deep in a thick wall slab escape to free space instead of being killed. Cap at ~1.5 cells
-        // (max axis) rather than 0.9 of the SMALLEST axis: the old tight cap killed most probes in scenes with thick
-        // walls / anisotropic spacing (the DGI box: min spacing 0.8 → cap 0.73, but the nudge out of a 10-unit slab
-        // needs far more → every slab probe went dead → black GI). Wider cap = far fewer dead probes = real GI.
         float maxMove = 1.5f * MathF.Max(ProbeSpacing.X, MathF.Max(ProbeSpacing.Y, ProbeSpacing.Z));
 
         var state = new Vector4[n];
@@ -216,20 +160,16 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
 
             if (move > maxMove)
             {
-                // Can't relocate within the cell. If it was solid → dead probe (inactive). If it was merely on a
-                // boundary the classify didn't flag solid, keep it active but DON'T apply the over-long move.
                 offset = Vector3.Zero;
                 state[i] = new Vector4(0, 0, 0, solid ? 0f : 1f);
             }
             else
             {
-                // Relocate (offset) and stay active unless it was solid with a zero usable nudge.
                 bool active = !(solid && move < 1e-4f);
                 state[i] = new Vector4(offset.X, offset.Y, offset.Z, active ? 1f : 0f);
             }
         }
 
-        // Upload via an upload-heap staging copy into the default-heap probeState buffer.
         UploadState(device, state);
         StatePlaced = true;
     }
@@ -254,17 +194,12 @@ public sealed class Dx12DdgiProbeGrid : IDisposable
         upload.Dispose();
     }
 
-    // Self-tracked resource states (the relight pass transitions all four buffers each frame).
     readonly System.Collections.Generic.Dictionary<ID3D12Resource, ResourceStates> states = new();
     public ResourceStates StateOf(ID3D12Resource r) => states.TryGetValue(r, out var s) ? s : ResourceStates.UnorderedAccess;
     public void SetState(ID3D12Resource r, ResourceStates s) { states[r] = s; }
 
-    // Swap the ping-pong + mark history valid (called at the end of the relight pass).
     public void SwapAndMarkHistory() { writeB = !writeB; HistoryValid = true; }
 
-    // Invalidate the temporal history so the NEXT relight does a full replace (alpha=1) instead of EMA-blending
-    // over stale data. Called by the orchestrator when GI is inactive this frame — so toggling GI off then on
-    // does not bring back a stale (or runaway) cache; it rebuilds clean. Idempotent + cheap (just a flag).
     public void ResetHistory() { HistoryValid = false; }
 
     public void Dispose()

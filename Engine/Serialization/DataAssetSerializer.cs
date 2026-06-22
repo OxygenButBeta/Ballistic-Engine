@@ -4,18 +4,12 @@ using BallisticEngine.AssetPipeline;
 
 namespace BallisticEngine.Serialization;
 
-// YAML (de)serialization for DataAsset (.asset) files. Same rules as component serialization
-// (ComponentReflection picks the members; asset refs become guid strings; OpenTK math types use the
-// SceneYaml converters) so a DataAsset's fields author exactly like a component's. The file carries
-// a `type:` (registry key) so the loader can resolve the concrete type, plus a member map.
 public static class DataAssetSerializer {
     public sealed class Document {
         public int Version { get; set; } = 1;
         public string Type { get; set; }
         public Dictionary<string, object> Members { get; set; } = new();
     }
-
-    // ---- Serialize ----------------------------------------------------------
 
     public static string Serialize(DataAsset asset) {
         var doc = new Document { Type = ComponentRegistry.DataAssetNameOf(asset.GetType()) };
@@ -42,10 +36,6 @@ public static class DataAssetSerializer {
         return value;
     }
 
-    // ---- Deserialize --------------------------------------------------------
-
-    // Builds a DataAsset of the type named in the YAML and applies its members. `expectedType` is the
-    // type AssetDatabase.Load<T> asked for — the built instance must be assignable to it.
     public static DataAsset Deserialize(string yaml, Type expectedType) {
         Document doc = SceneYaml.Deserializer.Deserialize<Document>(yaml);
         if (doc is null)

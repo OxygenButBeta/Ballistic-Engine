@@ -1,10 +1,5 @@
-using System;
-
 namespace BallisticEngine.UI;
 
-// A horizontal slider (P5.4) — UITK's Slider. Track + filled portion + draggable handle. Drag the handle
-// (pointer capture keeps tracking outside the track) or click anywhere on the track to set the value.
-// Arrow keys nudge when focused. Value is clamped to [LowValue, HighValue].
 public class Slider : VisualElement, INotifyValueChanged<float>, IPostLayout
 {
     readonly VisualElement _track;
@@ -13,7 +8,7 @@ public class Slider : VisualElement, INotifyValueChanged<float>, IPostLayout
 
     public float LowValue { get; set; } = 0f;
     public float HighValue { get; set; } = 1f;
-    public float Step { get; set; } = 0f;          // 0 = continuous
+    public float Step { get; set; } = 0f;
     public float PageStep { get; set; } = 0.1f;
 
     public event Action<float, float> ValueChanged;
@@ -67,7 +62,6 @@ public class Slider : VisualElement, INotifyValueChanged<float>, IPostLayout
 
         PointerDown += e => { SetFromPointer(e.Position.X); e.Handled = true; };
         PointerMove += e => { if (_dragging) { SetFromPointer(e.Position.X); e.Handled = true; } };
-        // capture begins on press of self (the input module captures the press target = this slider)
         PointerDown += e => _dragging = true;
         PointerUp += e => _dragging = false;
 

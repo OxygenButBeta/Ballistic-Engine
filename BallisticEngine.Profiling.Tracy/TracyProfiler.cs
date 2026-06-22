@@ -1,14 +1,9 @@
 using bottlenoselabs.C2CS.Runtime;
-using Tracy;
 using static Tracy.PInvoke;
 
 namespace BallisticEngine.Profiling;
 
-// Tracy-backed IProfilerBackend. Opt-in via BALLISTIC_TRACY=1 so the Tracy client (which
-// buffers all events in RAM until a viewer connects) costs nothing in normal sessions.
-// Attach Tools/Tracy/tracy-profiler.exe (live GUI) or tracy-capture.exe (headless).
 public sealed class TracyProfiler : IProfilerBackend {
-    // Tracy requires plot names to stay alive for the program lifetime (manual section 3.1).
     static readonly Dictionary<string, CString> PlotNameCache = new();
 
     public static bool TryInstall(string appName) {

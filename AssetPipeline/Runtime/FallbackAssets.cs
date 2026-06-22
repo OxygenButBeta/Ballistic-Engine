@@ -1,13 +1,9 @@
 namespace BallisticEngine.AssetPipeline;
 
-// Procedural 4x4 stand-in textures used when a material references a texture that
-// is missing or fails to load. Diffuse is magenta so the problem is visible on screen.
 public static class FallbackAssets {
     static readonly Dictionary<TextureType, Texture2D> cache = new();
     static Texture2D plainWhiteDiffuse;
 
-    // For materials that intentionally have no diffuse map (e.g. untextured source materials):
-    // plain white instead of the magenta error texture.
     public static Texture2D PlainDiffuse() {
         if (plainWhiteDiffuse is not null)
             return plainWhiteDiffuse;
@@ -27,8 +23,8 @@ public static class FallbackAssets {
 
         (byte r, byte g, byte b) = type switch {
             TextureType.Diffuse => ((byte)255, (byte)0, (byte)255),
-            TextureType.Normal => ((byte)128, (byte)128, (byte)255), // flat +Z normal
-            TextureType.Emissive => ((byte)0, (byte)0, (byte)0),     // broken emissive must not glow
+            TextureType.Normal => ((byte)128, (byte)128, (byte)255),
+            TextureType.Emissive => ((byte)0, (byte)0, (byte)0),
             _ => ((byte)255, (byte)255, (byte)255),
         };
 

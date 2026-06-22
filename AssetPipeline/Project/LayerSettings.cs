@@ -2,29 +2,20 @@ using BallisticEngine.AssetPipeline;
 
 namespace BallisticEngine;
 
-// Persists the project's tags, layer names, and collision matrix (Unity's
-// ProjectSettings/TagManager.asset). Stored as ProjectSettings/TagsAndLayers.json at the project
-// root so it's source-controlled with the project, not in the gitignored Library. Loaded once at
-// bootstrap into TagManager/LayerManager; the editor's Tags & Layers settings panel saves it back.
-//
-// Lives in AssetPipeline (it owns file I/O + the project) but drives the Engine-layer managers —
-// AssetPipeline may reference Engine types, the reverse is forbidden, so the bootstrap calls Load.
 public static class LayerSettings {
     public sealed class SettingsData {
         public List<string> Tags { get; set; } = new();
-        public List<string> Layers { get; set; } = new();      // 32 entries (index = layer)
-        public List<bool> CollisionMatrix { get; set; } = new(); // upper-triangle flat (LayerManager export)
+        public List<string> Layers { get; set; } = new();
+        public List<bool> CollisionMatrix { get; set; } = new();
     }
 
     static string PathFor(BallisticProject project) =>
         Path.Combine(project.RootPath, "ProjectSettings", "TagsAndLayers.json");
 
-    // Applies the saved settings to the managers, or seeds the file from the current defaults if it
-    // doesn't exist yet (so a fresh project gets a visible, editable settings file).
     public static void Load(BallisticProject project) {
         string path = PathFor(project);
         if (!File.Exists(path)) {
-            Save(project); // materialize defaults
+            Save(project);
             return;
         }
 
@@ -45,7 +36,6 @@ public static class LayerSettings {
         }
     }
 
-    // Snapshots the current managers to disk (called by the editor settings panel after edits).
     public static void Save(BallisticProject project) {
         string path = PathFor(project);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);

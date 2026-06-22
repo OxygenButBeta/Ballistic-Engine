@@ -1,6 +1,4 @@
-using System;
 using System.Collections;
-using System.Collections.Generic;
 
 namespace Facebook.Yoga
 {
@@ -23,12 +21,10 @@ namespace Facebook.Yoga
 
         public struct Iterator : IEnumerator<T>
         {
-            // Small inline stack to avoid LinkedList allocation for shallow nesting
             private const int InlineCapacity = 4;
             private (T node, int childIndex) _stack0, _stack1, _stack2, _stack3;
             private int _stackCount;
 
-            // Overflow for deep nesting (rare)
             private List<(T node, int childIndex)>? _overflow;
 
             private T _node;

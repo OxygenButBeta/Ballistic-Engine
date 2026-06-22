@@ -2,13 +2,8 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine;
 
-// One-off authoring of SampleProject's Main.scene (recreates the old SceneInit setup),
-// invoked via `--author-scene`. Builds entities in edit mode and serializes them, then exits.
-// Kept in the Runtime so the player exe can regenerate the sample scene without the editor.
 internal static class SceneAuthoring {
     public static void AuthorMainScene(string projectPath) {
-        // No GPU/window needed — authoring just builds entities and serializes them. The headless host
-        // bootstraps the engine end-to-end (assets load via the null render asset) without a swapchain.
         HeadlessRuntime runtime = new();
         EngineBootstrap bootstrap = new(runtime, projectPath);
 

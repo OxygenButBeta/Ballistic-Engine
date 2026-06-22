@@ -1,31 +1,14 @@
-using System;
-using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
 using Vortice.DXGI;
-using BallisticEngine;   // RuntimeSet, CapsuleShadowCaster
 
 namespace BallisticEngine.DX12;
 
-// Capsule shadows (the Unreal capsule-shadow feature): cheap ANALYTIC soft sun shadows from character proxy
-// capsules onto the world. Each CapsuleShadowCaster contributes one world-space capsule; this pass gathers the
-// active casters into a StructuredBuffer, then a compute shader (CapsuleShadows.hlsl) computes per-pixel soft
-// sun occlusion (closest approach ray-vs-segment + sphere-cone soft occlusion using the sun's angular radius)
-// into an R8 mask. The deferred sun term multiplies it with the cascade / RT shadow (min over all shadowers).
-//
-// Runs at BeforeOpaqueLighting (250) — after the G-buffer is readable, before deferred lighting consumes the
-// mask (mirrors RTAO's slot). OFF when no caster exists in the scene → Enabled returns false → the pass never
-// records, ctx.CapsuleShadowsThisFrame stays false, and the deferred path is byte-identical (the t16 bind
-// falls back to a valid unused SRV, gated off by UseCapsuleShadows=0).
-//
-// V1 = single capsule per caster. FOLLOW-UP: multi-capsule (a flat capsule array per articulated skeleton) —
-// the buffer + shader already loop over an array, so it's just a wider gather.
 public sealed class Dx12CapsuleShadowPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.BeforeOpaqueLighting;
     public string Name => "CapsuleShadows";
 
-    // Active only when at least one caster is in the scene. No casters → no work → byte-identical default path.
     public bool Enabled(Dx12FrameContext ctx) => ActiveCasterCount() > 0;
 
     static int ActiveCasterCount() {
@@ -55,12 +38,12 @@ public sealed class Dx12CapsuleShadowPass : IRenderPass, IDisposable {
     ID3D12PipelineState pso;
     ID3D12Resource cb;
     unsafe byte* cbMapped;
-    ID3D12Resource capsuleBuf;       // UploadHeap StructuredBuffer<GpuCapsule>, filled per frame
+    ID3D12Resource capsuleBuf;
     unsafe byte* capsuleMapped;
-    Dx12DescriptorHeap heap;         // 4 descriptors: depth(t0), normal(t1), capsules(t2), occlusion-UAV(u0)
-    ID3D12Resource maskOut;          // own committed R8 UAV target (the occlusion mask)
+    Dx12DescriptorHeap heap;
+    ID3D12Resource maskOut;
     ResourceStates maskState = ResourceStates.UnorderedAccess;
-    int maskSrvIndex = -1;           // persistent SRV "home" in the SrvStore (rebuilt to point at maskOut)
+    int maskSrvIndex = -1;
     int outW, outH;
     bool built;
 
@@ -73,7 +56,6 @@ public sealed class Dx12CapsuleShadowPass : IRenderPass, IDisposable {
         int w = ctx.TargetW, h = ctx.TargetH;
         EnsureBuilt(w, h);
 
-        // Gather active casters into the upload buffer (world-space segment + radius).
         int count = 0;
         GpuCapsule* dst = (GpuCapsule*)capsuleMapped;
         foreach (CapsuleShadowCaster c in RuntimeSet<CapsuleShadowCaster>.ReadOnlyCollection) {
@@ -98,7 +80,7 @@ public sealed class Dx12CapsuleShadowPass : IRenderPass, IDisposable {
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         dev.Device.CopyDescriptorsSimple(1, heap.Cpu(0), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, heap.Cpu(1), gbuffer.ColorSrvCpu(1), heapType);   // world normal (RT1)
+        dev.Device.CopyDescriptorsSimple(1, heap.Cpu(1), gbuffer.ColorSrvCpu(1), heapType);
         dev.Device.CreateShaderResourceView(capsuleBuf, new ShaderResourceViewDescription {
             ViewDimension = ShaderResourceViewDimension.Buffer, Format = Format.Unknown,
             Shader4ComponentMapping = ShaderComponentMapping.Default,
@@ -110,8 +92,6 @@ public sealed class Dx12CapsuleShadowPass : IRenderPass, IDisposable {
             new UnorderedAccessViewDescription { Format = Format.R8_UNorm, ViewDimension = UnorderedAccessViewDimension.Texture2D },
             heap.Cpu(3));
 
-        // Compute reads depth+normal as NON_PIXEL SRVs; the deferred PIXEL read follows, so emit the combined
-        // read (covers both). All barriers + dispatch in ONE list so state tracking is exact.
         gbuffer.ToShaderResource();
         dev.ExecuteSync(cl => {
             if (maskState != ResourceStates.UnorderedAccess)
@@ -156,15 +136,13 @@ public sealed class Dx12CapsuleShadowPass : IRenderPass, IDisposable {
             heap = new Dx12DescriptorHeap(dev, DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 4, shaderVisible: true, framesInFlight: dev.FramesInFlight);
             built = true;
         }
-        // (Re)create the own UAV mask target at render resolution.
+
         maskOut?.Dispose();
         var desc = ResourceDescription.Texture2D(Format.R8_UNorm, (uint)w, (uint)h, 1, 1);
         desc.Flags = ResourceFlags.AllowUnorderedAccess;
         maskOut = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
             desc, ResourceStates.UnorderedAccess);
         maskState = ResourceStates.UnorderedAccess;
-        // A stable SRV "home" (separate from the per-frame compute heap) so the deferred pass can bind it.
-        // Allocate the index once; rebuild the view to point at the (possibly re-created) maskOut on resize.
         if (maskSrvIndex < 0) maskSrvIndex = Dx12Backend.SrvStore.Allocate();
         dev.Device.CreateShaderResourceView(maskOut, new ShaderResourceViewDescription {
             ViewDimension = ShaderResourceViewDimension.Texture2D, Format = Format.R8_UNorm,

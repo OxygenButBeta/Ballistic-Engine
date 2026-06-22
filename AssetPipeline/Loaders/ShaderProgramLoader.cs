@@ -1,35 +1,21 @@
 namespace BallisticEngine.AssetPipeline.Loaders;
 
-// .shader asset: { "version": 1, "vertex": "<.glsl ref>", "fragment": "<.glsl ref>",
-//   "properties": [ { "name": "_BaseColor", "display": "Base Color", "type": "Color",
-//                     "semantic": "BaseColorFactor", "default": [1,1,1,1] }, ... ] }
-// `properties` is OPTIONAL: omit it and the shader uses the built-in Standard PBR declaration
-// (StandardShaderProperties). A custom shader declares its own block — this is the seam a future
-// full-fragment-control shader plugs its authorable inputs into (semantic "None" = no Standard
-// channel, fed to a generic CB the custom shader owns).
 public sealed class ShaderDefinition {
     public int Version { get; set; } = 1;
     public string Vertex { get; set; }
     public string Fragment { get; set; }
     public ShaderPropertyDef[] Properties { get; set; }
 
-    // OPTIONAL custom surface shader. A ref to a .hlsl/.surface asset containing a Unity-style
-    // `SurfaceOutput Surface(SurfaceInput i)` body. When present, materials using this shader render with
-    // a per-material PSO built from this body + the engine's G-buffer skeleton (z-prepass/MRT contract
-    // stays engine-owned). Omit it → the Standard PBR shader (unchanged, byte-identical).
     public string Surface { get; set; }
 }
 
-// JSON-serializable form of one declared property (the .shader Properties-block entry). Converted to
-// the engine's immutable ShaderProperty by ToShaderProperty. `default` is a number for Float/Range or
-// a [r,g,b(,a)] array for Color/Vector or a texture ref string for Texture2D.
 public sealed class ShaderPropertyDef {
     public string Name { get; set; }
     public string Display { get; set; }
-    public string Type { get; set; }       // ShaderPropertyType name
-    public string Semantic { get; set; }   // MaterialSemantic name (default None)
+    public string Type { get; set; }
+    public string Semantic { get; set; }
     public System.Text.Json.JsonElement? Default { get; set; }
-    public float[] Range { get; set; }     // [min,max] for Range type
+    public float[] Range { get; set; }
 
     public ShaderProperty ToShaderProperty(string ownerPath) {
         var name = Name ?? "_Unnamed";
@@ -88,14 +74,8 @@ public static class ShaderProgramLoader {
         if (vertexCode is null || fragmentCode is null)
             return null;
 
-        // A shader with a custom surface body OR a custom Properties block must NOT share the cached
-        // instance of the plain Standard shader (same Vert/Frag.glsl → same default identity) — its
-        // SetProperties/SurfaceSource would leak onto every Standard material. Give such shaders a distinct
-        // cache key (the .shader asset path). Plain Standard shaders pass null → unchanged shared instance.
         bool isCustom = definition.Properties is { Length: > 0 } || !string.IsNullOrWhiteSpace(definition.Surface);
         var shader = GraphicAPI.CreateStandardShader(vertexCode, fragmentCode, isCustom ? assetPath : null);
-        // Custom Properties block overrides the built-in Standard declaration; omit it (the common
-        // case, incl. the legacy .shader assets) and the shader keeps StandardShaderProperties.
         if (shader is not null && definition.Properties is { Length: > 0 } defs) {
             var props = new ShaderProperty[defs.Length];
             for (int i = 0; i < defs.Length; i++)
@@ -103,10 +83,6 @@ public static class ShaderProgramLoader {
             shader.SetProperties(new ShaderProperties(props));
         }
 
-        // Custom surface body: read the referenced .hlsl/.surface text and hand it to the shader. The
-        // backend (DX12) compiles a per-material PSO from it lazily. SurfaceKey = the resolved asset path
-        // (+ a content hash so hot-reload busts the PSO cache on edit). A broken/missing ref logs + leaves
-        // the shader Standard (no surface), NOT a hard failure — the material still renders (as Standard).
         if (shader is not null && !string.IsNullOrWhiteSpace(definition.Surface)) {
             string surfacePath = AssetRef.IsGuidRef(definition.Surface, out Guid sg)
                 ? AssetDatabase.GuidToAssetPath(sg) : definition.Surface;
@@ -116,9 +92,6 @@ public static class ShaderProgramLoader {
                                    "material renders as Standard.");
             else {
                 shader.SurfaceSource = body;
-                // Key = the resolved asset path (stable across edits). The PSO cache keys by this path
-                // and tracks the source content itself, so hot-reload recompiles the SAME key in place
-                // (the material keeps its key; only the cache's PSO + source change).
                 shader.SurfaceKey = surfacePath ?? definition.Surface;
                 shader.SurfaceSourcePath = surfacePath;
             }

@@ -2,37 +2,14 @@ using System.Runtime.InteropServices;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Engine-native binary mesh, Library\Artifacts\<guid>.bmesh:
-//   u32 magic 'BMSH' | u32 version | i32 vertexCount | i32 indexCount | i32 submeshCount
-//   positions[v] normals[v] (Vector3) | tangents[v] (Vector4, w = handedness) | uvs[v] (Vector2)
-//   indices[i] (u32)
-//   submeshes: { i32 indexStart | i32 indexCount | string name | string materialRef
-//                | nodeTransform (Matrix4, v4+) | i32 nodeIndex (v5+) } x submeshCount
-//   nodes (v5+): i32 nodeCount | { string name | i32 parentIndex | localTransform (Matrix4) }
-//   skin (v6+): u8 hasSkin; if 1:
-//       boneIndices[v] (Vector4i) | boneWeights[v] (Vector4)
-//       i32 boneCount | { string name | i32 parentIndex | inverseBind (Matrix4) | bindLocal (Matrix4) } x boneCount
-//   lod (v7+): per-submesh geometric-LOD ranges, appended AFTER the skin block (so a v6 reader stops cleanly):
-//       { i32 lodCount | { i32 firstIndex | i32 indexCount } x lodCount } x submeshCount
-//       lodCount<=1 ⇒ that submesh is LOD0-only. The extra LOD index ranges already live in the shared `indices`
-//       buffer above (the importer appended them); this block only records where each level is.
-//   (strings are BinaryWriter length-prefixed; "" means none)
-// Version 1 had a reserved u32 instead of submeshCount and no submesh table; it reads back
-// as a single submesh spanning the whole index buffer. Versions 1-2 stored vec3 tangents;
-// they read back with handedness +1. Versions 1-3 had no per-submesh node transform; they
-// read back with identity (vertices are model-space baked, so rendering is unaffected).
-// Version 4 had no node hierarchy table; it reads back empty (nodeIndex -1).
-// Version 5 had no skin block; it reads back un-skinned (hasSkin implicitly 0).
 public static class MeshArtifact {
-    const uint Magic = 0x48534D42; // "BMSH"
+    const uint Magic = 0x48534D42;
     const uint FormatVersion = 7;
 
     public static void Write(string path, in MeshData data) {
         using FileStream stream = File.Create(path);
         using BinaryWriter writer = new(stream);
 
-        // Write v7 ONLY when a LOD chain is actually present; otherwise write v6 so a LOD-less artifact stays
-        // byte-identical to the pre-LOD pipeline (determinism + diff tests + existing Library caches unchanged).
         bool hasLods = false;
         foreach (SubMeshData sm in data.SubMeshes) if (sm.Lods is { Length: > 1 }) { hasLods = true; break; }
         uint writeVersion = hasLods ? 7u : 6u;
@@ -66,7 +43,6 @@ public static class MeshArtifact {
             WriteMatrix(writer, node.LocalTransform);
         }
 
-        // Skin block (v6). A static mesh writes a single 0 byte.
         if (data.IsSkinned) {
             writer.Write((byte)1);
             writer.Write(MemoryMarshal.AsBytes<Vector4i>(data.BoneIndices));
@@ -85,7 +61,6 @@ public static class MeshArtifact {
             writer.Write((byte)0);
         }
 
-        // LOD block (v7 only — written after skin so a v6 reader stops at the skin block).
         if (writeVersion >= 7) {
             foreach (SubMeshData sm in data.SubMeshes) {
                 LodRange[] lods = sm.Lods is { Length: > 1 } ? sm.Lods : null;
@@ -110,8 +85,6 @@ public static class MeshArtifact {
         return Read(stream, path);
     }
 
-    // Decodes from an already-open stream (e.g. bytes from a mounted content pack). `sourceName` is
-    // for error messages only.
     public static MeshData Read(Stream stream, string sourceName = "<stream>") {
         using BinaryReader reader = new(stream);
 
@@ -127,7 +100,7 @@ public static class MeshArtifact {
         if (version >= 2)
             subMeshCount = reader.ReadInt32();
         else
-            reader.ReadUInt32(); // v1 reserved field
+            reader.ReadUInt32();
 
         Vector3[] vertices = ReadArray<Vector3>(reader, vertexCount);
         Vector3[] normals = ReadArray<Vector3>(reader, vertexCount);
@@ -136,7 +109,6 @@ public static class MeshArtifact {
             tangents = ReadArray<Vector4>(reader, vertexCount);
         }
         else {
-            // Pre-handedness artifacts: widen vec3 tangents with w = +1 until reimport.
             Vector3[] legacy = ReadArray<Vector3>(reader, vertexCount);
             tangents = new Vector4[vertexCount];
             for (var i = 0; i < vertexCount; i++)
@@ -170,7 +142,6 @@ public static class MeshArtifact {
             }
         }
 
-        // Skin block (v6+). Older artifacts have no byte here and read back un-skinned.
         Vector4i[] boneIndices = null; Vector4[] boneWeights = null; SkeletonData skeleton = default;
         bool skinned = false;
         if (version >= 6 && reader.ReadByte() == 1) {
@@ -193,7 +164,6 @@ public static class MeshArtifact {
             skeleton = new SkeletonData(names, parents, inverseBind, bindLocal);
         }
 
-        // LOD block (v7+, after skin). Attach per-submesh LOD ranges; absent ⇒ submeshes stay LOD0-only.
         if (version >= 7) {
             for (var i = 0; i < subMeshCount; i++) {
                 int lodCount = reader.ReadInt32();
@@ -209,7 +179,6 @@ public static class MeshArtifact {
             return new MeshData(vertices, indices, uvs, normals, tangents, subMeshes, nodes,
                 boneIndices, boneWeights, skeleton);
 
-        // subMeshCount == 0 (v1 artifacts): MeshData substitutes a single full-range submesh.
         return new MeshData(vertices, indices, uvs, normals, tangents, subMeshes, nodes);
     }
 

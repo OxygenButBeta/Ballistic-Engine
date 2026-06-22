@@ -1,19 +1,13 @@
-using System;
 using System.Globalization;
 
 namespace BallisticEngine.UI;
 
-// HTML/CSS-friendly RGBA color (components 0..1). Exists so ported designs can write colors the
-// way the source CSS does — Color.FromHex("#1a1a2e"), Color.Rgb(26, 26, 46), rgba() with alpha —
-// instead of hand-converting to the engine's Vector4. Converts to/from Vector4 (the engine's
-// native color type, e.g. Material.BaseColorFactor) so the eventual UI renderer stays engine-native.
 public readonly struct Color : IEquatable<Color>
 {
     public readonly float R, G, B, A;
 
     public Color(float r, float g, float b, float a = 1f) { R = r; G = g; B = b; A = a; }
 
-    // 0..255 byte channels — matches how CSS rgb()/rgba() and the port skill's themes are written.
     public static Color Rgb(byte r, byte g, byte b) => new(r / 255f, g / 255f, b / 255f, 1f);
     public static Color Rgba(byte r, byte g, byte b, float a) => new(r / 255f, g / 255f, b / 255f, a);
 
@@ -21,10 +15,6 @@ public readonly struct Color : IEquatable<Color>
     public static readonly Color White = new(1, 1, 1, 1);
     public static readonly Color Black = new(0, 0, 0, 1);
 
-    // Parses #rgb, #rgba, #rrggbb, #rrggbbaa (with or without the leading '#'). Returns Transparent
-    // on a malformed string rather than throwing — UI authoring should never crash the engine, and a
-    // bad color is visually obvious. The leading-'#' and 3/4-digit short forms cover what Claude
-    // designs actually emit.
     public static Color FromHex(string hex)
     {
         if (string.IsNullOrWhiteSpace(hex)) return Transparent;
@@ -33,20 +23,19 @@ public readonly struct Color : IEquatable<Color>
 
         switch (s.Length)
         {
-            case 3: // #rgb
+            case 3:
                 return Rgb(Dup(s[0]), Dup(s[1]), Dup(s[2]));
-            case 4: // #rgba
+            case 4:
                 return Rgba(Dup(s[0]), Dup(s[1]), Dup(s[2]), Dup(s[3]) / 255f);
-            case 6: // #rrggbb
+            case 6:
                 return Rgb(Hex2(s[0], s[1]), Hex2(s[2], s[3]), Hex2(s[4], s[5]));
-            case 8: // #rrggbbaa
+            case 8:
                 return Rgba(Hex2(s[0], s[1]), Hex2(s[2], s[3]), Hex2(s[4], s[5]), Hex2(s[6], s[7]) / 255f);
             default:
                 return Transparent;
         }
     }
 
-    // Expands a single hex nibble to a full byte (CSS #rgb shorthand: 'f' -> 0xff, '3' -> 0x33).
     static byte Dup(char c) { int v = Nibble(c); return (byte)((v << 4) | v); }
     static byte Hex2(char hi, char lo) => (byte)((Nibble(hi) << 4) | Nibble(lo));
     static int Nibble(char c) =>

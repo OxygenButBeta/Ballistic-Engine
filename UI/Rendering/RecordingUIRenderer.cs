@@ -1,11 +1,5 @@
-using System.Collections.Generic;
-
 namespace BallisticEngine.UI;
 
-// A headless IUIRenderer that records every primitive instead of drawing. It exists so the render
-// WALK (draw order, opacity inheritance, radius clamping, clipping, text/image emission) can be
-// asserted without a GPU — the AI-first verification path. Also handy as a debugging dump of exactly
-// what a UI would draw. Not used in the real engine render loop.
 public sealed class RecordingUIRenderer : IUIRenderer
 {
     public enum Op { Begin, End, Rect, Gradient, Text, Image, PushClip, PopClip, Shadow, BackdropBlur }
@@ -16,7 +10,7 @@ public sealed class RecordingUIRenderer : IUIRenderer
         public readonly Rect Rect;
         public readonly Color Color;
         public readonly Vector4 Radius;
-        public readonly float Scalar;     // borderWidth (Rect) / fontSize (Text) / scale (Begin)
+        public readonly float Scalar;
         public readonly string Text;
         public readonly object Texture;
 
@@ -29,7 +23,6 @@ public sealed class RecordingUIRenderer : IUIRenderer
 
     public readonly List<Command> Commands = new();
 
-    // Convenience counters for tests.
     public int CountOf(Op op)
     {
         int n = 0;

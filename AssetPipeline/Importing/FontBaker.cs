@@ -1,25 +1,15 @@
-using System;
-using System.IO;
-using StbTrueTypeSharp;
 using static StbTrueTypeSharp.StbTrueType;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Bakes a .ttf into a FontAtlas of SDF glyphs. The ONLY file allowed to touch StbTrueTypeSharp (the
-// layering rule that keeps font libraries out of Engine/OpenGL — same as Assimp/Stb image decode
-// living only here). Rasterizes printable ASCII (32..126) as per-glyph signed-distance fields and
-// shelf-packs them into one R8 atlas; the GL backend uploads it and the text shader thresholds the
-// field for crisp edges at any size.
 public static unsafe class FontBaker
 {
-    const int FirstChar = 32;   // space
-    const int LastChar = 126;   // ~
-    const int Padding = 4;      // SDF spread in pixels (edge falloff radius)
-    const byte OnEdgeValue = 128;             // SDF value at the glyph edge
-    const float PixelDistScale = 128f / Padding; // distance units per pixel, so the field spans 0..255 over the padding
+    const int FirstChar = 32;
+    const int LastChar = 126;
+    const int Padding = 4;
+    const byte OnEdgeValue = 128;
+    const float PixelDistScale = 128f / Padding;
 
-    // Bakes `ttfPath` at `pixelHeight`. Returns null (logged) on any failure — asset loading never
-    // throws into the caller.
     public static FontAtlas Bake(string ttfPath, float pixelHeight = 48f)
     {
         if (!File.Exists(ttfPath))
@@ -41,10 +31,6 @@ public static unsafe class FontBaker
 
     public static FontAtlas BakeFromBytes(byte[] ttf, float pixelHeight)
     {
-        // stbtt's SDF rasterizer tessellates bezier contours RECURSIVELY; complex serif glyphs (e.g.
-        // EB Garamond, IM Fell) can recurse deep enough to overflow the default ~1MB managed stack —
-        // an UNCATCHABLE crash. Run the bake on a worker thread with a large stack so deep glyphs are
-        // safe. 64MB is generous and only allocated for the brief bake.
         FontAtlas result = null;
         Exception error = null;
         var worker = new System.Threading.Thread(() =>
@@ -81,7 +67,6 @@ public static unsafe class FontBaker
                 LineHeight = (ascent - descent + lineGap) * scale,
             };
 
-            // First pass: rasterize every glyph's SDF and gather sizes for packing.
             int count = LastChar - FirstChar + 1;
             var bitmaps = new byte[count][];
             var gw = new int[count];
@@ -104,16 +89,12 @@ public static unsafe class FontBaker
                     gw[i] = w; gh[i] = h; gxoff[i] = xoff; gyoff[i] = yoff;
                     stbtt_FreeSDF(sdf, null);
                 }
-                // null SDF (e.g. space) -> no bitmap, but still record advance below.
             }
 
-            // Shelf-pack into a square-ish atlas. Pick a width, lay glyphs left-to-right wrapping to
-            // new rows; grow height as needed. A 1px gutter prevents bilinear bleed between glyphs.
             const int gutter = 1;
             int atlasW = ChooseAtlasWidth(gw, gh, count);
             PackAndBlit(atlas, bitmaps, gw, gh, atlasW, gutter, font, scale);
 
-            // Glyph metrics (offsets + advance), independent of packing.
             for (int i = 0; i < count; i++)
             {
                 int cp = FirstChar + i;
@@ -123,8 +104,6 @@ public static unsafe class FontBaker
                 var glyph = atlas.TryGetGlyph((char)cp, out var existing) ? existing : new FontAtlas.Glyph();
                 glyph.Codepoint = (char)cp;
                 glyph.Advance = advance * scale;
-                // Offset from pen (baseline) to the glyph quad's top-left. xoff/yoff are SDF-space
-                // offsets from the bitmap rasterization; yoff is negative (above baseline).
                 glyph.OffsetX = gxoff[i];
                 glyph.OffsetY = gyoff[i];
                 glyph.Width = gw[i];
@@ -138,7 +117,6 @@ public static unsafe class FontBaker
 
     static int ChooseAtlasWidth(int[] gw, int[] gh, int count)
     {
-        // Total area heuristic -> next pow2 width that yields a roughly square atlas.
         long area = 0;
         for (int i = 0; i < count; i++) area += (gw[i] + 2L) * (gh[i] + 2L);
         int side = (int)Math.Ceiling(Math.Sqrt(area));
@@ -153,7 +131,6 @@ public static unsafe class FontBaker
         int penX = gutter, penY = gutter, rowH = 0;
         int usedH = gutter;
 
-        // First, determine placements + total height.
         int count = bitmaps.Length;
         var px = new int[count];
         var py = new int[count];
@@ -178,9 +155,8 @@ public static unsafe class FontBaker
 
         atlas.AtlasWidth = atlasW;
         atlas.AtlasHeight = atlasH;
-        atlas.Pixels = new byte[atlasW * atlasH]; // zero = fully outside (SDF floor)
+        atlas.Pixels = new byte[atlasW * atlasH];
 
-        // Blit each glyph SDF into the atlas and record its sub-rect.
         for (int i = 0; i < count; i++)
         {
             if (px[i] < 0) continue;

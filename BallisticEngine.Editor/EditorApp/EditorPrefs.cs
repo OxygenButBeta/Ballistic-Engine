@@ -4,37 +4,23 @@ using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Persisted editor preferences (theme accent, viewport defaults, gizmo/snap settings). Stored as a
-// single JSON file under %AppData%/BallisticEngine so settings survive across runs and projects.
-// Load() runs once at startup BEFORE the theme is first applied; Save() runs whenever the Settings
-// panel changes something. All access is via the static Current snapshot.
 internal sealed class EditorPrefs {
-    // --- Theme --- STATIC azure accent (0x3D8BD4) paired with the deep-graphite panels. EF5e: the accent
-    // is now a FIXED constant, NOT user-overridable — a saved editorprefs.json with an old (e.g. orange)
-    // accent used to override the theme so the UE5 palette never showed. These fields stay for json back-compat
-    // (deserialization won't choke) but the Accent property below ignores them and always returns azure.
     public float AccentR { get; set; } = 0.239f;
     public float AccentG { get; set; } = 0.545f;
     public float AccentB { get; set; } = 0.831f;
 
-    // User UI scale multiplier on top of the auto-detected monitor DPI (Unity's editor UI scale).
     public float UiScale { get; set; } = 1f;
 
-    // --- Viewport / camera ---
     public bool AlwaysRefresh { get; set; } = true;
     public float CameraBaseSpeed { get; set; } = 10f;
-    public float GizmoSize { get; set; } = 90f;     // on-screen handle length in px
+    public float GizmoSize { get; set; } = 90f;
 
-    // --- Performance --- 0 = VSync (Adaptive), otherwise a hard FPS cap (e.g. 60, 120, 144).
     public int FrameRateLimit { get; set; }
 
-    // --- Asset browser --- width of the folder tree pane (unscaled px; multiplied by DPI scale).
     public float AssetTreeWidth { get; set; } = 190f;
 
-    // Favourite folders (project-relative "Assets/..." paths) pinned above the folder tree, Unity-style.
     public List<string> FavoriteFolders { get; set; } = new();
 
-    // --- Grid + snapping ---
     public bool ShowGrid { get; set; } = true;
     public float GridSize { get; set; } = 1f;
     public bool ShowGizmos { get; set; } = true;
@@ -42,13 +28,8 @@ internal sealed class EditorPrefs {
     public float SnapRotate { get; set; } = 15f;
     public float SnapScale { get; set; } = 0.25f;
 
-    // --- Session --- last scene opened per project (project root path -> "Assets/..." scene path), so
-    // reopening the editor restores the scene you were last editing instead of always the StartupScene.
-    // Keyed by project so switching between projects each remembers its own scene.
     public Dictionary<string, string> LastScenes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-    // Last Scene-view camera pose per project (root path -> "px,py,pz,pitch,yaw"), so reopening the
-    // editor restores where you were looking. Keyed per project like LastScenes.
     public Dictionary<string, string> LastCameras { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
     public static string GetLastCamera(string projectRoot) =>
@@ -59,12 +40,9 @@ internal sealed class EditorPrefs {
         Current.LastCameras[projectRoot] = pose;
     }
 
-    // Returns the last scene opened for this project root, or null if none has been recorded yet.
     public static string GetLastScene(string projectRoot) =>
         Current.LastScenes.TryGetValue(projectRoot, out var scene) ? scene : null;
 
-    // Records the last scene opened for this project root and persists prefs. A null/empty path clears it
-    // (e.g. File > New leaves no file to reopen, so fall back to the StartupScene next launch).
     public static void SetLastScene(string projectRoot, string scenePath) {
         if (string.IsNullOrEmpty(scenePath))
             Current.LastScenes.Remove(projectRoot);
@@ -73,20 +51,11 @@ internal sealed class EditorPrefs {
         Save();
     }
 
-    // The editor accent is STATIC — fixed regardless of any saved/old value in editorprefs.json. (An old
-    // accent in the json used to silently override the theme.) The setter is intentionally a no-op so the
-    // Settings "Accent color" control can't drift the theme either.
-    // EF5i: pivoted OFF blue entirely (user rejected "genel mavilik"). The chrome is now NEUTRAL graphite +
-    // a warm AMBER/GOLD accent — Unity/Substance-style. Amber pops warmly against the cool-neutral grey ramp
-    // without re-introducing any blue cast. Tuned slightly MUTED (0xD49B45, was the more saturated 0xE0A23C)
-    // so the accent reads as a refined warm gold, not a gaudy neon orange on every selected control.
     [JsonIgnore]
     public SysVec4 Accent {
-        get => new(0.831f, 0.608f, 0.271f, 1f);   // 0xD49B45 muted amber/gold
-        set { /* static theme: accent is fixed, ignore writes */ }
+        get => new(0.831f, 0.608f, 0.271f, 1f);
+        set { }
     }
-
-    // ---- Storage ----
 
     public static EditorPrefs Current { get; private set; } = new();
 

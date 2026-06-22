@@ -4,33 +4,27 @@ using BallisticEngine.DX12;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
 using Vortice.DXGI;
-using GLVec3 = System.Numerics.Vector3;   // engine math is System.Numerics now
+using GLVec3 = System.Numerics.Vector3;
 using SNM = System.Numerics;
 
 namespace BallisticEngine.Editor;
 
-// DX12 implementation of the editor's mesh/material thumbnail rendering + the CPU-pixel -> ImGui-texture
-// upload. The GL MeshPreviewRenderer / MaterialPreviewRenderer / ThumbnailCache delegate here when the
-// editor runs on DX12. Renders into a small Dx12OffscreenTarget and reads back RGBA8 (the GL path returns
-// byte[] too, so the upstream thumbnail cache is unchanged); uploads go into a DEFAULT-heap texture whose
-// SRV lives in the shared Dx12Backend.UiHeap, so the ImGui DX12 backend samples it as ImTextureID.
 internal static class Dx12EditorPreview {
     static Dx12Device Dev => Dx12Backend.Device;
     static bool initialized;
 
     static ID3D12RootSignature meshRootSig, matRootSig;
     static ID3D12PipelineState meshPso, matPso;
-    static ID3D12Resource meshCb, matCb;     // upload-heap CBVs (mapped)
+    static ID3D12Resource meshCb, matCb;
     static unsafe byte* meshCbMapped, matCbMapped;
-    static Dx12DescriptorHeap matSrvHeap;    // shader-visible, ring; 2 SRVs (albedo,normal) per material draw
-    static ID3D12Resource whiteTex;          // 1x1 white fallback for missing material maps
+    static Dx12DescriptorHeap matSrvHeap;
+    static ID3D12Resource whiteTex;
     static int whiteSrvIndex = -1;
 
-    // Unit UV sphere (interleaved pos/normal/uv, stride 32), built once for the material preview.
     static ID3D12Resource sphereVb, sphereIb;
     static int sphereIndexCount;
 
-    static readonly Dictionary<int, Dx12OffscreenTarget> targets = new();   // by size
+    static readonly Dictionary<int, Dx12OffscreenTarget> targets = new();
 
     [StructLayout(LayoutKind.Sequential)]
     struct MatConstants { public SNM.Matrix4x4 Mvp; public SNM.Vector4 BaseColor; public float Roughness, Metallic, HasAlbedo, HasNormal; }
@@ -39,7 +33,6 @@ internal static class Dx12EditorPreview {
         if (initialized) return;
         initialized = true;
 
-        // --- Mesh preview pipeline: CBV b0 (mvp), pos@slot0 + normal@slot1 ---
         var meshCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Vertex);
         meshRootSig = Dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout, new[] { meshCbv })));
@@ -59,7 +52,6 @@ internal static class Dx12EditorPreview {
             SampleDescription = new SampleDescription(1, 0),
         });
 
-        // --- Material preview pipeline: CBV b0 + SRV table t0..t1 + sampler s0; interleaved pos/normal/uv ---
         var matCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 0);
         var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
@@ -158,7 +150,7 @@ internal static class Dx12EditorPreview {
             cl.DrawIndexedInstanced((uint)idxLen, 1u, 0u, 0, 0u);
         });
         byte[] pixels = target.ReadColorRgba8();
-        vb.Dispose(); nb.Dispose(); ib.Dispose();   // RenderIntoCleared + readback flushed the GPU
+        vb.Dispose(); nb.Dispose(); ib.Dispose();
         return pixels;
     }
 
@@ -179,13 +171,6 @@ internal static class Dx12EditorPreview {
         };
         *(MatConstants*)matCbMapped = cb;
 
-        // 2 contiguous SRV slots (albedo, normal) in the ring heap; missing maps fall back to 1x1 white.
-        // Reset the ring to slot 0 FIRST: this heap's AllocateRange contract (Dx12DescriptorHeap) is a per-use
-        // rewind — without it the 64-slot ring bump-grows across previews and silently wraps at draw #32,
-        // overwriting a slot a later CopyDescriptorsSimple still indexes (a named DEVICE_HUNG suspect: a
-        // shader-visible SRV ring overwritten under load). Each preview drains the GPU before returning
-        // (RenderIntoCleared + ReadColorRgba8 both submit+wait), so only 2 live slots are ever needed — rewind
-        // to 0 keeps the bound table descriptors fixed + valid. Harmless for the gated path; the fix-enabler.
         matSrvHeap.Reset();
         int slot = matSrvHeap.AllocateRange(2);
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -217,8 +202,6 @@ internal static class Dx12EditorPreview {
                           Guid.TryParseExact(reference["guid:".Length..], "N", out Guid g)
                 ? AssetDatabase.GuidToAssetPath(g) : reference;
             if (path is null) return null;
-            // Only return a texture that actually has a valid SRV — a null/invalid SRV copied into the
-            // shader-visible table is an out-of-bounds descriptor = GPU device-removal. Missing → white fallback.
             return AssetDatabase.Load<Texture2D>(path) is Dx12Texture2D t && t.HasSrv ? t : null;
         }
         catch { return null; }
@@ -266,9 +249,6 @@ internal static class Dx12EditorPreview {
         sphereIb = Dev.CreateDefaultBuffer<uint>(indices.ToArray(), ResourceStates.IndexBuffer);
     }
 
-    // A DX12 editor texture (thumbnail/preview): a DEFAULT-heap texture + its SRV in the shared UiHeap.
-    // The Handle is the GPU descriptor ptr ImGui samples (ImTextureID). Dispose releases the resource AND
-    // returns the UiHeap slot for reuse (so asset-browser invalidations don't leak descriptors).
     public sealed class Dx12EditorTexture : IDisposable {
         public ID3D12Resource Resource;
         public int UiSlot = -1;
@@ -279,7 +259,6 @@ internal static class Dx12EditorPreview {
         }
     }
 
-    // Upload RGBA8 CPU pixels (size x size, top-down) into a fresh DX12 texture + UiHeap SRV.
     public static unsafe Dx12EditorTexture UploadTexture(byte[] pixels, int size) {
         EnsureInitialized();
         var tex = new Dx12EditorTexture();

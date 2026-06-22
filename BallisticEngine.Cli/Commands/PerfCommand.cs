@@ -1,14 +1,9 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
-using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal perf <scene>` — structured render-perf query (the agent's autonomous-perf-work surface). Renders one
-// deterministic frame headlessly and emits RenderStats as JSON: draw calls, triangles, culled submeshes,
-// punctual/shadowed lights, CPU frame ms (+ per-pass GPU ms once DX12 timestamp queries land). Device-free
-// CLI — same subprocess pattern as `bal render` / `bal query`.
 internal sealed class PerfCommand : ICommand {
     public string Name => "perf";
     public string Summary => "Render-perf stats for a scene (draws/tris/cull/lights/CPU ms) as JSON.";
@@ -63,7 +58,7 @@ internal sealed class PerfCommand : ICommand {
         psi.ArgumentList.Add(projectRoot);
         psi.Environment["BALLISTIC_BACKEND"] = "dx12";
         psi.Environment["BALLISTIC_SCENE"] = sceneRel;
-        psi.Environment["BALLISTIC_SCREENSHOT"] = bmp;          // forces the headless host + a rendered frame
+        psi.Environment["BALLISTIC_SCREENSHOT"] = bmp;
         psi.Environment["BALLISTIC_SCREENSHOT_FRAME"] = frame.ToString(CultureInfo.InvariantCulture);
         psi.Environment["BALLISTIC_SCREENSHOT_PAUSED"] = "1";
         psi.Environment["BALLISTIC_STATS_OUT"] = statsOut;

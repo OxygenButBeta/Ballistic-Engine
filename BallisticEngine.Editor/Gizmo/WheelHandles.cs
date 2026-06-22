@@ -4,22 +4,14 @@ using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Scene-view drag handles for a selected entity's WheelColliders (Unity's WheelCollider edit handles).
-// Two square handles per wheel, both dragged along the wheel's UP axis so the values match the
-// inspector exactly:
-//   * RADIUS  — a square at the top of the wheel circle; drag away from the centre to grow the radius.
-//   * TRAVEL  — a square at full droop (mount − up·travel); drag down to lengthen the suspension travel.
-// The drawing (the circle + travel line) is the WheelCollider's own OnDrawGizmosSelected; this file
-// only adds the interactive squares. Undo snapshots on grab, like ColliderHandles.
 internal static class WheelHandles {
     static WheelCollider activeWheel;
-    static int activeHandle = -1;          // 0 = radius, 1 = travel
+    static int activeHandle = -1;
     static Vector3 grabAnchor, grabDir;
     static float grabParam, grabValue;
 
     public static bool IsInteracting => activeWheel is not null;
 
-    // Returns true when a wheel changed this frame (caller marks the scene dirty).
     public static bool Draw(WheelCollider wheel, IViewProjectionProvider camera,
         SysVec2 viewMin, SysVec2 viewSize, ImDrawListPtr draw, bool viewHovered) {
         if (!ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
@@ -32,13 +24,11 @@ internal static class WheelHandles {
         Vector3 up = t.Up;
         Vector3 mount = t.WorldPosition;
 
-        // The wheel centre sits at the rest position in edit mode (the same place the mesh/gizmo draw it).
         float restDrop = wheel.SuspensionTravel * wheel.SuspensionRestFraction;
         Vector3 centre = mount - up * restDrop;
 
         var changed = false;
 
-        // RADIUS handle: top of the wheel circle. Drag along +up grows the radius.
         Vector3 radiusPos = centre + up * wheel.Radius;
         if (HandleSquare(wheel, 0, radiusPos, up, vp, viewMin, viewSize, draw, viewHovered,
                 out float radiusDelta))
@@ -48,7 +38,6 @@ internal static class WheelHandles {
             changed = true;
         }
 
-        // TRAVEL handle: at full droop. Drag along −up (downward) lengthens the travel.
         Vector3 travelPos = mount - up * wheel.SuspensionTravel;
         if (HandleSquare(wheel, 1, travelPos, -up, vp, viewMin, viewSize, draw, viewHovered,
                 out float travelDelta))
@@ -61,8 +50,6 @@ internal static class WheelHandles {
         return changed;
     }
 
-    // Draws one square handle; starts a drag (undo push + grab snapshot) when clicked. Outputs the
-    // world distance dragged along `worldDir` since grab. Returns true on the grab frame.
     static bool HandleSquare(WheelCollider wheel, int index, Vector3 worldPos, Vector3 worldDir,
         Matrix4 vp, SysVec2 viewMin, SysVec2 viewSize, ImDrawListPtr draw, bool viewHovered,
         out float worldDelta) {
@@ -93,10 +80,6 @@ internal static class WheelHandles {
             grabDir = worldDir;
             GizmoMath.MouseRay(vp, viewMin, viewSize, mouse, out Vector3 rayO, out Vector3 rayD);
             grabParam = ClosestParamOnAxis(worldPos, worldDir, rayO, rayD);
-            // Drag-start snapshot of this ONE wheel's entity -> scoped through EditorCommands.EditEntity
-            // (PushEntity: selection survives, no whole-scene re-bake). The drag mutates wheel.Radius/
-            // SuspensionTravel on later frames, so the grab-frame snapshot is preserved with a no-op
-            // mutate -- byte-identical beyond the Push->PushEntity scoping.
             EditorCommands.EditEntity(wheel.Entity, "Edit Wheel", () => { });
             grabbed = true;
         }
@@ -109,7 +92,6 @@ internal static class WheelHandles {
         return grabbed;
     }
 
-    // Parameter t along the axis (origin + axis*t) closest to the mouse ray.
     static float ClosestParamOnAxis(Vector3 axisOrigin, Vector3 axisDir, Vector3 rayO, Vector3 rayD) {
         Vector3 w0 = axisOrigin - rayO;
         float a = Vector3.Dot(axisDir, axisDir);

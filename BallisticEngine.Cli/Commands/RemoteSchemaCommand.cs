@@ -1,16 +1,5 @@
-using BallisticEngine;
-
 namespace BallisticEngine.Cli.Commands;
 
-// `bal remote-schema` -- emits the JSON catalog of the editor's command-port method surface (the named
-// pipe / MCP bridge methods: entity.create, component.set, scene.open, ...), with each method's rendered
-// signature and its per-param contract (name + JSON kind + required flag).
-//
-// This surfaces the SAME RemoteSchema table the editor's RemoteHandlers dispatches + validates against and
-// the `help` command derives its catalog from (editor-rework Phase D / D1). Where `bal schema` answers
-// "what components can I author?", this answers "what can I drive in a live editor over the pipe/MCP?" --
-// the agent's command-port reference, generated from the single source so it can never drift. GL-free:
-// RemoteSchema is a plain engine-library data table, no scene/GPU touch.
 internal sealed class RemoteSchemaCommand : ICommand {
     public string Name => "remote-schema";
     public string Summary => "Print the JSON catalog of editor command-port methods (pipe/MCP surface).";
@@ -49,7 +38,6 @@ internal sealed class RemoteSchemaCommand : ICommand {
         return args[++i];
     }
 
-    // ---- JSON shapes ----
     record RemoteSchemaResult(int count, List<MethodInfo> methods);
     record MethodInfo(string method, string signature, List<ParamInfo> @params);
     record ParamInfo(string name, string kind, bool required);

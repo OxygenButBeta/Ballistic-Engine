@@ -2,9 +2,6 @@ using System.Collections;
 
 namespace BallisticEngine;
 
-// An ordered, immutable collection of a shader's declared properties with O(1) lookup by name and
-// by semantic. Order is preserved because the editor renders properties top-to-bottom in declared
-// order, and the renderer binds texture slots in declared order (DiffuseMap -> t0, ... ).
 public sealed class ShaderProperties : IReadOnlyList<ShaderProperty> {
     public static readonly ShaderProperties Empty = new([]);
 
@@ -18,7 +15,6 @@ public sealed class ShaderProperties : IReadOnlyList<ShaderProperty> {
         bySemantic = new Dictionary<MaterialSemantic, ShaderProperty>(properties.Length);
         foreach (var p in properties) {
             byName[p.Name] = p;
-            // First declaration of a semantic wins; None can repeat (custom props) so it is not indexed.
             if (p.Semantic != MaterialSemantic.None)
                 bySemantic.TryAdd(p.Semantic, p);
         }

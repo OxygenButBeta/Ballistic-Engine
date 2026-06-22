@@ -1,98 +1,71 @@
-using System;
-using System.Collections.Generic;
-using System.Numerics;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
-using GLMatrix4 = System.Numerics.Matrix4x4;   // engine math is System.Numerics now; ToNum(...) is an identity copy
+using GLMatrix4 = System.Numerics.Matrix4x4;
 using GLVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.DX12;
 
-// GPU-driven geometry pass for the DX12 clustered-deferred renderer (port of OpenGL/Rendering/GpuDriven/).
-// Targets WHOLE-MESH renderers (SubMeshIndex < 0): a compute shader frustum-culls all their opaque
-// submeshes (GpuCull.hlsl — bit-identical to the CPU AabbInFrustum, so the visible set matches), compacts
-// the survivors into an ExecuteIndirect command list + a per-draw buffer, and a single ExecuteIndirect per
-// mesh draws them all with BINDLESS materials (GBufferBindless.hlsl) — collapsing ~1600 CPU DrawIndexed
-// calls (+ per-draw CBV/descriptor binds) into a handful of dispatch+ExecuteIndirect calls. Byte-identical
-// G-buffer to the CPU path (the cull + shading math match exactly). Gated by BALLISTIC_DX12_GPUDRIVEN.
 public sealed class Dx12GpuDrivenRenderer : IDisposable {
-    const int Capacity = 8192;     // max whole-mesh submeshes per frame
-    const int MaxGroups = 64;      // distinct meshes among whole-mesh renderers
-    const int DrawCmdStride = 24;  // GpuDrawCommand bytes (1 root const + 5 DrawIndexedArguments)
+    const int Capacity = 8192;
+    const int MaxGroups = 64;
+    const int DrawCmdStride = 24;
 
     readonly Dx12Device dev;
 
-    // Cull (compute): CullParams CBV(b0) + Metas SRV(t0) + Commands/PerDraws UAV(u0/u1). cullRootSig is the
-    // PLAIN one (shadow cull); geoCullRootSig adds a point sampler + bindless flag for the Hi-Z pyramid read.
     ID3D12RootSignature cullRootSig;
     ID3D12RootSignature geoCullRootSig;
     ID3D12PipelineState cullPso;
-    // Hi-Z occlusion (camera geometry cull only).
     Dx12HiZ hiz;
     int hizBindlessIndex = -1;
     bool hizOnThisFrame;
-    // Exposed so the per-instance culler (Dx12InstanceCuller) can occlusion-cull against the SAME Hi-Z pyramid
-    // this frame built — its bindless slot, on-state, and pyramid dims. HizOn folds in the slot-valid check.
+
     public int HizBindlessIndex => hizBindlessIndex;
     public bool HizOn => hizOnThisFrame && hizBindlessIndex >= 0;
     public int HizWidth => hiz?.Width ?? 0;
     public int HizHeight => hiz?.Height ?? 0;
     public int HizMipCount => hiz?.MipCount ?? 0;
-    // GPU-driven G-buffer draw: DrawIndex root const(b0) + PerDraws SRV(t0) + GpuMaterials SRV(t1) + bindless.
     ID3D12RootSignature drawRootSig;
     ID3D12PipelineState drawPso;
     ID3D12CommandSignature cmdSig;
 
-    ID3D12Resource metaUpload;      unsafe byte* metaMapped;        // SubmeshMeta[] (rebuilt per frame)
-    ID3D12Resource cullParamUpload; unsafe byte* cullParamMapped;   // CullParams[MaxGroups] (256B slots)
-    ID3D12Resource commands;        // DEFAULT UAV — indirect draw commands (one slot per submesh, in order)
-    ID3D12Resource perDraws;        // DEFAULT UAV — per-draw Mvp/Model/MaterialId (GPU cull writes these)
-    ID3D12Resource materials;       unsafe byte* materialsMapped;   // GpuMaterial[] (built on material change)
-    // R2 — CPU per-submesh bindless: the CPU draw loop reuses drawPso/drawRootSig/GBufferBindless.hlsl + this
-    // exact GpuMaterials table, but writes its OWN PerDraw entries (Mvp/Model/MaterialId) into a CPU-mapped,
-    // N-buffered UPLOAD buffer (the GPU-driven `perDraws` is a DEFAULT UAV the cull writes — the CPU can't map it).
-    // One draw = one entry; DrawIndex root const selects it, same as the indirect path. Capacity = MaxCpuDraws.
-    ID3D12Resource cpuPerDraws;     unsafe byte* cpuPerDrawsMapped;
-    long cpuPerDrawsFrameStride;    // perDrawStride*MaxCpuDraws bytes per frame slot
-    const int MaxCpuDraws = 8192;   // CPU-path opaque submeshes per frame (split-import scenes); over → old path
+    ID3D12Resource metaUpload;      unsafe byte* metaMapped;
+    ID3D12Resource cullParamUpload; unsafe byte* cullParamMapped;
+    ID3D12Resource commands;
+    ID3D12Resource perDraws;
+    ID3D12Resource materials;       unsafe byte* materialsMapped;
 
-    // R3b — compute skinning: skin pos/normal/tangent on the compute path into per-renderer transient buffers,
-    // then the skinned result draws through the static GPU-driven path. Root SRV/UAV only (no descriptor heap).
+    ID3D12Resource cpuPerDraws;     unsafe byte* cpuPerDrawsMapped;
+    long cpuPerDrawsFrameStride;
+    const int MaxCpuDraws = 8192;
+
     ID3D12RootSignature skinRootSig;
     ID3D12PipelineState skinPso;
-    // R4 — mesh-shader meshlet pipeline (null unless dev.HasMeshShaders).
     ID3D12RootSignature meshletRootSig;
     ID3D12PipelineState meshletPso;
-    // Transient skinned out-buffers, keyed by skinned renderer instance, recreated when its vertex count changes.
-    // Pos/Normal are float3, Tangent float4 — same layout as the source streams so they're drop-in vertex buffers.
-    // GPU-written (UAV) then GPU-read (vertex buffer) the SAME frame; under P0b overlap a frame N+1 reuse can't
-    // race frame N's read because each skinned renderer's buffers are only rewritten by ITS dispatch each frame
-    // and the draw that reads them is in the same command list after a UAV→vertex barrier (intra-frame ordered).
+
     public sealed class SkinnedBuffers {
         public ID3D12Resource Pos, Normal, Tangent; public int VertexCount;
-        public ResourceStates State = ResourceStates.UnorderedAccess;   // tracked so barriers never mismatch (GBV)
+        public ResourceStates State = ResourceStates.UnorderedAccess;
     }
     readonly Dictionary<IStaticMeshRenderer, SkinnedBuffers> skinnedBuffers = new();
-    int cullParamSlotSize;       // shadow CullParams slot
-    int geoCullParamSlotSize;    // geometry GeoCullParams slot (bigger — has the Hi-Z fields)
+    int cullParamSlotSize;
+    int geoCullParamSlotSize;
+
     int metaStride, perDrawStride, materialStride;
-    // P0b frame-overlap: every per-frame CPU-mapped UPLOAD buffer is N-buffered (×dev.FramesInFlight) so the CPU
-    // writing frame F+1's slab can't stomp data the GPU is still reading from frame F. Each *FrameStride is the
-    // byte span of ONE frame's region; the live slot is dev.FrameSlot*stride. At FramesInFlight==1 every stride
-    // multiplies a single-frame alloc and FrameSlot is always 0 → offsets are 0 → byte-identical to pre-P0b.
-    long metaFrameStride;          // metaUpload: metaStride*Capacity bytes per frame
-    long cullParamFrameStride;     // cullParamUpload: geoCullParamSlotSize*MaxGroups bytes per frame
-    long materialsFrameStride;     // materials: materialStride*MaxMaterials bytes per frame
-    public long LastTris;        // triangles fed to the GPU cull this frame (pre-cull upper bound, for stats)
-    public int LastSubmeshes;    // submeshes fed to the GPU cull this frame
+
+    long metaFrameStride;
+    long cullParamFrameStride;
+    long materialsFrameStride;
+    public long LastTris;
+    public int LastSubmeshes;
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct SubmeshMeta {
         public Matrix4x4 Mvp; public Matrix4x4 Model;
         public Vector4 AabbMin; public Vector4 AabbMax;
         public uint FirstIndex, IndexCount, MaterialId, Flags;
-        public uint LodCount; public float LodBias; public uint Lp0, Lp1;   // geometric LOD: count + per-submesh bias
-        public uint LodR0a, LodR0b, LodR1a, LodR1b, LodR2a, LodR2b, LodR3a, LodR3b;  // LodRanges[4] (FirstIndex,IndexCount)
+        public uint LodCount; public float LodBias; public uint Lp0, Lp1;
+        public uint LodR0a, LodR0b, LodR1a, LodR1b, LodR2a, LodR2b, LodR3a, LodR3b;
     }
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct PerDraw { public Matrix4x4 Mvp; public Matrix4x4 Model; public uint MaterialId; public uint P0, P1, P2; }
@@ -107,39 +80,37 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     }
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct CullParams { public Vector4 P0, P1, P2, P3, P4, P5; public uint SubmeshCount, OutBase, Pad0, Pad1; }
-    // Geometry cull params (matches GpuCull.hlsl's bigger cbuffer — adds the Hi-Z fields).
+
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct GeoCullParams {
         public Vector4 P0, P1, P2, P3, P4, P5;
         public uint SubmeshCount, OutBase, HizEnabled, HizIndex;
-        public Matrix4x4 ViewProj;   // unjittered
+        public Matrix4x4 ViewProj;
         public Matrix4x4 View;
-        public Vector4 HizParams;    // x=w, y=h, z=mipCount, w=near
-        public Vector4 HizFar;       // x=far
-        public Vector4 LodSpanThresholds;   // x=LOD1 thr, y=LOD2, z=LOD3, w=LOD4 (px)
-        public Vector4 LodControl;          // x=globalBias, y=lodEnabled(0/1), zw spare
+        public Vector4 HizParams;
+        public Vector4 HizFar;
+        public Vector4 LodSpanThresholds;
+        public Vector4 LodControl;
     }
 
-    // Material table cache (rebuilt when the material set changes).
     readonly Dictionary<Material, int> materialIds = new();
     readonly Dictionary<Dx12Texture2D, int> bindlessIds = new();
     int materialCount;
     int tableStamp = -1;
 
-    // --- GPU-driven sun shadows (depth-only, per cascade) ---
     const int ShadowCascades = 4;
     const int ShadowCapacity = ShadowCascades * Capacity;
-    ID3D12PipelineState shadowCullPso;       // reuses cullRootSig (CBV b0 + SRV t0 + UAV u0/u1)
-    ID3D12RootSignature shadowDrawRootSig;   // root const b0 (DrawIndex) + SRV t0 (ShadowPerDraws)
-    ID3D12PipelineState shadowDrawPso;       // depth-only, slope bias (matches CPU shadow PSO)
+    ID3D12PipelineState shadowCullPso;
+    ID3D12RootSignature shadowDrawRootSig;
+    ID3D12PipelineState shadowDrawPso;
     ID3D12CommandSignature shadowCmdSig;
     ID3D12Resource shadowMetaUpload;   unsafe byte* shadowMetaMapped;
     ID3D12Resource shadowCullParamUpload; unsafe byte* shadowCullParamMapped;
-    ID3D12Resource shadowCommands;     // DEFAULT UAV
-    ID3D12Resource shadowPerDraws;     // DEFAULT UAV
+    ID3D12Resource shadowCommands;
+    ID3D12Resource shadowPerDraws;
     int shadowMetaStride;
-    long shadowMetaFrameStride;        // P0b: shadowMetaUpload bytes per frame (shadowMetaStride*ShadowCapacity)
-    long shadowCullParamFrameStride;   // P0b: shadowCullParamUpload bytes per frame
+    long shadowMetaFrameStride;
+    long shadowCullParamFrameStride;
     readonly List<(int cascade, Dx12Buffer<GLVector3> vb, Dx12IndexBuffer ib, int baseIdx, int count)> shadowSlices = new();
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -161,7 +132,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     }
 
     unsafe void BuildPipelines() {
-        // --- Cull root sig (PLAIN, used by the SHADOW cull): CBV b0 + SRV t0 + UAV u0/u1 ---
         var cullParams = new[] {
             new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All),
             new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All),
@@ -171,8 +141,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cullRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.None, cullParams)));
 
-        // --- Geometry cull root sig: same + a static point sampler (s0) + directly-indexed flag so the
-        // cull can sample the Hi-Z pyramid via ResourceDescriptorHeap[HizIndex]. ---
         var pointClamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
             Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp,
             AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
@@ -183,48 +151,30 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                 RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
                 cullParams, new[] { pointClamp })));
 
-        // --- R3b compute-skinning root sig: CBV b0 (SkinParams) + root SRV t0 bones + t1..t5 in-streams +
-        // root UAV u0..u2 out-streams. ALL root descriptors (raw buffers) — no descriptor heap, so the descriptor-
-        // lifetime hang class (R2) can't apply here. ---
         var skinParams = new[] {
             new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All),
-            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All), // t0 bones
-            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.All), // t1 pos
-            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All), // t2 normal
-            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All), // t3 tangent
-            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All), // t4 boneIdx
-            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All), // t5 boneWt
-            new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All), // u0 outPos
-            new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All), // u1 outNormal
-            new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(2, 0), ShaderVisibility.All), // u2 outTangent
+            new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All), new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.All), new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All), new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All), new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All), new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All), new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(0, 0), ShaderVisibility.All), new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(1, 0), ShaderVisibility.All), new RootParameter1(RootParameterType.UnorderedAccessView, new RootDescriptor1(2, 0), ShaderVisibility.All),
         };
         skinRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
             new RootSignatureDescription1(RootSignatureFlags.None, skinParams)));
-        // PSO cache (proof migration): dedupe + warm-load. Each name is a unique disk-library key.
         skinPso = dev.CreateComputePso(new ComputePipelineStateDescription {
             RootSignature = skinRootSig,
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute,
                 EmbeddedShaderSource.ReadHlsl("SkinCompute.hlsl"), "CSMain", "SkinCompute.hlsl"),
         }, "GpuDriven.Skin");
 
-        // --- R4 mesh-shader meshlet pipeline (AS+MS+PS). Root sig: root const b0 (DrawIndex/MeshletBase/Count) +
-        // root SRV t0..t9 (PerDraws, GpuMaterials, Meshlets, Bounds, Verts, Prims, Pos, Normal, UV, Tangent) + CBV
-        // b1 (motion) + CBV b2 (cull planes) + static sampler s0 + the directly-indexed flag (PS reads
-        // ResourceDescriptorHeap for bindless material textures). Built only when HW mesh shaders are available. ---
         if (dev.HasMeshShaders) {
             var mp = new System.Collections.Generic.List<RootParameter1> {
-                new(new RootConstants(0, 0, 4), ShaderVisibility.All),   // b0 DrawIndexCB (4 uints)
+                new(new RootConstants(0, 0, 4), ShaderVisibility.All),
             };
-            for (int t = 0; t <= 9; t++)   // t0..t9 root SRVs
-                mp.Add(new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1((uint)t, 0), ShaderVisibility.All));
-            mp.Add(new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All)); // b1 motion
-            mp.Add(new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(2, 0), ShaderVisibility.All)); // b2 cull
+            for (int t = 0; t <= 9; t++) mp.Add(new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1((uint)t, 0), ShaderVisibility.All));
+            mp.Add(new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.All));
+            mp.Add(new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(2, 0), ShaderVisibility.All));
             var msWrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
                 Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap,
                 AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16, ComparisonFunction = ComparisonFunction.Never,
                 MinLOD = 0, MaxLOD = float.MaxValue,
             };
-            // s1 point-clamp for the AS meshlet Hi-Z occlusion sample (visible to the amplification stage = All).
             var msPoint = new StaticSamplerDescription(ShaderVisibility.All, 1, 0) {
                 Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
                 AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never,
@@ -249,8 +199,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, cullHlsl, "CSMain", "GpuCull.hlsl"),
         }, "GpuDriven.Cull");
 
-        // --- Draw root sig: root const b0 (DrawIndex) + SRV t0 (PerDraws) + SRV t1 (GpuMaterials) +
-        // CBV b1 (MotionConstants, per pass — matches the CPU GBuffer.hlsl b1) + bindless ---
         var drawParams = new[] {
             new RootParameter1(new RootConstants(0, 0, 1), ShaderVisibility.Vertex),
             new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.Vertex),
@@ -279,13 +227,12 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         drawPso = dev.CreateGraphicsPso(new GraphicsPipelineStateDescription {
             RootSignature = drawRootSig, VertexShader = vs, PixelShader = ps, InputLayout = layout,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullClockwise,   // back-face cull (matches CPU GBuffer PSO)
+            RasterizerState = RasterizerDescription.CullClockwise,
             BlendState = BlendDescription.Opaque, DepthStencilState = DepthStencilDescription.Default,
             RenderTargetFormats = Dx12GBuffer.ColorFormats,
             DepthStencilFormat = Dx12GBuffer.DepthFormat, SampleDescription = new Vortice.DXGI.SampleDescription(1, 0),
         }, "GpuDriven.Draw");
 
-        // Command signature: [Constant -> root param 0][DrawIndexed]. References drawRootSig (root const).
         var argConstant = new IndirectArgumentDescription { Type = IndirectArgumentType.Constant };
         argConstant.Constant.RootParameterIndex = 0;
         argConstant.Constant.DestOffsetIn32BitValues = 0;
@@ -319,37 +266,24 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             ResourceDescription.Buffer((ulong)(materialsFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         materialsMapped = materials.Map<byte>(0);
 
-        // R2: CPU per-submesh bindless PerDraws — UPLOAD heap (CPU-mapped), N-buffered by FrameSlot like materials.
         cpuPerDrawsFrameStride = (long)perDrawStride * MaxCpuDraws;
         cpuPerDraws = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)(cpuPerDrawsFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         cpuPerDrawsMapped = cpuPerDraws.Map<byte>(0);
     }
 
-    // Drop the cached material table so the NEXT EnsureMaterialTable rebuilds from scratch. Called on a scene
-    // swap: the table is cached by a cheap count stamp (renderer + submesh count), so a new scene with the SAME
-    // counts as the old one would keep the old scene's Material->id map and bindless texture binds — then
-    // RenderInto's `materialIds.TryGetValue(mat)` misses every new-scene material and skips its submeshes (the
-    // "second scene culls/renders wrong" bug). The dictionaries hold dead Material/Texture refs across the swap
-    // anyway, so clear them too. -1 stamp forces a rebuild even if the new counts coincide.
     public void Invalidate() {
         tableStamp = -1;
         materialIds.Clear();
         bindlessIds.Clear();
         materialCount = 0;
         hizBindlessIndex = -1;
-        bufferBindless.Clear();   // R5: the bindless heap was/will be Reset → the vis-buffer geometry SRVs are stale.
-        visResolveUavBase = -1;   // R5: re-reserve the resolve UAV-table slots after this rebuild's heap Reset.
-        // Drop the Hi-Z pyramid too: a same-resolution scene swap leaves it holding the OLD scene's depth, so
-        // the occlusion cull would reject the new scene behind stale occluders. Next BuildHiZ re-creates it
-        // (recreated=true → bindless SRV re-pointed) and refills from the new depth.
+        bufferBindless.Clear();
+        visResolveUavBase = -1;
         hiz?.Invalidate();
     }
 
-    // Build / rebuild the bindless material table from the whole-mesh renderers' opaque submeshes. Cached
-    // by a stamp (material-set size); rebuild resets the shared bindless heap + caches.
     public unsafe void EnsureMaterialTable(List<IStaticMeshRenderer> wholeMesh) {
-        // Stamp = renderer count + total submesh count (cheap change detector for a static scene).
         int stamp = wholeMesh.Count;
         foreach (var r in wholeMesh) { var m = r.SharedMesh; if (m != null) stamp = stamp * 31 + m.SubMeshes.Length; }
         if (stamp == tableStamp) return;
@@ -358,10 +292,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         Dx12Backend.BindlessHeap.Reset();
         materialIds.Clear();
         bindlessIds.Clear();
-        bufferBindless.Clear();   // R5: vis-buffer geometry SRVs lived in the heap that was just reset — re-register
-        visResolveUavBase = -1;   // R5: the resolve UAV-table slots are gone too — re-reserve on next ReserveVisResolveUavs
+        bufferBindless.Clear();
+        visResolveUavBase = -1;
         materialCount = 0;
-        hizBindlessIndex = -1;   // the Hi-Z SRV lived in the bindless heap that was just reset — re-register
+        hizBindlessIndex = -1;
 
         foreach (var r in wholeMesh) {
             Mesh mesh = r.SharedMesh; if (mesh is null) continue;
@@ -370,20 +304,12 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         }
     }
 
-    // The bindless material table is sized for `MaxMaterials` GpuMaterial entries (AllocateBuffers).
     const int MaxMaterials = 4096;
 
-    // Register one opaque material into the bindless table if it isn't there yet, writing its GpuMaterial
-    // (byte-identical decode to GBufferBindless.hlsl). No-op for null / transparent / already-present / table-
-    // full. Factored out of EnsureMaterialTable so the RT geometry build (Dx12RtGeometry) can resolve-or-
-    // register the SAME ids — see ResolveOrRegisterMaterialId.
     unsafe void RegisterMaterial(Material mat) {
         if (mat is null || mat.Transparent || materialIds.ContainsKey(mat) || materialCount >= MaxMaterials) return;
         int id = materialCount++;
         materialIds[mat] = id;
-        // Material-shaping fields read through the shader-declared property bag (semantic-keyed); the
-        // map-presence flags (HasMetallicMap/HasRoughnessMap) are derived from the texture slots, not
-        // authored properties. Byte-identical to the old typed-field reads (the bag mirrors them 1:1).
         bool hasMetal = mat.GetTexture(MaterialSemantic.MetallicMap) is not null;
         bool hasRough = mat.GetTexture(MaterialSemantic.RoughnessMap) is not null;
         var ec = mat.GetVector(MaterialSemantic.EmissiveColor);
@@ -396,8 +322,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             AoIdx = (uint)Bindless(mat.GetTexture(MaterialSemantic.AOMap), TextureType.AO),
             EmissiveIdx = (uint)Bindless(mat.GetTexture(MaterialSemantic.EmissiveMap), TextureType.Emissive),
             BaseColorFactor = mat.GetVector(MaterialSemantic.BaseColorFactor),
-            // W stays 0 (the old code multiplied a W=0 vector by intensity); the bag holds EmissiveColor
-            // with W=1, so build the RGB-only vector explicitly to preserve the exact bytes.
             EmissiveFactor = new Vector4(ec.X, ec.Y, ec.Z, 0f) * ei,
             Metallic = mat.GetFloat(MaterialSemantic.MetallicFactor), Roughness = mat.GetFloat(MaterialSemantic.RoughnessFactor),
             SpecularReflectance = mat.GetFloat(MaterialSemantic.SpecularReflectance), NormalStrength = mat.GetFloat(MaterialSemantic.NormalStrength),
@@ -405,115 +329,62 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             HasRoughnessMap = hasRough ? 1f : 0f, PackedOrm = mat.GetFloat(MaterialSemantic.PackedOrm),
             Cutout = mat.GetFloat(MaterialSemantic.Cutout), HasEmissive = mat.GetFloat(MaterialSemantic.IsEmissive),
         };
-        // materials is stamp-gated (rebuilt only on a material-set change, not per frame), but N-buffered for
-        // overlap safety: when a rebuild lands on frame F, an in-flight earlier frame may still be reading its
-        // own slab, and a later frame will read a DIFFERENT slot. The data is frame-invariant (same stamp = same
-        // bytes), so write the entry into ALL N slabs (like ClusteredLights' clusterMin/Max) — every slot holds
-        // correct material data regardless of which FrameSlot the next draw reads from.
         for (int f = 0; f < dev.FramesInFlight; f++)
             *(GpuMaterial*)(materialsMapped + f * materialsFrameStride + (long)id * materialStride) = gm;
     }
 
-    // R1.0 (GI Pragmatic Revival) — robust per-submesh MaterialId for the RT geometry build. Dx12RtGeometry
-    // bakes one MaterialId per triangle so the DXR hit shaders decode the SAME material the raster G-buffer
-    // does. EnsureMaterialTable only registers WHOLE-MESH (SubMeshIndex<0) renderers, but the TLAS/rtGeometry
-    // trace EVERY active renderer (incl. SubMeshIndex>=0 split-import children). Those renderers' materials
-    // were absent from the table, so the old `TryMaterialId-or-0` fallback silently shaded their triangles
-    // with material 0 (the first whole-mesh material) — RT-GI/emissive/reflection bounce came out wrong/empty
-    // off color-only & split content while the raster G-buffer looked correct. This resolve-or-register makes
-    // every RT-traced submesh's material present (extending the live table; the next EnsureMaterialTable reset
-    // re-registers whole-mesh first, then rtGeometry's stamp-tracked rebuild re-adds these — ids stay
-    // consistent). Returns -1 for null/transparent (the caller leaves such triangles at id 0; transparent
-    // surfaces bounce negligibly and are skipped by the raster path too).
     public int ResolveOrRegisterMaterialId(Material mat) {
         if (mat is null || mat.Transparent) return -1;
         if (materialIds.TryGetValue(mat, out int id)) return id;
         RegisterMaterial(mat);
-        return materialIds.TryGetValue(mat, out id) ? id : -1;   // -1 only if the table was full
+        return materialIds.TryGetValue(mat, out id) ? id : -1;
     }
 
-    // RT exposure: the DXR GI/reflection hit shaders decode the hit material BYTE-IDENTICALLY to the raster
-    // G-buffer, so they reuse THIS exact bindless material table (no parallel build → no drift). The table is
-    // a root SRV in the raster draw; here we hand the RT pass its GPU address + the Material→id map so it can
-    // build a per-triangle MaterialId buffer (Dx12RtGeometry) that resolves the same ids GBufferBindless uses.
-    // Live FrameSlot's material slab (all N slabs hold identical, frame-invariant data — see RegisterMaterial —
-    // so the RT/Lumen/reflection passes that read this within the same frame decode the same bytes the raster
-    // draw does). FramesInFlight==1 → FrameSlot 0 → offset 0 → byte-identical to pre-P0b.
     public ulong MaterialsGpuAddress => materials is null ? 0 : materials.GPUVirtualAddress + (ulong)(dev.FrameSlot * materialsFrameStride);
     public int MaterialCount => materialCount;
 
-    // ===================== R2 — CPU per-submesh bindless draw =====================
-    // The CPU per-submesh opaque loop reuses the GPU-driven bindless draw PSO/root sig (GBufferBindless.hlsl —
-    // shading byte-identical to GBuffer.hlsl) instead of binding 6 material descriptors per draw. The CPU writes
-    // each draw's PerDraw{Mvp,Model,MaterialId} into cpuPerDraws (its own N-buffered upload buffer) and selects it
-    // with the DrawIndex root constant — exactly like the indirect path, just CPU-submitted one draw at a time.
-    //
-    // Bind ONCE before the CPU draws: root sig + PSO, PerDraws(t0)=cpuPerDraws (this frame's slot), GpuMaterials
-    // (t1) = the shared table, Motion CBV (b1), and the bindless heap. The geometry pass already bound the bindless
-    // heap via SetDescriptorHeaps(srvVisible.Heap)? — NO: bindless needs Dx12Backend.BindlessHeap. The caller binds
-    // it here. The vertex/index buffers are still bound per-renderer by the caller (mesh streams differ per mesh).
     public void CpuBindlessBegin(ID3D12GraphicsCommandList4 cl, ulong motionCbAddress) {
-        // ORDER IS LOAD-BEARING: SetDescriptorHeaps MUST precede SetGraphicsRootSignature for a root sig with the
-        // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED flag (else GBV: DescriptorHeapNotSetBeforeRootSignature... → GPU hang).
-        // The GPU-driven RenderInto does the same ("GOTCHA: before the root sig"). Getting this backwards was the
-        // DRED PageFaultVA=0 "bad bind" hang on the forced-CPU Bistro stress.
-        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);   // ResourceDescriptorHeap[] source for the bindless reads
+        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
         cl.SetGraphicsRootSignature(drawRootSig);
         cl.SetPipelineState(drawPso);
-        cl.SetGraphicsRootShaderResourceView(1,                  // t0 PerDraws (this frame's slot)
-            cpuPerDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * cpuPerDrawsFrameStride));
-        cl.SetGraphicsRootShaderResourceView(2, MaterialsGpuAddress);   // t1 GpuMaterials (this frame's slot)
-        cl.SetGraphicsRootConstantBufferView(3, motionCbAddress);       // b1 MotionConstants (per pass)
+        cl.SetGraphicsRootShaderResourceView(1, cpuPerDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * cpuPerDrawsFrameStride));
+        cl.SetGraphicsRootShaderResourceView(2, MaterialsGpuAddress);
+        cl.SetGraphicsRootConstantBufferView(3, motionCbAddress);
     }
 
-    // R3b — SkinParams CB (just VertexCount), N-buffered + a small per-dispatch stride so several skinned
-    // renderers in one frame don't stomp each other's CB. Lazily created.
     ID3D12Resource skinCb; unsafe byte* skinCbMapped; int skinCbStride; long skinCbFrameStride;
     const int MaxSkinnedPerFrame = 256;
     unsafe void EnsureSkinCb() {
         if (skinCb != null) return;
-        skinCbStride = 256;   // one SkinParams slot (CB alignment)
+        skinCbStride = 256;
         skinCbFrameStride = (long)skinCbStride * MaxSkinnedPerFrame;
         skinCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)(skinCbFrameStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         skinCbMapped = skinCb.Map<byte>(0);
     }
 
-    // Ensure this skinned renderer's transient out-buffers exist at the right vertex count (recreated on change).
     SkinnedBuffers EnsureSkinnedBuffers(IStaticMeshRenderer r, int vertexCount) {
         if (!skinnedBuffers.TryGetValue(r, out var sb)) { sb = new SkinnedBuffers(); skinnedBuffers[r] = sb; }
         if (sb.VertexCount == vertexCount && sb.Pos != null) return sb;
-        // Vertex count changed (or first use) — (re)create. Defer-release the old ones under overlap.
         if (sb.Pos != null) { dev.DeferredRelease(sb.Pos); dev.DeferredRelease(sb.Normal); dev.DeferredRelease(sb.Tangent); }
         ID3D12Resource MakeUav(int bytes) => dev.Device.CreateCommittedResource(
             HeapProperties.DefaultHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)bytes, ResourceFlags.AllowUnorderedAccess), ResourceStates.UnorderedAccess);
-        sb.Pos = MakeUav(vertexCount * 12);      // float3
-        sb.Normal = MakeUav(vertexCount * 12);   // float3
-        sb.Tangent = MakeUav(vertexCount * 16);  // float4
+        sb.Pos = MakeUav(vertexCount * 12);
+        sb.Normal = MakeUav(vertexCount * 12);
+        sb.Tangent = MakeUav(vertexCount * 16);
         sb.VertexCount = vertexCount;
         return sb;
     }
 
-    // R3b — dispatch compute skinning for one skinned renderer. `boneGpuAddr` = the transposed bone-matrix SRV
-    // (the SAME buffer the skinned VS read). in* = the mesh's bind-pose streams (raw root SRVs). Writes the
-    // animated pos/normal/tangent into this renderer's transient out-buffers, left in NonPixelShaderResource so
-    // the subsequent draw can bind them as vertex buffers (a vertex buffer read is legal from a
-    // VertexAndConstantBuffer state; the caller transitions out-buffers to that before the draw — see
-    // SkinnedBuffersForDraw). Returns the out-buffers (or null if streams are missing). `skinIndex` = a per-frame
-    // counter so each renderer's SkinParams CB slot is distinct.
     public unsafe SkinnedBuffers DispatchSkin(ID3D12GraphicsCommandList4 cl, IStaticMeshRenderer r, int skinIndex,
         ulong boneGpuAddr, ulong inPos, ulong inNormal, ulong inTangent, ulong inBoneIdx, ulong inBoneWt,
         int vertexCount) {
         if (vertexCount <= 0 || skinIndex >= MaxSkinnedPerFrame) return null;
         EnsureSkinCb();
         var sb = EnsureSkinnedBuffers(r, vertexCount);
-        // SkinParams CB (VertexCount).
         long cbOff = (long)dev.FrameSlot * skinCbFrameStride + (long)skinIndex * skinCbStride;
         *(uint*)(skinCbMapped + cbOff) = (uint)vertexCount;
-        // The out-buffers are in UnorderedAccess (fresh) or NonPixelShaderResource (from last frame's draw) —
-        // ensure UAV for the dispatch write. Use the TRACKED state so the barrier's before-state always matches
-        // (a fixed before-state mismatches on the first frame → GBV ResourceBarrierBeforeAfterMismatch).
         if (sb.State != ResourceStates.UnorderedAccess) {
             Barrier(cl, sb.Pos, sb.State, ResourceStates.UnorderedAccess);
             Barrier(cl, sb.Normal, sb.State, ResourceStates.UnorderedAccess);
@@ -533,8 +404,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cl.SetComputeRootUnorderedAccessView(8, sb.Normal.GPUVirtualAddress);
         cl.SetComputeRootUnorderedAccessView(9, sb.Tangent.GPUVirtualAddress);
         cl.Dispatch((uint)((vertexCount + 63) / 64), 1, 1);
-        // UAV write done → transition out-buffers to a state legal as a vertex-buffer input for the draw.
-        // VertexAndConstantBuffer is the correct read state for IASetVertexBuffers.
         Barrier(cl, sb.Pos, ResourceStates.UnorderedAccess, ResourceStates.VertexAndConstantBuffer);
         Barrier(cl, sb.Normal, ResourceStates.UnorderedAccess, ResourceStates.VertexAndConstantBuffer);
         Barrier(cl, sb.Tangent, ResourceStates.UnorderedAccess, ResourceStates.VertexAndConstantBuffer);
@@ -546,8 +415,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         if (from != to) cl.ResourceBarrierTransition(res, from, to);
     }
 
-    // Write one CPU draw's PerDraw entry into this frame's slot at `drawIndex` and return whether it fit
-    // (drawIndex < MaxCpuDraws). The caller then SetGraphicsRoot32BitConstant(0, drawIndex) + DrawIndexedInstanced.
     public unsafe bool CpuBindlessWrite(int drawIndex, Matrix4x4 mvp, Matrix4x4 model, int materialId) {
         if ((uint)drawIndex >= MaxCpuDraws) return false;
         long off = (long)dev.FrameSlot * cpuPerDrawsFrameStride + (long)drawIndex * perDrawStride;
@@ -560,11 +427,9 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         if (mat is not null) return materialIds.TryGetValue(mat, out id);
         id = 0; return false;
     }
-    // The material-table stamp — Dx12RtGeometry rebuilds its per-triangle buffer when this changes (a new
-    // material set means the ids it baked are stale).
+
     public int MaterialTableStamp => tableStamp;
 
-    // Resolve a material map to a bindless index (real texture or the neutral fallback — matches CPU BindSrv).
     int Bindless(Texture2D tex, TextureType type) {
         var dx = (tex as Dx12Texture2D) ?? (DefaultTextures.Neutral(type) as Dx12Texture2D);
         if (dx is null) return 0;
@@ -574,28 +439,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         return idx;
     }
 
-    // Build the Hi-Z pyramid from the previous frame's G-buffer depth (must already be NonPixelShaderResource).
-    // `enabled` = the camera-delta gate (false 1 frame after a big jump, and on the first frame). Own ExecuteSync.
     public void BuildHiZ(CpuDescriptorHandle depthSrvCpu, int w, int h, bool enabled) {
         hizOnThisFrame = enabled;
         if (!enabled) return;
-        // EF3 RESIZE HANG FIX: Ensure() returns true when it RECREATED the pyramid (resize → new dimensions →
-        // new resource + new mip count). The cull shader reads the pyramid through the BINDLESS heap slot
-        // hizBindlessIndex (ResourceDescriptorHeap[index]); that descriptor must be re-pointed at the NEW
-        // resource, or the cull samples the DISPOSED old pyramid → GPU device-removal/hang (DXGI_DEVICE_HUNG,
-        // PageFaultVA=0). Previously CreateAllMipsSrv ran ONLY on first build (hizBindlessIndex < 0), so after
-        // any resize the bindless descriptor was stale — the editor's resize crash. Re-register whenever the
-        // pyramid was (re)created OR the slot is unallocated.
-        bool recreated = hiz.Ensure(w, h);   // true on FIRST build (pyramid was null) AND on every resize
-        // The bindless slot must be (re-)written when it was freshly allocated, NOT only when the pyramid was
-        // recreated. EnsureMaterialTable calls BindlessHeap.Reset() on a material-table rebuild and sets
-        // hizBindlessIndex = -1 (the old slot is gone). On a SCENE SWAP the resolution is unchanged, so
-        // hiz.Ensure() returns false (no recreation) — but the slot below is freshly Allocate()d into a heap
-        // whose descriptor was never written. Re-pointing only on `recreated` left that new slot pointing at
-        // garbage → the cull sampled junk Hi-Z depth → whole new scene wrongly occlusion-culled (the "culling
-        // breaks after switching scenes" bug). Re-write whenever the slot was just allocated OR the pyramid was
-        // recreated. (Same class of bug as the EF3 resize hang: a cached bindless descriptor not re-pointed
-        // after its backing heap/resource changed.)
+        bool recreated = hiz.Ensure(w, h);
         bool slotReallocated = hizBindlessIndex < 0;
         if (slotReallocated)
             hizBindlessIndex = Dx12Backend.BindlessHeap.Allocate();
@@ -604,15 +451,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         dev.ExecuteSync(cl => hiz.Build(cl, depthSrvCpu));
     }
 
-    // Record the cull + ExecuteIndirect for all whole-mesh groups into the geometry command list (which has
-    // the G-buffer MRT + viewport already bound). `frustumPlanes` are the SAME 6 normalized planes the CPU
-    // cull uses (from viewProjUnjittered). viewProjUnjittered/view drive the Hi-Z occlusion test. Returns the
-    // ExecuteIndirect count for stats.
-    // R4 — cull-planes CB for the meshlet AS shader (b2), N-buffered. Lazily created.
     ID3D12Resource meshletCullCb; unsafe byte* meshletCullCbMapped; long meshletCullCbStride;
     unsafe void EnsureMeshletCullCb() {
         if (meshletCullCb != null) return;
-        meshletCullCbStride = 512;   // Planes[6](96)+CameraPos(16)+HizVP(64)+HizView(64)+HizParams(16)+HizFar(16)=272
+        meshletCullCbStride = 512;
         meshletCullCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)(meshletCullCbStride * dev.FramesInFlight)), ResourceStates.GenericRead);
         meshletCullCbMapped = meshletCullCb.Map<byte>(0);
@@ -622,11 +464,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     public long MeshletTris => meshletTris;
     long meshletTris;
 
-    // ===================== R5 — visibility-buffer VisDraw table =====================
-    // One VisDraw per vis-buffer submesh draw: Mvp/Model/MaterialId + BINDLESS heap indices for this draw's OWN
-    // vertex streams + per-submesh meshlet buffers, so VisResolve.hlsl can fetch the right geometry per pixel
-    // (the engine has per-mesh / per-submesh buffers, not one global geometry buffer). Layout matches VisResolve's
-    // VisDraw. N-buffered like cpuPerDraws.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct VisDraw {
         public Matrix4x4 Mvp; public Matrix4x4 Model;
@@ -635,9 +472,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         public uint MeshletIdx, MeshletVertIdx, MeshletPrimIdx;
     }
     ID3D12Resource visDraws; unsafe byte* visDrawsMapped; int visDrawStride; long visDrawsFrameStride;
-    // Bindless SRV slot cache: each unique geometry buffer (vertex stream OR meshlet buffer) gets ONE structured-SRV
-    // bindless slot, registered on first use. Keyed by the buffer resource. Cleared on Invalidate (the bindless heap
-    // is Reset on a material rebuild, so the slots are gone — re-register lazily).
+
     readonly Dictionary<ID3D12Resource, int> bufferBindless = new();
     unsafe void EnsureVisDraws() {
         if (visDraws != null) return;
@@ -648,21 +483,16 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         visDrawsMapped = visDraws.Map<byte>(0);
     }
     public ulong VisDrawsAddress { get { EnsureVisDraws(); return visDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * visDrawsFrameStride); } }
-    // R5 — 5 CONTIGUOUS bindless-heap slots for the vis resolve's G-buffer color UAV table (u0..u4). DX12 allows
-    // one shader-visible CBV_SRV_UAV heap, so the UAV table must live in the SAME bindless heap the resolve indexes
-    // for geometry/material/VisId. Reserved here (gpuDriven owns the heap's Reset lifecycle) so a material rebuild /
-    // Invalidate that Resets the heap forces a re-reserve. Returns the first slot; the heap is bump-allocated so the
-    // 5 Allocate() calls are contiguous (no Free in between).
+
     int visResolveUavBase = -1;
     public int ReserveVisResolveUavs() {
         if (visResolveUavBase >= 0) return visResolveUavBase;
         int first = Dx12Backend.BindlessHeap.Allocate();
-        for (int i = 1; i < Dx12GBuffer.RtCount; i++) Dx12Backend.BindlessHeap.Allocate();   // 4 more (contiguous)
+        for (int i = 1; i < Dx12GBuffer.RtCount; i++) Dx12Backend.BindlessHeap.Allocate();
         visResolveUavBase = first;
         return first;
     }
-    // Register (or reuse) a structured-buffer SRV in the shared bindless heap for `res` with `count` elements of
-    // `stride` bytes. Cached per resource. Returns the bindless index (ResourceDescriptorHeap[idx]).
+
     int RegisterBufferBindless(ID3D12Resource res, int count, int stride) {
         if (res is null) return 0;
         if (bufferBindless.TryGetValue(res, out int idx)) return idx;
@@ -682,16 +512,9 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct MeshletDrawConst { public uint DrawIndex, MeshletBase, MeshletCount, Pad; }
 
-    // R4 — draw `renderers` through the MESH-SHADER meshlet pipeline (one DispatchMesh per submesh; the AS shader
-    // frustum/sphere-culls meshlets). Reuses the bindless material table + cpuPerDraws (PerDraw{Mvp,Model,MatId}).
-    // Shading is byte-identical to GBufferBindless (MeshletGBuffer.PSMain is a verbatim copy). Returns draw count.
-    // R5 — exposes the pieces the visibility-buffer pass needs to reuse the GPU-driven substrate.
     public ulong CpuPerDrawsAddress => cpuPerDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * cpuPerDrawsFrameStride);
     public ulong MeshletCullCbAddress { get { EnsureMeshletCullCb(); return meshletCullCb.GPUVirtualAddress + (ulong)(dev.FrameSlot * meshletCullCbStride); } }
 
-    // R5 — raster the visibility id with `visPso`/`visRootSig` (VisBuffer.hlsl). Same meshlet draw loop as
-    // RenderIntoMeshlet but binds only PerDraws(t0)+meshlet SRVs(t2-t6)+cull CB(b2); the vis PS writes only the id.
-    // Fills the meshlet cull CB (frustum+cone+Hi-Z) exactly like RenderIntoMeshlet. Returns the draw count.
     public unsafe int RenderVis(ID3D12GraphicsCommandList6 cl, List<IStaticMeshRenderer> renderers,
         ID3D12RootSignature visRootSig, ID3D12PipelineState visPso,
         Matrix4x4 viewProj, Vector4[] frustumPlanes, Vector3 cameraPos, bool coneCull,
@@ -714,8 +537,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
         cl.SetGraphicsRootSignature(visRootSig);
         cl.SetPipelineState(visPso);
-        cl.SetGraphicsRootShaderResourceView(1, CpuPerDrawsAddress);   // t0 PerDraws (raster MSMain reads Mvp)
-        cl.SetGraphicsRootConstantBufferView(12, meshletCullCb.GPUVirtualAddress + (ulong)cullOff); // b2 cull
+        cl.SetGraphicsRootShaderResourceView(1, CpuPerDrawsAddress);
+        cl.SetGraphicsRootConstantBufferView(12, meshletCullCb.GPUVirtualAddress + (ulong)cullOff);
         long visSlot = (long)dev.FrameSlot * visDrawsFrameStride;
         int draws = 0;
         foreach (var r in renderers) {
@@ -724,15 +547,13 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             var nrm = mesh.NormalBuffer as Dx12Buffer<GLVector3>;
             var uv  = mesh.UvBuffer as Dx12Buffer<Vector2>;
             var tan = mesh.TangentBuffer as Dx12Buffer<Vector4>;
-            // The vis resolve needs ALL four streams bindlessly; skip a renderer missing any (it can't be resolved).
             if (pos?.Resource is null || nrm?.Resource is null || uv?.Resource is null || tan?.Resource is null) continue;
             Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
             Matrix4x4 mvp = model * viewProj;
             int only = r.SubMeshIndex;
             int sFirst = only >= 0 ? only : 0;
             int sLast = only >= 0 ? only : mesh.SubMeshes.Length - 1;
-            cl.SetGraphicsRootShaderResourceView(7, pos.GpuAddress);   // t6 Positions (raster MSMain)
-            // Per-mesh vertex stream bindless indices (cached; same for every submesh of this mesh).
+            cl.SetGraphicsRootShaderResourceView(7, pos.GpuAddress);
             int vcount = mesh.Vertices.Length;
             int posIdx = RegisterBufferBindless(pos.Resource, vcount, 12);
             int nrmIdx = RegisterBufferBindless(nrm.Resource, vcount, 12);
@@ -752,10 +573,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                     Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model), MaterialId = (uint)mid,
                 };
                 var ml = Dx12Meshlet.Build(dev, mesh, s);
-                // VisDraw record for the resolve: Mvp/Model (NON-transposed; HLSL mul(v, M) with row-major C# data
-                // matches the raster's Mvp use — the raster MSMain reads the TRANSPOSED PerDraw.Mvp, but the resolve
-                // reads VisDraw.Mvp; both must agree. The raster does mul(pos, PerDraw.Mvp) on the transposed matrix;
-                // to get the SAME clip pos the resolve must use the same transposed matrix). So store TRANSPOSED.
                 *(VisDraw*)(visDrawsMapped + visSlot + (long)cpuDrawIndex * visDrawStride) = new VisDraw {
                     Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model), MaterialId = (uint)mid,
                     PosIdx = (uint)posIdx, NrmIdx = (uint)nrmIdx, UvIdx = (uint)uvIdx, TanIdx = (uint)tanIdx,
@@ -783,29 +600,25 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         if (meshletPso == null || renderers.Count == 0) return 0;
         meshletTris = 0;
         EnsureMeshletCullCb();
-        // Cull CB (b2): 6 unjittered frustum planes + camera pos (xyz)/cone flag (w) + Hi-Z occlusion fields.
         long cullOff = (long)dev.FrameSlot * meshletCullCbStride;
         byte* cb = meshletCullCbMapped + cullOff;
         var planesDst = (Vector4*)cb;
         for (int i = 0; i < 6; i++) planesDst[i] = frustumPlanes[i];
         planesDst[6] = new Vector4(cameraPos, coneCull ? 1f : 0f);
-        // Hi-Z: reuse the GPU-driven pyramid (same one ExecuteIndirect occludes against). Enabled only when the
-        // pyramid is primed this frame + the bindless slot is valid. Conservative (never false-culls) → byte-id.
-        long o = 7 * 16;   // after Planes[6] + CameraPosCull
+        long o = 7 * 16;
         *(Matrix4x4*)(cb + o) = Matrix4x4.Transpose(viewProjUnjittered); o += 64;
         *(Matrix4x4*)(cb + o) = Matrix4x4.Transpose(view); o += 64;
         bool hizOn = hizOnThisFrame && hizBindlessIndex >= 0;
         *(Vector4*)(cb + o) = new Vector4(hiz.Width, hiz.Height, hiz.MipCount, near); o += 16;
         *(Vector4*)(cb + o) = new Vector4(far, hizOn ? 1f : 0f, Math.Max(hizBindlessIndex, 0), 0f);
 
-        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);   // ResourceDescriptorHeap[] for bindless materials
+        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
         cl.SetGraphicsRootSignature(meshletRootSig);
         cl.SetPipelineState(meshletPso);
-        // Root params: 0=root const b0, 1..10=SRV t0..t9, 11=CBV b1 motion, 12=CBV b2 cull.
-        cl.SetGraphicsRootShaderResourceView(1, cpuPerDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * cpuPerDrawsFrameStride)); // t0 PerDraws
-        cl.SetGraphicsRootShaderResourceView(2, MaterialsGpuAddress);   // t1 GpuMaterials
-        cl.SetGraphicsRootConstantBufferView(11, motionCbAddress);      // b1 motion
-        cl.SetGraphicsRootConstantBufferView(12, meshletCullCb.GPUVirtualAddress + (ulong)cullOff); // b2 cull planes
+        cl.SetGraphicsRootShaderResourceView(1, cpuPerDraws.GPUVirtualAddress + (ulong)(dev.FrameSlot * cpuPerDrawsFrameStride));
+        cl.SetGraphicsRootShaderResourceView(2, MaterialsGpuAddress);
+        cl.SetGraphicsRootConstantBufferView(11, motionCbAddress);
+        cl.SetGraphicsRootConstantBufferView(12, meshletCullCb.GPUVirtualAddress + (ulong)cullOff);
 
         int draws = 0;
         foreach (var r in renderers) {
@@ -820,7 +633,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             int only = r.SubMeshIndex;
             int sFirst = only >= 0 ? only : 0;
             int sLast = only >= 0 ? only : mesh.SubMeshes.Length - 1;
-            // Vertex streams bound as root SRVs (t6..t9) once per renderer (same mesh for all its submeshes).
             cl.SetGraphicsRootShaderResourceView(7, pos.GpuAddress);
             cl.SetGraphicsRootShaderResourceView(8, nrm.GpuAddress);
             cl.SetGraphicsRootShaderResourceView(9, uv.GpuAddress);
@@ -834,24 +646,20 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                 int mid = materialIds.TryGetValue(mat, out int rid) ? rid : ResolveOrRegisterMaterialId(mat);
                 if (mid < 0) continue;
                 if ((uint)cpuDrawIndex >= MaxCpuDraws) break;
-                // PerDraw entry (shared cpuPerDraws buffer).
                 long pdOff = (long)dev.FrameSlot * cpuPerDrawsFrameStride + (long)cpuDrawIndex * perDrawStride;
                 *(PerDraw*)(cpuPerDrawsMapped + pdOff) = new PerDraw {
                     Mvp = Matrix4x4.Transpose(mvp), Model = Matrix4x4.Transpose(model), MaterialId = (uint)mid,
                 };
                 var ml = Dx12Meshlet.Build(dev, mesh, s);
-                // Per-submesh meshlet SRVs (t2..t5).
                 cl.SetGraphicsRootShaderResourceView(3, ml.Meshlets.GPUVirtualAddress);
                 cl.SetGraphicsRootShaderResourceView(4, ml.Bounds.GPUVirtualAddress);
                 cl.SetGraphicsRootShaderResourceView(5, ml.Verts.GPUVirtualAddress);
                 cl.SetGraphicsRootShaderResourceView(6, ml.Prims.GPUVirtualAddress);
-                // DrawIndexCB b0: { DrawIndex, MeshletBase=0, MeshletCount, pad } — meshlets are per-submesh so base 0.
                 var rc = new MeshletDrawConst { DrawIndex = (uint)cpuDrawIndex, MeshletBase = 0, MeshletCount = (uint)ml.MeshletCount, Pad = 0 };
                 cl.SetGraphicsRoot32BitConstants(0, rc, 0);
-                // One AS threadgroup per 32 meshlets.
                 cl.DispatchMesh((uint)((ml.MeshletCount + 31) / 32), 1, 1);
                 cpuDrawIndex++; draws++;
-                meshletTris += sub.IndexCount / 3;   // pre-cull upper bound (for stats parity with ExecuteIndirect)
+                meshletTris += sub.IndexCount / 3;
             }
         }
         return draws;
@@ -861,17 +669,9 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                                  Matrix4x4 viewProj, Vector4[] frustumPlanes,
                                  Matrix4x4 viewProjUnjittered, Matrix4x4 view, float near, float far,
                                  ulong motionCbAddress) {
-        // Group by mesh; build the flat SubmeshMeta array (per frame: Mvp depends on the camera).
         var groups = new List<(Dx12Buffer<GLVector3> vb, Dx12Buffer<GLVector3> nb,
             Dx12Buffer<Vector2> ub, Dx12Buffer<Vector4> tb,
             Dx12IndexBuffer ib, int baseIdx, int count)>();
-        // DETERMINISTIC group order: a plain Dictionary's enumeration order is NOT stable (hash + insertion
-        // history), so iterating it assigned SubmeshMeta slots — and thus the ExecuteIndirect DRAW ORDER — in a
-        // run-to-run-varying order. For meshes that don't overlap (Bistro) draw order doesn't change pixels, so
-        // it went unnoticed; but for OVERLAPPING coplanar geometry (split-import siblings at the same transform)
-        // the last-writer at z-equal seams flipped, making the output non-deterministic AND diverge from the CPU
-        // loop. Fix: order groups by each mesh's FIRST appearance in `wholeMesh` (the renderer iteration order the
-        // CPU per-submesh loop also uses), via a parallel key list — so the draw order matches the CPU path.
         var meshOrder = new List<Mesh>();
         var byMesh = new Dictionary<Mesh, List<IStaticMeshRenderer>>();
         foreach (var r in wholeMesh) {
@@ -880,7 +680,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             list.Add(r);
         }
 
-        // P0b: write into THIS frame's slab of the N-buffered uploads (offset 0 at FramesInFlight==1).
         long metaSlot = (long)dev.FrameSlot * metaFrameStride;
         long cullParamSlot = (long)dev.FrameSlot * cullParamFrameStride;
 
@@ -901,9 +700,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             foreach (var r in kvValue) {
                 Matrix4x4 model = ToNum(r.Transform.WorldMatrix);
                 Matrix4x4 mvp = model * viewProj;
-                // R3a: a split-import renderer (SubMeshIndex >= 0) draws ONLY its one submesh; a whole-mesh
-                // renderer (< 0) draws all submeshes. Clamp the loop range per renderer so split-import children
-                // can share the GPU-driven path without each one pulling in the whole mesh's submeshes.
                 int only = r.SubMeshIndex;
                 int sFirst = only >= 0 ? only : 0;
                 int sLast = only >= 0 ? only : mesh.SubMeshes.Length - 1;
@@ -912,7 +708,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                     SubMeshData sub = mesh.SubMeshes[s];
                     if (sub.IndexCount <= 0) continue;
                     Material mat = r.MaterialFor(s);
-                    if (mat is null || mat.Transparent) continue;   // transparents -> forward pass
+                    if (mat is null || mat.Transparent) continue;
                     if (!materialIds.TryGetValue(mat, out int matId)) continue;
                     mesh.GetSubMeshBounds(s, out GLVector3 lmin, out GLVector3 lmax);
                     WorldAabb(lmin, lmax, model, out Vector3 wlo, out Vector3 whi);
@@ -923,10 +719,8 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
                         MaterialId = (uint)matId, Flags = 0,
                         LodCount = 1, LodBias = r.LodBias,
                     };
-                    // Pack up to 4 extra LOD ranges (LOD1..4) so the GPU cull can pick by screen span. LodCount<=1
-                    // ⇒ the shader takes the LOD0 (FirstIndex/IndexCount) branch → byte-identical when no chain.
                     if (sub.Lods is { Length: > 1 } lods) {
-                        int n = Math.Min(lods.Length, 5);   // LOD0 + up to 4 extra
+                        int n = Math.Min(lods.Length, 5);
                         meta.LodCount = (uint)n;
                         if (n > 1) { meta.LodR0a = (uint)lods[1].FirstIndex; meta.LodR0b = (uint)lods[1].IndexCount; }
                         if (n > 2) { meta.LodR1a = (uint)lods[2].FirstIndex; meta.LodR1b = (uint)lods[2].IndexCount; }
@@ -940,7 +734,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             }
             int groupTotal = total - groupBase;
             if (groupTotal == 0) continue;
-            // Fill this group's GeoCullParams slot (planes + Hi-Z fields).
             var cp = new GeoCullParams {
                 P0 = frustumPlanes[0], P1 = frustumPlanes[1], P2 = frustumPlanes[2],
                 P3 = frustumPlanes[3], P4 = frustumPlanes[4], P5 = frustumPlanes[5],
@@ -958,13 +751,9 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         }
         if (groups.Count == 0) return 0;
 
-        // 1) Transition outputs back to UAV (from last frame's draw states).
         cl.ResourceBarrierTransition(commands, ResourceStates.IndirectArgument, ResourceStates.UnorderedAccess);
         cl.ResourceBarrierTransition(perDraws, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
 
-        // 2) Cull dispatch per group (writes Commands + PerDraws; one slot per submesh, in order). Bind the
-        // bindless heap FIRST (the cull samples the Hi-Z pyramid via ResourceDescriptorHeap; gotcha: before
-        // the root sig). The same heap stays bound for the bindless GBuffer draw below.
         cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
         cl.SetComputeRootSignature(geoCullRootSig);
         cl.SetPipelineState(cullPso);
@@ -976,17 +765,15 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             cl.Dispatch((uint)((groups[g].count + 63) / 64), 1, 1);
         }
 
-        // 3) Barrier outputs for the draw (transition flushes the cull's UAV writes).
         cl.ResourceBarrierTransition(commands, ResourceStates.UnorderedAccess, ResourceStates.IndirectArgument);
         cl.ResourceBarrierTransition(perDraws, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
 
-        // 4) Bindless GPU-driven draw — one ExecuteIndirect per mesh group.
-        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);   // GOTCHA: before the root sig
+        cl.SetDescriptorHeaps(Dx12Backend.BindlessHeap.Heap);
         cl.SetGraphicsRootSignature(drawRootSig);
         cl.SetPipelineState(drawPso);
         cl.SetGraphicsRootShaderResourceView(1, perDraws.GPUVirtualAddress);
         cl.SetGraphicsRootShaderResourceView(2, materials.GPUVirtualAddress + (ulong)(dev.FrameSlot * materialsFrameStride));
-        cl.SetGraphicsRootConstantBufferView(3, motionCbAddress);   // b1 motion (per pass)
+        cl.SetGraphicsRootConstantBufferView(3, motionCbAddress);
         cl.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
         for (int g = 0; g < groups.Count; g++) {
             var gp = groups[g];
@@ -997,23 +784,19 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             vbViews[3] = new VertexBufferView(gp.tb.GpuAddress, (uint)gp.tb.ByteSize, (uint)gp.tb.Stride);
             cl.IASetVertexBuffers(0, vbViews);
             cl.IASetIndexBuffer(new IndexBufferView(gp.ib.GpuAddress, (uint)gp.ib.ByteSize, Vortice.DXGI.Format.R32_UInt));
-            // No count buffer: issue exactly the group's submesh commands in order; culled ones have
-            // InstanceCount 0 (GPU skips them). Order-preserving -> byte-identical to the CPU path.
             cl.ExecuteIndirect(cmdSig, (uint)gp.count, commands, (ulong)((long)gp.baseIdx * DrawCmdStride), null, 0);
         }
         LastTris = triAccum;
         LastSubmeshes = total;
-        return groups.Count;   // ExecuteIndirect calls submitted (the CPU-submit win: ~1600 draws -> a few)
+        return groups.Count;
     }
 
     unsafe void BuildShadowPipelines() {
         string cullHlsl = EmbeddedShaderSource.ReadHlsl("GpuCullShadow.hlsl");
         shadowCullPso = dev.CreateComputePso(new ComputePipelineStateDescription {
-            RootSignature = cullRootSig,   // same layout: CBV b0 + SRV t0 + UAV u0/u1
-            ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, cullHlsl, "CSMain", "GpuCullShadow.hlsl"),
+            RootSignature = cullRootSig, ComputeShader = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, cullHlsl, "CSMain", "GpuCullShadow.hlsl"),
         }, "GpuDriven.ShadowCull");
 
-        // Draw root sig: root const b0 (DrawIndex) + SRV t0 (ShadowPerDraws). Depth-only, no samplers.
         var drawParams = new[] {
             new RootParameter1(new RootConstants(0, 0, 1), ShaderVisibility.Vertex),
             new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.Vertex),
@@ -1025,7 +808,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, drawHlsl, "VSMain", "ShadowDepthIndirect.hlsl");
         var layout = new InputLayoutDescription(
             new InputElementDescription("POSITION", 0, Vortice.DXGI.Format.R32G32B32_Float, 0, 0));
-        var raster = RasterizerDescription.CullClockwise;     // matches the CPU shadow PSO bias exactly
+        var raster = RasterizerDescription.CullClockwise;
         raster.DepthBias = 2000; raster.SlopeScaledDepthBias = 2.5f; raster.DepthBiasClamp = 0f;
         shadowDrawPso = dev.CreateGraphicsPso(new GraphicsPipelineStateDescription {
             RootSignature = shadowDrawRootSig, VertexShader = vs, PixelShader = default, InputLayout = layout,
@@ -1057,17 +840,10 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         shadowCullParamMapped = shadowCullParamUpload.Map<byte>(0);
     }
 
-    // Build the per-cascade SubmeshMeta + dispatch the shadow culls (records into `cl`). Must run BEFORE the
-    // per-cascade depth draws. Mirrors the CPU shadow caster set EXACTLY (every submesh with IndexCount > 0,
-    // no material filter — depth-only) so the shadow maps are byte-identical. Stores the slices for
-    // DrawShadowCascade. cascadeMatrices = the 4 light-space view*proj matrices.
-    // activeCascades = how many cascades the volume selected (1..ShadowCascades); culls/draws only those.
     public unsafe void BuildShadowCull(ID3D12GraphicsCommandList4 cl, List<IStaticMeshRenderer> wholeMesh,
                                        Matrix4x4[] cascadeMatrices, int activeCascades = ShadowCascades) {
         shadowSlices.Clear();
         int cascades = Math.Clamp(activeCascades, 1, ShadowCascades);
-        // Deterministic group order (see RenderInto): Dictionary enumeration order is unstable. Shadow depth is
-        // Less-tested so order rarely flips pixels, but keep it stable for parity with the geometry pass.
         var meshOrder = new List<Mesh>();
         var byMesh = new Dictionary<Mesh, List<IStaticMeshRenderer>>();
         foreach (var r in wholeMesh) {
@@ -1076,7 +852,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             list.Add(r);
         }
 
-        // P0b: write into THIS frame's slab (offset 0 at FramesInFlight==1).
         long shadowMetaSlot = (long)dev.FrameSlot * shadowMetaFrameStride;
         long shadowCullParamSlot = (long)dev.FrameSlot * shadowCullParamFrameStride;
 
@@ -1133,7 +908,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         cl.ResourceBarrierTransition(shadowPerDraws, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
     }
 
-    // ExecuteIndirect this cascade's shadow slices into the currently-bound cascade DSV (inside RenderCascade).
     public void DrawShadowCascade(ID3D12GraphicsCommandList4 cl, int cascade) {
         bool any = false;
         for (int i = 0; i < shadowSlices.Count; i++) if (shadowSlices[i].cascade == cascade) { any = true; break; }
@@ -1151,7 +925,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         }
     }
 
-    // Gribb-Hartmann frustum planes from a row-major view*proj — identical to DX12HDRenderer.ExtractFrustumPlanes.
     static void ExtractPlanes(Matrix4x4 m, Vector4[] p) {
         Vector4 r1 = new(m.M11, m.M21, m.M31, m.M41);
         Vector4 r2 = new(m.M12, m.M22, m.M32, m.M42);
@@ -1165,9 +938,6 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         }
     }
 
-    // Debug door (BALLISTIC_DX12_HIZ_DEBUG=1): read back the geometry command buffer after the cull and
-    // count how many submeshes survived (InstanceCount == 1). Proves the GPU cull (frustum + Hi-Z) is
-    // actually dropping draws, not silently passing everything. Blocks — debug only.
     public unsafe (int visible, int total) DebugVisibleCount() {
         int total = LastSubmeshes;
         if (total <= 0) return (0, 0);
@@ -1177,7 +947,7 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
             cl.CopyBufferRegion(rb, 0, commands, 0, (ulong)((long)total * DrawCmdStride));
             cl.ResourceBarrierTransition(commands, ResourceStates.CopySource, ResourceStates.IndirectArgument);
         });
-        Span<uint> cmds = rb.Map<uint>(0, total * 6);   // 6 uints per command; [2] = InstanceCount
+        Span<uint> cmds = rb.Map<uint>(0, total * 6);
         int visible = 0;
         for (int i = 0; i < total; i++) if (cmds[i * 6 + 2] == 1u) visible++;
         rb.Unmap(0);
@@ -1207,10 +977,9 @@ public sealed class Dx12GpuDrivenRenderer : IDisposable {
         hiz?.Dispose();
         shadowCullPso?.Dispose(); shadowDrawRootSig?.Dispose(); shadowDrawPso?.Dispose(); shadowCmdSig?.Dispose();
         shadowCommands?.Dispose(); shadowPerDraws?.Dispose(); shadowMetaUpload?.Dispose(); shadowCullParamUpload?.Dispose();
-        // R3b compute skinning.
         skinRootSig?.Dispose(); skinPso?.Dispose(); skinCb?.Dispose();
         foreach (var sb in skinnedBuffers.Values) { sb.Pos?.Dispose(); sb.Normal?.Dispose(); sb.Tangent?.Dispose(); }
-        // R4 meshlet pipeline.
+
         meshletRootSig?.Dispose(); meshletPso?.Dispose(); meshletCullCb?.Dispose(); Dx12Meshlet.Clear();
     }
 }

@@ -1,18 +1,12 @@
-using BallisticEngine.Core.GL;            // GLTime, GLInput (OpenTK input/timer — not GL-API-coupled)
-using BallisticEngine.DX12;               // Dx12Backend, Dx12SwapChain
-using BallisticEngine.GLImplementation;   // GLLogger
+using BallisticEngine.Core.GL;
+using BallisticEngine.DX12;
+using BallisticEngine.GLImplementation;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
 
-// The windowed DX12 PLAYER host: an OpenTK GameWindow with ContextAPI.NoAPI (no GL context) whose HWND
-// drives a DX12 swapchain. Mirrors GLBallisticEngineWindow but presents through Dx12SwapChain instead of
-// Context.SwapBuffers — the engine renders the scene into the renderer's LDR target (PresentToScreen path),
-// and each frame the host blits that into the backbuffer and flips. No ImGui (that's the editor). This is
-// the piece that lets the standalone player run on DX12 windowed, so GL can be deleted. Selected by
-// Program.cs when BALLISTIC_BACKEND=dx12 (and not the deterministic headless screenshot path).
 public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, IWindow {
     public event Action<double> WindowUpdateCallback;
     public event Action<double> WindowRenderCallback;
@@ -35,13 +29,10 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
 
     Dx12SwapChain swapChain;
 
-    // Present sync. DEFAULT OFF (uncapped) — vsync caps the player to the refresh rate (60 Hz), which hides the
-    // CPU↔GPU frame overlap (P0b/P0c) and the Lumen tier savings behind the flip wait. BALLISTIC_DX12_VSYNC=1
-    // turns it back on (no tearing, refresh-locked). Read once: it's a launch-time choice, not a per-frame toggle.
     static readonly bool VSync = Environment.GetEnvironmentVariable("BALLISTIC_DX12_VSYNC") == "1";
 
     public void SetFrequency(int frequency) => UpdateFrequency = frequency;
-    public void SwapFrameBuffers() { }   // present is driven by OnRenderFrame
+    public void SwapFrameBuffers() { }
 
     public CursorMode CursorMode {
         get => CursorState switch {
@@ -59,7 +50,7 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
     public Dx12WindowedRuntime(int width, int height, bool fullscreen = false,
         bool borderless = false, string title = "Ballistic") : base(GameWindowSettings.Default,
         new NativeWindowSettings {
-            API = ContextAPI.NoAPI,   // DX12 owns the surface via the HWND; NativeWindow.Context is null
+            API = ContextAPI.NoAPI,
             WindowBorder = fullscreen || borderless ? WindowBorder.Hidden : WindowBorder.Resizable,
             StartFocused = true,
             StartVisible = true,
@@ -78,13 +69,12 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
             WindowState = WindowState.Fullscreen;
         }
         else {
-            ClientSize = new OpenTK.Mathematics.Vector2i(width, height);   // window API uses OpenTK's Vector2i
+            ClientSize = new OpenTK.Mathematics.Vector2i(width, height);
         }
     }
 
     protected override void OnTextInput(TextInputEventArgs e) {
         base.OnTextInput(e);
-        // Feed typed characters to the UI text-input buffer (UI TextField drains it). Unicode -> char(s).
         foreach (var ch in char.ConvertFromUtf32(e.Unicode))
             Input.PushTypedChar(ch);
     }
@@ -95,11 +85,6 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
         Focus();
         width = ClientSize.X; height = ClientSize.Y;
         swapChain = new Dx12SwapChain(Dx12Backend.Device, GetHwnd(), width, height);
-        // The player present is a CopyResource(backbuffer, ldr) — it REQUIRES the renderer's LDR target to be
-        // the exact backbuffer size. The renderer initializes at a hardcoded 1920x1080 default; sync it to the
-        // real client size now (before the first OnRenderFrame) so the first present never copies mismatched
-        // sizes, even if OnResize hasn't fired yet. (The renderer exists: DirectXRenderAsset.Initialize ran
-        // during bootstrap, before Run/OnLoad.)
         (RenderAsset.Current.Renderer as DX12HDRenderer)?.ResizeSceneTarget(width, height);
     }
 
@@ -111,8 +96,6 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
         height = e.Height;
         if (swapChain != null) {
             swapChain.Resize(e.Width, e.Height);
-            // Keep the renderer's LDR target the same size as the backbuffer so the present blit (CopyResource)
-            // matches; the renderer renders the scene at the window resolution.
             (RenderAsset.Current.Renderer as DX12HDRenderer)?.ResizeSceneTarget(e.Width, e.Height);
         }
         OnResizeCallback?.Invoke(e.Width, e.Height);
@@ -120,12 +103,11 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
 
     protected override void OnRenderFrame(FrameEventArgs args) {
         if (swapChain == null) { base.OnRenderFrame(args); return; }
-        // Decoupled render thread: rendering + present happen on the render thread (driven from OnUpdateFrame via
-        // EngineLoop), NOT here. OnRenderFrame just pumps the OpenTK frame so the window stays responsive.
+
         if (BallisticEngine.RenderThread.Enabled) { base.OnRenderFrame(args); Profiler.FrameMark(); return; }
 
         using (Profiler.Zone("RenderFrame"))
-            WindowRenderCallback?.Invoke(args.Time);   // engine renders the scene into the renderer's LDR target
+            WindowRenderCallback?.Invoke(args.Time);
         var r = RenderAsset.Current.Renderer as DX12HDRenderer;
         if (r?.DisplayResource != null)
             swapChain.PresentTexture(r.DisplayResource, vsync: VSync);
@@ -133,10 +115,6 @@ public sealed class Dx12WindowedRuntime : GameWindow, IBallisticEngineRuntime, I
         Profiler.FrameMark();
     }
 
-    // Decoupled render thread: present the just-drawn LDR target. Called ON the render thread from EngineLoop
-    // after RenderCamera() has finished recording + submitting the frame. DXGI Present is thread-safe to call
-    // here; the swapchain is owned by this host. (The render thread also owns the DX12 frame submission, so the
-    // present's preceding EndFrame ran on the same thread — correct ordering.)
     public void PresentFromRenderThread() {
         if (swapChain == null) return;
         var r = RenderAsset.Current.Renderer as DX12HDRenderer;

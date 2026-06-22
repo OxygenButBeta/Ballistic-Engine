@@ -1,18 +1,11 @@
 
 namespace BallisticEngine;
 
-// CPU-side skeleton for a skinned mesh — the bone hierarchy plus the matrices that bind it to the
-// mesh's vertices. Pure data (Abstraction layer: BCL + OpenTK.Mathematics only), so the importer
-// produces it and the engine consumes it without either touching the GL backend or Assimp.
-//
-// Bones are stored in PRE-ORDER: ParentIndices[i] always refers to an earlier entry (-1 for a root),
-// so a single forward pass computes world matrices (worldBone[i] = local[i] * worldBone[parent]).
-// This is the same convention MeshNodeData uses for the node hierarchy.
 public readonly struct SkeletonData {
-    public readonly string[] BoneNames;            // bone i's name (matches a source node name)
-    public readonly int[] ParentIndices;           // parent bone index, -1 for a root (parent < i)
-    public readonly Matrix4[] InverseBindPose;      // mesh-space -> bone-space at bind (Assimp offset matrix)
-    public readonly Matrix4[] BindPoseLocal;        // bone's default local transform (used when un-animated)
+    public readonly string[] BoneNames;
+    public readonly int[] ParentIndices;
+    public readonly Matrix4[] InverseBindPose;
+    public readonly Matrix4[] BindPoseLocal;
 
     public SkeletonData(string[] boneNames, int[] parentIndices,
         Matrix4[] inverseBindPose, Matrix4[] bindPoseLocal) {
@@ -28,7 +21,6 @@ public readonly struct SkeletonData {
         && InverseBindPose.Length == BoneCount
         && BindPoseLocal.Length == BoneCount;
 
-    // Finds a bone by name (animation channels are keyed by node name). -1 when absent.
     public int IndexOf(string boneName) {
         if (BoneNames is null)
             return -1;

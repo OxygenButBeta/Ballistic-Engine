@@ -4,14 +4,6 @@ using System.Text.Json;
 
 namespace BallisticEngine.Mcp;
 
-// MCP stdio server -> editor named pipe bridge. Each MCP tool maps onto one command-port method;
-// the editor does the real work on its main thread (undoable, viewport-repainting — see
-// BallisticEngine.Editor/Remote/). Tools are TASK-LEVEL and few on purpose: tool definitions live
-// in the agent's context window, so a small multiplexed surface beats one-tool-per-verb.
-//
-// Stdio transport: one JSON-RPC 2.0 message per line. Handles initialize / notifications/* /
-// tools/list / tools/call / ping. The pipe connects lazily and reconnects per failure, so the
-// server can start before the editor does.
 internal static class Program {
     static readonly JsonSerializerOptions Indented = new() { WriteIndented = true };
 
@@ -29,7 +21,7 @@ internal static class Program {
                 string method = root.TryGetProperty("method", out JsonElement m) ? m.GetString() ?? "" : "";
                 bool hasId = root.TryGetProperty("id", out JsonElement idEl);
                 if (!hasId)
-                    continue; // notifications need no response
+                    continue;
 
                 object response = method switch {
                     "initialize" => Result(idEl, new {
@@ -56,15 +48,10 @@ internal static class Program {
     static object Error(JsonElement id, int code, string message) =>
         new { jsonrpc = "2.0", id, error = new { code, message } };
 
-    // ---- tools/call -> pipe ----------------------------------------------------
-
     static object ToolCall(JsonElement id, JsonElement p) {
         string tool = p.GetProperty("name").GetString() ?? "";
         JsonElement args = p.TryGetProperty("arguments", out JsonElement a) ? a : default;
 
-        // CLI-backed tools (scene_query / scene_gbuffer): run the `bal` CLI headlessly (no editor needed) —
-        // GpuSceneQuery + raw G-buffer. The editor's LIVE query surface is deferred (it touches the GPU
-        // surface that hung before), so these shell out to the proven device-free CLI subprocess path.
         if (tool is "scene_query" or "scene_gbuffer")
             return RunCliTool(id, tool, args);
 
@@ -75,12 +62,6 @@ internal static class Program {
         if (method.Length == 0)
             return Result(id, ToolText($"unknown tool '{tool}'", isError: true));
 
-        // D2: defence-in-depth -- the method MapTool produced must be one the tool's declared ToolBinding
-        // allows. This makes the ToolBindings table load-bearing (the boundary contract, not dead data): a
-        // mapping regression that produced a method outside the declared set is caught HERE with a clean
-        // error instead of sending a surprise method down the pipe. The reflection harness (McpBoundaryTests)
-        // proves those declared methods are all real RemoteSchema methods, so this guard + that test together
-        // mean the MCP boundary can only ever send a real, schema-known method.
         ToolBinding binding = Array.Find(ToolBindings, b => b.Tool == tool);
         if (binding.Tool is not null && Array.IndexOf(binding.Methods, method) < 0)
             return Result(id, ToolText(
@@ -102,8 +83,6 @@ internal static class Program {
     static object ToolText(string text, bool isError) =>
         new { content = new[] { new { type = "text", text } }, isError };
 
-    // ---- CLI-backed tools (scene_query / scene_gbuffer) -> `bal` subprocess ---------
-
     static object RunCliTool(JsonElement id, string tool, JsonElement a) {
         try {
             string scene = Str(a, "scene");
@@ -116,7 +95,7 @@ internal static class Program {
                 string? pairs = OptStr(a, "pairs");
                 if (points is not null) { args.Add("--points"); args.Add(points); }
                 if (pairs is not null) { args.Add("--pairs"); args.Add(pairs); }
-            } else { // scene_gbuffer
+            } else {
                 args.Add("gbuffer");
                 args.Add(scene);
                 string? outDir = OptStr(a, "out");
@@ -144,7 +123,6 @@ internal static class Program {
         return (proc.ExitCode, stdout, stderr);
     }
 
-    // bal.exe sits next to this MCP server's build output, or in the engine repo build tree.
     static string FindBalExe() {
         string local = Path.Combine(AppContext.BaseDirectory, "bal.exe");
         if (File.Exists(local)) return local;
@@ -164,36 +142,6 @@ internal static class Program {
         throw new Exception("bal.exe not found (build BallisticEngine.Cli or set BALLISTIC_ENGINE_ROOT)");
     }
 
-    // D2 (editor-rework Phase D, "MCP boundary schema validation"): the DECLARATIVE binding of each
-    // pipe-backed MCP tool to its command-port method(s) + the args the boundary requires PRESENT before
-    // it ever reaches the editor. This is the MCP layer's slice of the SAME single-source-of-truth the
-    // editor enforces with RemoteSchema -- the MCP tool surface used to be a THIRD hand-kept list (the
-    // tool switch in MapTool + the inputSchema.required arrays in ToolDefinitions) that could silently
-    // drift from the engine's RemoteSchema (e.g. the engine adds a required param to component.set; the MCP
-    // boundary keeps packaging the old shape and a malformed call slips through). This table is the boundary
-    // contract made DATA: ToolCall asserts at runtime that MapTool only ever produces a method declared here
-    // (so a mapping regression can't send a surprise method down the pipe), and -- because the MCP process
-    // stays ZERO-DEPENDENCY (it does NOT reference the engine, see the .csproj note) -- the parity with the
-    // engine schema is enforced HEADLESSLY by the reflection harness, which MIRRORS this table (the same
-    // mirror pattern MenuRegistryTests/ComponentPreviewTests use for unreferenceable editor types) and
-    // asserts every method here is a real RemoteSchema method and the RequiredArgs cover that method's
-    // required STRING params. ★ The harness mirror (BallisticEngine.Tests.Reflection/McpBoundaryTests.cs)
-    // MUST be kept in lockstep with this table -- a divergence makes the parity test RED. (CLI-backed tools
-    // scene_query/scene_gbuffer are NOT here: they shell out to `bal` and have no command-port method.)
-    //
-    // Methods can be a SET (play_control fans action->start/stop/pause/step; editor_undo->undo|redo). Two arg
-    // sets, both contributing to the GUARANTEE the MCP gives the editor (every schema-required string is in
-    // the pipe call):
-    //   - RequiredArgs: the agent MUST supply these -- Str() throws a clean message if absent, BEFORE the
-    //     pipe call, so a missing one is rejected here, not deep in a handler.
-    //   - DefaultedArgs: the MCP FILLS these if the agent omits them (e.g. editor_screenshot defaults `path`
-    //     to a temp file), so they are always present in the pipe call without burdening the agent.
-    // So the boundary guarantee = RequiredArgs UNION DefaultedArgs >= the method's required STRING params
-    // (asserted headlessly by the harness). Optional-only args (position/parent/fit/count/...) appear in
-    // NEITHER set -- the boundary tolerates them missing. The required Kind.Any "value" of component.set /
-    // scene.component.set is intentionally in NEITHER: the MCP reads it with TryGetProperty (an agent may
-    // pass a number/array), and the editor's RemoteSchema.Validate enforces its presence -- that division of
-    // labour is asserted by the harness too.
     internal readonly record struct ToolBinding(string Tool, string[] Methods, string[] RequiredArgs, string[] DefaultedArgs);
     internal static readonly ToolBinding[] ToolBindings = [
         new("editor_status",       ["editor.status"],        [],                  []),
@@ -209,8 +157,7 @@ internal static class Program {
         new("scene_save",          ["scene.save"],           [],                  []),
         new("scene_open",          ["scene.open"],           ["path"],            []),
         new("editor_undo",         ["undo", "redo"],         [],                  []),
-        new("editor_screenshot",   ["screenshot"],           [],                  ["path"]), // path defaults to a temp file
-        new("console_tail",        ["console.tail"],         [],                  []),
+        new("editor_screenshot",   ["screenshot"],           [],                  ["path"]), new("console_tail",        ["console.tail"],         [],                  []),
         new("scripts_rebuild",     ["scripts.rebuild"],      [],                  []),
         new("editor_frame",        ["editor.frame"],         [],                  []),
         new("editor_refresh",      ["editor.refresh"],       [],                  []),
@@ -218,11 +165,6 @@ internal static class Program {
         new("scene_component_set", ["scene.component.set"],  ["type", "member"],  []),
     ];
 
-    // Tool name + MCP arguments -> command-port method + params (mostly pass-through). The method NAMES this
-    // switch produces are exactly the ToolBindings[*].Methods above (the harness asserts that parity), and
-    // each Str() call below is exactly a ToolBindings[*].RequiredArgs entry -- the boundary rejects a missing
-    // required arg here (clean Str() error) before the pipe call, so a malformed request never reaches the
-    // editor (the engine-side RemoteSchema.Validate is the second, defence-in-depth check on the editor).
     static (string method, object? p) MapTool(string tool, JsonElement a) => tool switch {
         "editor_status" => ("editor.status", null),
         "scene_describe" => ("scene.describe", null),
@@ -282,15 +224,11 @@ internal static class Program {
             ? v.GetString()
             : null;
 
-    // ---- pipe client -------------------------------------------------------------
-
     static NamedPipeClientStream? pipe;
     static StreamReader? pipeReader;
     static StreamWriter? pipeWriter;
     static long pipeSeq;
 
-    // Optional args must VANISH from the pipe request, not arrive as null (the editor treats a
-    // present-but-null param as a value).
     static readonly JsonSerializerOptions SkipNulls = new() {
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
     };
@@ -307,7 +245,7 @@ internal static class Program {
                 return JsonDocument.Parse(reply).RootElement.Clone();
             }
             catch (Exception) when (attempt == 0) {
-                Disconnect(); // stale pipe from an earlier editor session — reconnect once
+                Disconnect();
             }
         }
         throw new IOException("pipe call failed");
@@ -329,8 +267,6 @@ internal static class Program {
         try { pipe?.Dispose(); } catch { }
         pipe = null;
     }
-
-    // ---- tool definitions ----------------------------------------------------------
 
     static object Schema(params (string Name, string Type, string Description, bool Required)[] props) => new {
         type = "object",

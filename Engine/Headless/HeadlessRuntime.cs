@@ -2,21 +2,11 @@ using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
 
-// A no-GPU IBallisticEngineRuntime for headless hosts (bal simulate, future test runners):
-// EngineBootstrap runs end-to-end — scripts compile, assets import, scenes load, physics and
-// scripts PLAY — with every render-asset call absorbed by null objects. Lives in the engine
-// library (not the CLI) because IEngineTimer.Update is internal to this assembly.
-//
-// What works headless: the full play loop (SceneManager.Update -> FixedTick/Tick, Bepu physics,
-// contact events, particles/trails CPU sim, audio graceful-degrade, BEvents). What doesn't:
-// anything that renders (HDCamera.RenderCamera, screenshots) — no host calls it here.
 public sealed class HeadlessRuntime : IBallisticEngineRuntime {
     public event Action<double> WindowUpdateCallback { add { } remove { } }
     public event Action<double> WindowRenderCallback { add { } remove { } }
     public event Action OnWindowShow { add { } remove { } }
 
-    // input: a ScriptedInput for deterministic playback (bal simulate --input), or null for
-    // no input at all.
     public HeadlessRuntime(IInputProvider input = null) =>
         InputProvider = input ?? new NullInput();
 
@@ -24,9 +14,8 @@ public sealed class HeadlessRuntime : IBallisticEngineRuntime {
     public IInputProvider InputProvider { get; }
     public IWindow Window { get; } = new NullWindow();
     public RenderAsset RenderAsset { get; } = new NullRenderAsset();
-    public ILogger Logger => null; // hosts subscribe Debugging.OnMessage instead
+    public ILogger Logger => null;
 
-    // Host-driven clock: EngineBootstrap.UpdateFrame(delta) advances it; nothing else does.
     sealed class ManualTimer : IEngineTimer {
         public double DeltaTime { get; private set; }
         public double TotalTime { get; private set; }
@@ -63,8 +52,6 @@ public sealed class HeadlessRuntime : IBallisticEngineRuntime {
         public CursorMode CursorMode { get; set; }
     }
 
-    // Render-asset null objects: Mesh/Texture constructors run (assets load with their CPU data,
-    // which colliders and gameplay need); every GPU call is a no-op.
     sealed class NullRenderAsset : RenderAsset {
         public NullRenderAsset() => Current = this;
 
@@ -87,8 +74,6 @@ public sealed class HeadlessRuntime : IBallisticEngineRuntime {
             new NullStandardShader(vertexCode, fragmentCode, identityExtra);
     }
 
-    // No-op shader for headless (scripts+physics, no GL). The headless runtime never renders, so this
-    // just satisfies the RenderAsset contract; every member is a no-op.
     sealed class NullStandardShader(string vertexCode, string fragmentCode, string identityExtra = null)
         : StandardShader(vertexCode, fragmentCode, identityExtra) {
         public override int UID => 0;

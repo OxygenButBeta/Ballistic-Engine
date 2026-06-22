@@ -1,21 +1,8 @@
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Numerics;
 using System.Text.Json;
 
 namespace BallisticEngine.DX12;
 
-// Headless scene-query mode for the `bal query` CLI. The CLI spawns the player (BALLISTIC_BACKEND=dx12)
-// with BALLISTIC_QUERY=<spec.json> (+ BALLISTIC_SCENE / BALLISTIC_SCREENSHOT_PAUSED=1); after the scene has
-// rendered a frame (the AS-feeding RuntimeSet<IStaticMeshRenderer> is populated), the headless runtime calls
-// Run() here, which runs the requested query against the live scene TLAS and writes the result JSON to
-// BALLISTIC_QUERY_OUT, then the process exits. This keeps the `bal` CLI device-free (same subprocess pattern
-// as `bal render`). Spec format (written by the CLI):
-//   { "op":"occupancy|visibility|classify|nudge|rooms",
-//     "points":[[x,y,z],...], "pairs":[[[ax,ay,az],[bx,by,bz]],...], "probeRadius":200 }
 public static class Dx12QueryMode {
-    // Returns true if query mode ran (the caller should then exit). False = no query requested.
     public static bool Run(DX12HDRenderer renderer) {
         string specPath = Environment.GetEnvironmentVariable("BALLISTIC_QUERY");
         if (string.IsNullOrWhiteSpace(specPath)) return false;

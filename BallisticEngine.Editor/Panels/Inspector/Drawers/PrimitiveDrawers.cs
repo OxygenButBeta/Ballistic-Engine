@@ -1,14 +1,7 @@
-using System;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.Editor.Inspector;
-
-// Each drawer replaces one arm of BOTH old switches at once: it sees an IProperty, so it is blind to
-// whether the value comes from a component field or a VolumeParameter. Range/IsColor/Hdr are unified on
-// IProperty, so a `[Range] float`, a plain float, a FloatParameter and a ClampedFloatParameter all land
-// here. Vector types are System.Numerics (post OpenTK->System.Numerics migration), the same type the
-// IInspectorGui widgets speak, so there is no conversion.
 
 public sealed class BoolDrawer : ITypeDrawer {
     public bool CanDraw(Type t) => t == typeof(bool);
@@ -58,8 +51,6 @@ public sealed class EnumDrawer : ITypeDrawer {
     public bool CanDraw(Type t) => t.IsEnum;
     public bool Draw(IProperty p, IInspectorGui gui) {
         string[] names = Enum.GetNames(p.ValueType);
-        // -1 when the value isn't a single declared name ([Flags] combo / out-of-range cast): fall back
-        // to the first entry so the combo shows a valid label instead of blank (matches old behaviour).
         int current = Math.Max(0, Array.IndexOf(names, p.Get().ToString()));
         if (!gui.Combo(ref current, names)) return false;
         p.Set(Enum.Parse(p.ValueType, names[current]));

@@ -1,6 +1,5 @@
 namespace BallisticEngine.DX12;
 
-// Reserved descriptor slots at the top of the shader-visible bindless heap.
 internal static class Dx12BindlessTail
 {
     public const int HeapCapacity = 16384;
@@ -10,9 +9,6 @@ internal static class Dx12BindlessTail
 
     public const int RtReflTableBase = HeapCapacity - RtReflReserved;
 
-    // DDGI relight table — its OWN reserved tail BELOW the RT-reflection tail so the two never collide.
-    // Slots used: t1 sky irradiance cube (the per-probe RT trace samples it on a ray miss). TLAS + bindless
-    // geo/material/lights are ROOT SRVs (not table slots). 8 reserved for slack.
     const int DdgiRelightReserved = 8;
     public const int DdgiRelightUsed = 1;
     public const int DdgiRelightTableBase = RtReflTableBase - DdgiRelightReserved;

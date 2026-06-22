@@ -1,11 +1,5 @@
-using System;
-using System.Collections.Generic;
-
 namespace BallisticEngine.UI;
 
-// A dropdown / popup select (P5.5) — UITK's DropdownField. A button showing the current choice; clicking
-// opens a popup list (added to the document's overlay layer so it draws above everything). Selecting an
-// item closes the popup and fires ValueChanged with the chosen index.
 public class Dropdown : VisualElement, INotifyValueChanged<int>
 {
     readonly Label _current;

@@ -2,28 +2,16 @@ using System.Text.Json;
 
 namespace BallisticEngine;
 
-// Save-system roots: where persistent game data lives and the JSON dialect it uses. The save
-// directory is injected at bootstrap (per-project, under the OS user-data folder — NOT the project
-// source tree, so saves don't get committed). PlayerPrefs and SaveData<T> read it.
-//
-// Typed game saves go through SaveData<T>: any plain serializable class persists to a named slot.
-//     SaveData.Save("slot1", playerState);
-//     var state = SaveData.Load<PlayerState>("slot1");
 public static class SaveSystem {
     public static readonly JsonSerializerOptions JsonOptions = new() {
         WriteIndented = true,
         PropertyNameCaseInsensitive = true,
-        IncludeFields = true, // game state is often public fields, not properties
+        IncludeFields = true,
     };
 
-    // The absolute directory persistent saves are written to. Set by the bootstrap from the project
-    // (e.g. %AppData%/Ballistic/<ProjectName>/Saves). Defaults to a local folder if never set so a
-    // headless/test run still works.
     public static string SaveDirectory { get; set; } =
         Path.Combine(AppContext.BaseDirectory, "Saves");
 
-    // Called by the bootstrap once the project is known. Re-points the directory and drops cached
-    // PlayerPrefs so the next access reloads from the right place.
     public static void Initialize(string saveDirectory) {
         SaveDirectory = saveDirectory;
         Directory.CreateDirectory(saveDirectory);
@@ -31,14 +19,10 @@ public static class SaveSystem {
     }
 }
 
-// Typed save slots (Unity devs usually roll this by hand over JsonUtility; here it's built in). A
-// "slot" is a named .json file under the save directory. T is any class/struct the JSON serializer
-// can handle — public fields included (game state tends to use fields).
 public static class SaveData {
     static string PathFor(string slot) =>
         Path.Combine(SaveSystem.SaveDirectory, SanitizeSlot(slot) + ".json");
 
-    // Serializes `data` to the named slot, overwriting it. Returns false (logged) on I/O failure.
     public static bool Save<T>(string slot, T data) {
         try {
             Directory.CreateDirectory(SaveSystem.SaveDirectory);
@@ -51,7 +35,6 @@ public static class SaveData {
         }
     }
 
-    // Loads the named slot, or returns `fallback` (default(T)) if it doesn't exist or fails to parse.
     public static T Load<T>(string slot, T fallback = default) {
         string path = PathFor(slot);
         if (!File.Exists(path))
@@ -78,18 +61,15 @@ public static class SaveData {
         }
     }
 
-    // Every existing slot name (file stem) under the save directory — for a "load game" screen.
     public static IEnumerable<string> AllSlots() {
         if (!Directory.Exists(SaveSystem.SaveDirectory))
             yield break;
         foreach (string file in Directory.EnumerateFiles(SaveSystem.SaveDirectory, "*.json")) {
             string name = Path.GetFileNameWithoutExtension(file);
-            if (name != "PlayerPrefs") // that's PlayerPrefs' backing file, not a game slot
-                yield return name;
+            if (name != "PlayerPrefs") yield return name;
         }
     }
 
-    // Slot names become file names — strip anything that isn't safe on disk.
     static string SanitizeSlot(string slot) {
         if (string.IsNullOrWhiteSpace(slot))
             return "default";

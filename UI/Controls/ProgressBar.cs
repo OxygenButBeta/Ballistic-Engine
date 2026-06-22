@@ -1,9 +1,5 @@
-using System;
-
 namespace BallisticEngine.UI;
 
-// A determinate progress bar (P5.8) — UITK's ProgressBar. A track with a fill whose width tracks
-// Value in [0..1], plus an optional centered title.
 public class ProgressBar : VisualElement, INotifyValueChanged<float>, IPostLayout
 {
     readonly VisualElement _fill;

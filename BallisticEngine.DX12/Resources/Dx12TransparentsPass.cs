@@ -1,56 +1,25 @@
-using System;
-using System.Collections.Generic;
-using System.Numerics;
 using System.Runtime.InteropServices;
-using BallisticEngine;         // IStaticMeshRenderer, Mesh, Material, RuntimeSet, DefaultTextures, TextureType, Texture2D
-using Vortice.Direct3D;        // PrimitiveTopology
+using Vortice.Direct3D;
 using Vortice.Direct3D12;
-using Vortice.Dxc;             // DxcShaderStage
-using Vortice.DXGI;            // Format, SampleDescription
+using Vortice.Dxc;
+using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// Transparent forward pass: after deferred + sky, draw Material.Transparent submeshes back-to-front,
-// alpha-blended over the HDR scene, depth-testing the G-buffer depth (LEqual, no write). Full forward PBR
-// (sun + IBL + shadows + clustered punctual) sampling material maps directly (TransparentForward.hlsl).
-//
-// VERBATIM MOVE (chunk 8 of the pass-graph migration): the bodies of BuildTransparentPass/DrawTransparents
-// are copied unchanged, only re-rooted onto `ctx`/this pass's own fields. No logic change → eyeball-unchanged
-// + SHA==golden. Copies the Dx12SkyPass/Fog/AP template (draws into `target`, owns no resolution targets).
-//
-// Decision 4 / R2: the head resource transition (gbuffer.DepthToReadOnly) lives right before the draw — the
-// inline sky block USED to do this unconditionally and transparents inherited DepthRead from it. Now Sky is a
-// graph pass gated by doors.Sky (and AP may leave depth in PixelShaderResource), so transparents emits its OWN
-// head DepthToReadOnly() — idempotent no-op when an upstream pass set it, the safety net when Sky is off.
-//
-// Event = Transparents (450) — after Sky (350) + AerialPerspective (400), before GI/Fog/SSR. Always enabled;
-// Record gathers the transparent submeshes and early-returns when there are none (no draw → no transition).
 public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.Transparents;
     public string Name => "Transparents";
 
-    // The inline call had NO outer-if (it was always invoked; the work-or-not gate is the per-frame gather's
-    // count==0 early-return inside Record). So the pass is always enabled.
     public bool Enabled(Dx12FrameContext ctx) => true;
 
-    // PHASE-2 V1: reads the G-buffer depth (DepthToReadOnly head) and the sun shadow map (forward-lit
-    // transparents sample the cascades), blends transparent geometry IN PLACE into the HDR scene color
-    // (ReadWrite — preserves the opaque-lit + sky pixels underneath).
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
         b.Read(b.Resource("ShadowMap"));
         b.ReadWrite(b.Resource("SceneColor"));
-        // PHASE-2 V3 (chunk 15): Transparents' ONE shared-resource head transition is `gbuffer.DepthToReadOnly()`
-        // (same usage class as Sky — the LEqual-no-write forward draw binds depth as a read-only DSV). Derive it;
-        // the manual head in Record is gated off when the barriers door is on. NOTE: the derived emit fires when
-        // the pass is Enabled (always true) EVEN when there are no transparent submeshes — but it's an idempotent
-        // state-tracked DepthToReadOnly with no draw, and every downstream consumer re-asserts its own depth state
-        // (R2), so the extra transition is a harmless no-op (verified SHA==golden + GBV 0-NEW, sky-off included).
         b.DeriveBarriers();
         b.Use(Dx12ResourceUsage.GBufferDepthReadOnly);
     }
 
-    // The 6 material maps in HLSL register(t0..t5) order; camera near/far — mirror the orchestrator consts.
     const int MaterialSrvCount = 6;
     const float CameraNear = 0.1f, CameraFar = 1000f;
 
@@ -72,15 +41,14 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
     }
 
     readonly Dx12Device dev;
-    ID3D12RootSignature transparentRootSig;  // b0 TransparentConstants + b1 FrameConstants + 6-SRV material table + 7-SRV lighting table + 2 samplers
+    ID3D12RootSignature transparentRootSig;
     ID3D12PipelineState transparentPso;
-    ID3D12Resource transparentCb;            // per-draw TransparentConstants ring
+    ID3D12Resource transparentCb;
     unsafe byte* transparentCbMapped;
     int transparentCbSlotSize, transparentCbSlotCount;
-    Dx12DescriptorHeap transparentSrvVisible; // per frame: 7 lighting SRVs + 6 material SRVs per draw
+    Dx12DescriptorHeap transparentSrvVisible;
     readonly List<(IStaticMeshRenderer r, int submesh, float dist)> transparentItems = new();
 
-    // VERBATIM BuildTransparentPass. Owns rootsig/PSO/CB/heap (resolution-independent — no Resize body).
     public unsafe Dx12TransparentsPass(Dx12Device device) {
         dev = device;
         var drawCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
@@ -111,15 +79,13 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
             new InputElementDescription("NORMAL", 0, Format.R32G32B32_Float, 0, 1),
             new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 0, 2),
             new InputElementDescription("TANGENT", 0, Format.R32G32B32A32_Float, 0, 3));
-        // Depth test LEqual, NO write (the G-buffer depth occludes; transparents don't write depth — sort
-        // handles their order). Straight alpha blend over the HDR scene (composite tonemaps later).
         var ds = DepthStencilDescription.Default;
         ds.DepthWriteMask = DepthWriteMask.Zero;
         ds.DepthFunc = ComparisonFunction.LessEqual;
         transparentPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
             RootSignature = transparentRootSig, VertexShader = vs, PixelShader = ps, InputLayout = layout,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullClockwise,   // back-face cull (forward parity)
+            RasterizerState = RasterizerDescription.CullClockwise,
             BlendState = new BlendDescription(Blend.SourceAlpha, Blend.InverseSourceAlpha),
             DepthStencilState = ds,
             RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
@@ -127,21 +93,15 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         });
 
         transparentCbSlotSize = (Marshal.SizeOf<TransparentConstants>() + 255) & ~255;
-        transparentCbSlotCount = 2048;   // transparent submesh draws per frame ceiling
+        transparentCbSlotCount = 2048;
         transparentCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)((long)transparentCbSlotSize * transparentCbSlotCount)), ResourceStates.GenericRead);
         transparentCbMapped = transparentCb.Map<byte>(0);
-        // Per frame: 7 lighting SRVs (bound once) + 6 material SRVs per draw.
         transparentSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
             7 + transparentCbSlotCount * MaterialSrvCount, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
-    // VERBATIM DrawTransparents. Call-site args re-derived from ctx: view/viewProj/camPos =
-    // ctx.View/ctx.ViewProj/ctx.CamPos; lightDir/lightColor/ambient = ctx.LightDir/ctx.LightColor/ctx.Ambient;
-    // iblActiveThisFrame = ctx.IblActiveThisFrame; frameCb.GPUVirtualAddress = ctx.FrameCbAddress; the lighting
-    // resources (ibl/shadowMap/clusteredLights) come from ctx. AabbInFrustum/ToNumerics/BindSrvInto are local
-    // copies of the orchestrator helpers (pure — frustumPlanes comes from ctx).
     public unsafe void Record(Dx12FrameContext ctx) {
         Matrix4x4 view = ctx.View, viewProj = ctx.ViewProj;
         Vector3 camPos = ctx.CamPos;
@@ -155,7 +115,6 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         int targetW = ctx.TargetW, targetH = ctx.TargetH;
         bool iblActiveThisFrame = ctx.IblActiveThisFrame;
 
-        // 1) Gather transparent submeshes (per-submesh frustum cull, like the geometry pass).
         transparentItems.Clear();
         foreach (IStaticMeshRenderer r in RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection) {
             if (r is null || !r.IsActive || !r.IsRenderable) continue;
@@ -172,7 +131,6 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
                 if (mat is null || !mat.Transparent) continue;
                 mesh.GetSubMeshBounds(s, out Vector3 lmin, out Vector3 lmax);
                 if (!AabbInFrustum(lmin, lmax, model, frustumPlanes)) continue;
-                // world-space submesh center for the back-to-front sort
                 var localCenter = new Vector3((lmin.X + lmax.X) * 0.5f, (lmin.Y + lmax.Y) * 0.5f, (lmin.Z + lmax.Z) * 0.5f);
                 Vector3 worldCenter = Vector3.Transform(localCenter, model);
                 transparentItems.Add((r, s, (worldCenter - camPos).LengthSquared()));
@@ -180,10 +138,8 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         }
         if (transparentItems.Count == 0) return;
 
-        // Back-to-front: farthest first (descending squared distance).
         transparentItems.Sort((a, c) => c.dist.CompareTo(a.dist));
 
-        // 2) Per-frame lighting SRVs (t6..t12: irradiance, prefilter, BRDF, shadow + cluster lights/grid/index).
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         transparentSrvVisible.Reset();
         int lightBase = transparentSrvVisible.AllocateRange(7);
@@ -201,10 +157,6 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         float punctualCount = clusteredLights.LightCount;
         int tslot = 0;
 
-        // 3) Draw back-to-front into the HDR color, depth-testing the G-buffer depth. Head transition (R2,
-        // Decision 4): emit our OWN DepthToReadOnly (the inline sky block used to do this unconditionally;
-        // now Sky is gated, so transparents re-asserts DepthRead). Idempotent no-op when upstream already set it.
-        // PHASE-2 V3: skip the manual head when derived barriers are active (the graph emitted it before Record).
         if (!ctx.BarriersDerived) gbuffer.DepthToReadOnly();
         target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
             cl.SetGraphicsRootSignature(transparentRootSig);
@@ -275,8 +227,6 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         });
     }
 
-    // VERBATIM AabbInFrustum (frustumPlanes passed in from ctx instead of the orchestrator field). The
-    // 8-corner world-AABB positive-vertex test, bit-identical to the geometry/shadow cull.
     static bool AabbInFrustum(Vector3 localMin, Vector3 localMax, Matrix4x4 model, Vector4[] frustumPlanes) {
         Vector3 wlo = new(float.MaxValue), whi = new(float.MinValue);
         for (int c = 0; c < 8; c++) {
@@ -289,13 +239,11 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         for (int i = 0; i < 6; i++) {
             Vector4 p = frustumPlanes[i];
             Vector3 pv = new(p.X >= 0 ? whi.X : wlo.X, p.Y >= 0 ? whi.Y : wlo.Y, p.Z >= 0 ? whi.Z : wlo.Z);
-            if (p.X * pv.X + p.Y * pv.Y + p.Z * pv.Z + p.W < 0f) return false;   // fully outside this plane
+            if (p.X * pv.X + p.Y * pv.Y + p.Z * pv.Z + p.W < 0f) return false;
         }
         return true;
     }
 
-    // VERBATIM BindSrvInto: copy one material texture's persistent SRV into the shader-visible table at
-    // `slot`. A null texture resolves to that slot's neutral default so the descriptor is always valid.
     void BindSrvInto(Dx12DescriptorHeap heap, int slot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback) {
         var dx = (tex as Dx12Texture2D)
                  ?? explicitFallback
@@ -304,7 +252,6 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
     }
 
-    // GLMatrix4/GLVector3 are System.Numerics aliases in the engine math; ToNumerics is an identity copy.
     static Matrix4x4 ToNumerics(Matrix4x4 m) => m;
     static Vector3 ToNumerics(Vector3 v) => v;
     static Vector4 ToNumerics(Vector4 v) => v;

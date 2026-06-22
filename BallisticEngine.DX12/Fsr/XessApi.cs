@@ -1,24 +1,13 @@
-using System;
 using System.Runtime.InteropServices;
 
 namespace BallisticEngine.DX12;
 
-// P/Invoke bindings for Intel XeSS (libxess.dll). Mirrors the FfxApi pattern: thin DllImport over the native
-// C entry points declared in native/xess/inc/xess/{xess,xess_d3d12}.h. All structs are BLITTABLE (the headers
-// pack(8); on x64 these members are naturally 8-aligned so default Sequential layout matches). The context
-// handle is an opaque pointer the app keeps for the context lifetime (created at init, destroyed in Dispose).
-//
-// libxess.dll runs an XMX path on Intel Arc and a DP4a fallback on any SM6.4 GPU (incl. AMD/NVIDIA) — so unlike
-// DLSS it is NOT vendor-locked. xessD3D12CreateContext returns XESS_RESULT_ERROR_UNSUPPORTED_DEVICE on a
-// pre-SM6.4 GPU, which the wrapper treats as "unavailable" → graceful fallback.
 internal static class XessApi {
     const string Lib = "libxess.dll";
 
-    // xess_result_t (only the codes the wrapper checks). SUCCESS = 0; warnings are >0; errors are <0.
     public const int ResultSuccess = 0;
     public const int ResultWarningOldDriver = 2;
 
-    // xess_quality_settings_t.
     public const int QualityUltraPerformance = 100;
     public const int QualityPerformance      = 101;
     public const int QualityBalanced         = 102;
@@ -27,7 +16,6 @@ internal static class XessApi {
     public const int QualityUltraQualityPlus = 105;
     public const int QualityAA               = 106;
 
-    // xess_init_flags_t.
     public const uint InitFlagNone               = 0;
     public const uint InitFlagHighResMv          = 1 << 0;
     public const uint InitFlagInvertedDepth      = 1 << 1;
@@ -45,23 +33,20 @@ internal static class XessApi {
     [StructLayout(LayoutKind.Sequential)]
     public struct Version { public ushort Major, Minor, Patch, Reserved; }
 
-    // xess_d3d12_init_params_t — the trailing optional pointers are null (XeSS allocates internally).
     [StructLayout(LayoutKind.Sequential)]
     public struct D3D12InitParams {
         public Xess2D OutputResolution;
-        public int QualitySetting;        // xess_quality_settings_t (enum is 4 bytes)
+        public int QualitySetting;
         public uint InitFlags;
         public uint CreationNodeMask;
         public uint VisibleNodeMask;
-        public IntPtr TempBufferHeap;     // ID3D12Heap* (null)
+        public IntPtr TempBufferHeap;
         public ulong BufferHeapOffset;
-        public IntPtr TempTextureHeap;    // ID3D12Heap* (null)
+        public IntPtr TempTextureHeap;
         public ulong TextureHeapOffset;
-        public IntPtr PipelineLibrary;    // ID3D12PipelineLibrary* (null)
+        public IntPtr PipelineLibrary;
     }
 
-    // xess_d3d12_execute_params_t. Resources are raw ID3D12Resource* (NativePointer). Color/velocity/depth must
-    // be in NON_PIXEL_SHADER_RESOURCE state; output in UNORDERED_ACCESS (header contract).
     [StructLayout(LayoutKind.Sequential)]
     public struct D3D12ExecuteParams {
         public IntPtr ColorTexture;
@@ -70,9 +55,9 @@ internal static class XessApi {
         public IntPtr ExposureScaleTexture;
         public IntPtr ResponsivePixelMaskTexture;
         public IntPtr OutputTexture;
-        public float JitterOffsetX;       // [-0.5, 0.5]
+        public float JitterOffsetX;
         public float JitterOffsetY;
-        public float ExposureScale;       // default 1
+        public float ExposureScale;
         public uint ResetHistory;
         public uint InputWidth;
         public uint InputHeight;
@@ -82,7 +67,7 @@ internal static class XessApi {
         public Xess2D InputResponsiveMaskBase;
         public Xess2D Reserved0;
         public Xess2D OutputColorBase;
-        public IntPtr DescriptorHeap;     // ID3D12DescriptorHeap* (null — XeSS owns its heap)
+        public IntPtr DescriptorHeap;
         public uint DescriptorHeapOffset;
     }
 
@@ -92,7 +77,6 @@ internal static class XessApi {
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     public static extern int xessD3D12CreateContext(IntPtr pDevice, out IntPtr phContext);
 
-    // pInitParams passed by ref (a const pointer in C).
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     public static extern int xessD3D12Init(IntPtr hContext, in D3D12InitParams pInitParams);
 

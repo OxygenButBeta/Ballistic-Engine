@@ -1,5 +1,3 @@
-using System;
-using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D;
 using Vortice.Direct3D12;
@@ -8,13 +6,6 @@ using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// MATH: the DX12 backend uses System.Numerics (SIMD-accelerated AND DX-convention — its
-// CreatePerspectiveFieldOfView gives NDC z in [0,1] as DX12 expects, vs OpenGL's [-1,1]). The engine
-// core stays on OpenTK.Mathematics; mesh/transform data is converted at the boundary when it arrives.
-
-// Phase 2 smoke: a real vertex-buffer cube, lit by directional N·L, through an MVP constant buffer with
-// depth testing. Proves mesh upload + CBV + depth + the minimal lit path on DX12 — the foundation the
-// real mesh/material renderer (DX12HDRenderer) is built from. Self-contained + disposable.
 public sealed class Dx12LitCubeTest : IDisposable {
     [StructLayout(LayoutKind.Sequential)]
     struct Vertex {
@@ -38,7 +29,7 @@ public sealed class Dx12LitCubeTest : IDisposable {
     readonly ID3D12PipelineState pso;
     readonly ID3D12Resource vbuffer;
     readonly ID3D12Resource ibuffer;
-    readonly ID3D12Resource cbuffer;     // upload heap, persistently mapped
+    readonly ID3D12Resource cbuffer;
     readonly VertexBufferView vbv;
     readonly IndexBufferView ibv;
     readonly int indexCount;
@@ -53,20 +44,17 @@ public sealed class Dx12LitCubeTest : IDisposable {
         ibuffer = CreateUploadBuffer(indices, out int ibBytes);
         ibv = new IndexBufferView(ibuffer.GPUVirtualAddress, (uint)ibBytes, Format.R16_UInt);
 
-        // Constant buffer: 256-aligned upload heap, persistently mapped (write per frame).
         int cbSize = (Marshal.SizeOf<Constants>() + 255) & ~255;
         cbuffer = dev.Device.CreateCommittedResource(
             HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
 
-        // Root signature: one root CBV at b0.
         var rootParam = new RootParameter1(
             RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var rsDesc = new RootSignatureDescription1(
             RootSignatureFlags.AllowInputAssemblerInputLayout, new[] { rootParam });
         rootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(rsDesc));
 
-        // Shaders + PSO with depth + input layout.
         string hlsl = EmbeddedShaderSource.ReadHlsl("LitCube.hlsl");
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "LitCube.hlsl");
         byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "LitCube.hlsl");
@@ -83,9 +71,9 @@ public sealed class Dx12LitCubeTest : IDisposable {
             InputLayout = layout,
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
             SampleMask = uint.MaxValue,
-            RasterizerState = RasterizerDescription.CullClockwise, // back-face cull (cube wound CCW-from-outside)
+            RasterizerState = RasterizerDescription.CullClockwise,
             BlendState = BlendDescription.Opaque,
-            DepthStencilState = DepthStencilDescription.Default,           // depth test + write, less
+            DepthStencilState = DepthStencilDescription.Default,
             RenderTargetFormats = new[] { Dx12OffscreenTarget.ColorFormat },
             DepthStencilFormat = Dx12OffscreenTarget.DepthFormat,
             SampleDescription = new SampleDescription(1, 0),
@@ -93,18 +81,13 @@ public sealed class Dx12LitCubeTest : IDisposable {
         pso = dev.Device.CreateGraphicsPipelineState(psoDesc);
     }
 
-    // Render the cube with a given model rotation into the target. Camera is a fixed look-at.
     public void Render(Dx12OffscreenTarget target, float yawRadians) {
         float aspect = (float)target.Width / target.Height;
         Matrix4x4 model = Matrix4x4.CreateRotationY(yawRadians) * Matrix4x4.CreateRotationX(0.5f);
-        // System.Numerics LookAt/Perspective are RIGHT-HANDED with DX depth [0,1] — the convention DX12
-        // wants. (This is what fixes the off-screen cube vs the OpenGL [-1,1] projection.)
         Matrix4x4 view = Matrix4x4.CreateLookAt(new Vector3(2.5f, 2.5f, 6f), Vector3.Zero, Vector3.UnitY);
         Matrix4x4 proj = Matrix4x4.CreatePerspectiveFieldOfView(
             45f * (MathF.PI / 180f), aspect, 0.1f, 100f);
 
-        // HLSL constant buffers read float4x4 COLUMN-major by default, but System.Numerics is row-major
-        // in memory — so transpose on upload, then mul(float4(pos,1), MVP) in HLSL matches the CPU math.
         var c = new Constants {
             Mvp = Matrix4x4.Transpose(model * view * proj),
             Model = Matrix4x4.Transpose(model),
@@ -112,7 +95,6 @@ public sealed class Dx12LitCubeTest : IDisposable {
             LightColor = new Vector3(1.0f, 0.97f, 0.9f),
             Ambient = new Vector3(0.15f, 0.16f, 0.2f),
         };
-        // Write the constant buffer via the Span map overload (no raw pointers).
         Span<Constants> cb = cbuffer.Map<Constants>(0, 1);
         cb[0] = c;
         cbuffer.Unmap(0);
@@ -128,8 +110,6 @@ public sealed class Dx12LitCubeTest : IDisposable {
         });
     }
 
-    // An upload-heap buffer seeded with `data` (fine for a static smoke test; the real renderer uses
-    // a DEFAULT-heap buffer with an upload copy).
     ID3D12Resource CreateUploadBuffer<T>(T[] data, out int byteSize) where T : unmanaged {
         byteSize = data.Length * Marshal.SizeOf<T>();
         ID3D12Resource buf = dev.Device.CreateCommittedResource(
@@ -142,7 +122,6 @@ public sealed class Dx12LitCubeTest : IDisposable {
     }
 
     static (Vertex[], ushort[]) BuildCube() {
-        // 24 verts (per-face normals + a distinct face color), 36 indices.
         Vector3[] faceN = {
             new(0,0,1), new(0,0,-1), new(1,0,0), new(-1,0,0), new(0,1,0), new(0,-1,0)
         };
@@ -150,14 +129,8 @@ public sealed class Dx12LitCubeTest : IDisposable {
             new(0.9f,0.3f,0.3f), new(0.3f,0.9f,0.3f), new(0.3f,0.3f,0.9f),
             new(0.9f,0.9f,0.3f), new(0.9f,0.3f,0.9f), new(0.3f,0.9f,0.9f)
         };
-        // Face corner offsets (CCW when viewed from outside along +normal).
         Vector3[][] faceV = {
-            new[]{ new Vector3(-1,-1, 1), new Vector3( 1,-1, 1), new Vector3( 1, 1, 1), new Vector3(-1, 1, 1) }, // +Z
-            new[]{ new Vector3( 1,-1,-1), new Vector3(-1,-1,-1), new Vector3(-1, 1,-1), new Vector3( 1, 1,-1) }, // -Z
-            new[]{ new Vector3( 1,-1, 1), new Vector3( 1,-1,-1), new Vector3( 1, 1,-1), new Vector3( 1, 1, 1) }, // +X
-            new[]{ new Vector3(-1,-1,-1), new Vector3(-1,-1, 1), new Vector3(-1, 1, 1), new Vector3(-1, 1,-1) }, // -X
-            new[]{ new Vector3(-1, 1, 1), new Vector3( 1, 1, 1), new Vector3( 1, 1,-1), new Vector3(-1, 1,-1) }, // +Y
-            new[]{ new Vector3(-1,-1,-1), new Vector3( 1,-1,-1), new Vector3( 1,-1, 1), new Vector3(-1,-1, 1) }, // -Y
+            new[]{ new Vector3(-1,-1, 1), new Vector3( 1,-1, 1), new Vector3( 1, 1, 1), new Vector3(-1, 1, 1) }, new[]{ new Vector3( 1,-1,-1), new Vector3(-1,-1,-1), new Vector3(-1, 1,-1), new Vector3( 1, 1,-1) }, new[]{ new Vector3( 1,-1, 1), new Vector3( 1,-1,-1), new Vector3( 1, 1,-1), new Vector3( 1, 1, 1) }, new[]{ new Vector3(-1,-1,-1), new Vector3(-1,-1, 1), new Vector3(-1, 1, 1), new Vector3(-1, 1,-1) }, new[]{ new Vector3(-1, 1, 1), new Vector3( 1, 1, 1), new Vector3( 1, 1,-1), new Vector3(-1, 1,-1) }, new[]{ new Vector3(-1,-1,-1), new Vector3( 1,-1,-1), new Vector3( 1,-1, 1), new Vector3(-1,-1, 1) },
         };
         var verts = new Vertex[24];
         var indices = new ushort[36];

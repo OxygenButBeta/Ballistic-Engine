@@ -1,23 +1,5 @@
 namespace BallisticEngine.AssetPipeline;
 
-// The Python program the .blend importer runs inside Blender (`blender --background <file>.blend
-// --python <thisScript> -- <out.fbx> <out.json>`). It does two things the C# side can't:
-//   1. Exports the scene's meshes to an .fbx via Blender's own FBX exporter — the only reliable
-//      reader of the .blend binary format is Blender itself (Assimp's Blender loader is mesh-only
-//      and breaks on modern versions). FBX, not glTF, because AssimpNet 4.1.0's bundled native
-//      Assimp parses Blender's modern .glb as zero meshes but reads Blender FBX cleanly.
-//   2. Walks bpy.data scene objects and writes a compact JSON sidecar describing the camera and
-//      every light (type, world transform, colour, energy, cone angles, range) plus a flag for
-//      whether any mesh was exported. The C# converter turns that JSON into engine entities.
-//
-// World matrices are emitted in Blender's native Z-up, row-major as 16 floats. The FBX is exported
-// Y-up at unit scale (axis_up='Y', FBX_SCALE_ALL), which bakes the mesh into engine space as
-// (x,y,z)_blender -> (x,z,-y)_engine; the C# converter (BlendSceneConverter) applies the SAME
-// basis change to the camera/light matrices — so geometry and lights stay aligned.
-//
-// Kept as a C# string constant rather than a loose .py asset so the importer is self-contained
-// (no path juggling, no risk of the script being treated as a project asset). Written to a temp
-// file at import time. Plain ASCII only — no engine UTF-8 sanitization runs on this path.
 public static class BlendExportScript {
     public const string Source = """
 import bpy, sys, json, os

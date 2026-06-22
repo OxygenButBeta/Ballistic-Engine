@@ -1,25 +1,9 @@
-using System;
 using System.Globalization;
 
 namespace BallisticEngine.UI;
 
-// Translates CSS-style declarations ("property: value") into Style setters. This is the single
-// shared bridge between authored text (inline style="" attributes AND .uss rules) and the live
-// Style object, so both routes support the exact same property vocabulary.
-//
-// The vocabulary is intentionally CSS-named and broad enough to cover what Claude designs emit:
-// flex layout, the box model (margin/padding/border/inset, with 1/2/4-value shorthands), sizing
-// (px/%/auto), colors (hex, rgb(), rgba(), named basics), border-radius, font-size, opacity, and
-// text-align. Unknown properties are ignored (logged) rather than fatal — a port should load even
-// when the source uses a property we don't model yet.
-//
-// Numbers are parsed with InvariantCulture ALWAYS (the port skill's hard-won locale rule: a Turkish/
-// EU locale otherwise reads "2.4" as a thousands separator and mangles every value).
 public static class StyleApplier
 {
-    // Apply a full declaration block: "a: b; c: d !important; ...". `pass` selects which declarations to
-    // apply: Normal skips `!important` ones, Important applies ONLY them (P2.7). The resolver runs two
-    // passes across all matched rules so every !important wins over every normal — proper CSS precedence.
     public enum Pass { Normal, Important, All }
 
     public static void ApplyInline(Style style, string declarations, Pass pass = Pass.All, IVarResolver vars = null)
@@ -34,7 +18,6 @@ public static class StyleApplier
             var val = decl[(colon + 1)..].Trim();
             if (prop.Length == 0 || val.Length == 0) continue;
 
-            // Strip a trailing !important and note it.
             bool important = false;
             int bang = val.IndexOf('!');
             if (bang >= 0 && val[bang..].Replace(" ", "").Equals("!important", StringComparison.OrdinalIgnoreCase))
@@ -45,7 +28,6 @@ public static class StyleApplier
             if (pass == Pass.Normal && important) continue;
             if (pass == Pass.Important && !important) continue;
 
-            // Resolve var() references (P2.4) against the document's custom-property store.
             if (vars != null && val.Contains("var(", StringComparison.OrdinalIgnoreCase))
                 val = ResolveVars(val, vars);
             if (val.Length == 0) continue;
@@ -54,8 +36,6 @@ public static class StyleApplier
         }
     }
 
-    // var(--token, fallback) → the token's value (or the fallback, or "" if neither). Supports nesting one
-    // level deep (a token whose value is itself a var() is resolved by the store before lookup).
     static string ResolveVars(string val, IVarResolver vars)
     {
         int guard = 0;
@@ -66,7 +46,6 @@ public static class StyleApplier
             int close = MatchParen(val, v + 3);
             if (close < 0) break;
             string inner = val[(v + 4)..close];
-            // inner = "--name" or "--name, fallback"
             string name, fallback = "";
             int comma = TopLevelComma(inner);
             if (comma >= 0) { name = inner[..comma].Trim(); fallback = inner[(comma + 1)..].Trim(); }
@@ -101,12 +80,10 @@ public static class StyleApplier
         return -1;
     }
 
-    // Apply a single property/value. Public so the USS cascade can feed pre-split declarations.
     public static void ApplyOne(Style style, string prop, string value)
     {
         switch (prop.ToLowerInvariant())
         {
-            // ---- flex container ----
             case "flex-direction": style.FlexDirection = ParseFlexDirection(value); break;
             case "flex-wrap": style.FlexWrap = ParseFlexWrap(value); break;
             case "justify-content": style.JustifyContent = ParseJustify(value); break;
@@ -114,7 +91,6 @@ public static class StyleApplier
             case "align-content": style.AlignContent = ParseAlign(value); break;
             case "align-self": style.AlignSelf = ParseAlign(value); break;
 
-            // ---- flex item ----
             case "flex-grow": style.FlexGrow = ParseFloat(value); break;
             case "flex-shrink": style.FlexShrink = ParseFloat(value); break;
             case "flex-basis": style.FlexBasis = ParseLength(value); break;
@@ -133,23 +109,18 @@ public static class StyleApplier
                 style.TextOverflow = value.Trim().Equals("ellipsis", StringComparison.OrdinalIgnoreCase)
                     ? TextOverflow.Ellipsis : TextOverflow.Clip; break;
 
-            // ---- sizing ----
             case "width": style.Width = ParseLength(value); break;
             case "height": style.Height = ParseLength(value); break;
-            // min/max accept px or "none" (none → no constraint: 0 for min, NaN for max). Percentage
-            // min/max would need percent setters on the Yoga facade — a later facade addition.
             case "min-width": style.MinWidth = NoneOrPx(value, 0f); break;
             case "min-height": style.MinHeight = NoneOrPx(value, 0f); break;
             case "max-width": style.MaxWidth = NoneOrPx(value, float.NaN); break;
             case "max-height": style.MaxHeight = NoneOrPx(value, float.NaN); break;
 
-            // ---- inset (position offsets) ----
             case "left": style.SetInset(Edge.Left, ParseLength(value)); break;
             case "top": style.SetInset(Edge.Top, ParseLength(value)); break;
             case "right": style.SetInset(Edge.Right, ParseLength(value)); break;
             case "bottom": style.SetInset(Edge.Bottom, ParseLength(value)); break;
 
-            // ---- margin / padding (1/2/4-value shorthands + per-edge) ----
             case "margin": ApplyBoxShorthand(value, style.SetMargin); break;
             case "margin-left": style.SetMargin(Edge.Left, ParsePx(value)); break;
             case "margin-top": style.SetMargin(Edge.Top, ParsePx(value)); break;
@@ -162,7 +133,6 @@ public static class StyleApplier
             case "padding-right": style.SetPadding(Edge.Right, ParsePx(value)); break;
             case "padding-bottom": style.SetPadding(Edge.Bottom, ParsePx(value)); break;
 
-            // ---- border (width + color + radius) ----
             case "border-width": style.SetBorderWidth(Edge.All, ParsePx(value)); break;
             case "border-color": style.BorderColor = ParseColor(value); break;
             case "border-radius": ApplyRadiusShorthand(style, value); break;
@@ -171,10 +141,8 @@ public static class StyleApplier
             case "border-bottom-right-radius": style.BorderRadiusBottomRight = ParsePx(value); break;
             case "border-bottom-left-radius": style.BorderRadiusBottomLeft = ParsePx(value); break;
 
-            // ---- visual ----
             case "background-color": style.BackgroundColor = ParseColor(value); break;
             case "background":
-                // CSS `background` shorthand: a gradient, or a solid color (we only model those two).
                 if (value.Contains("gradient", StringComparison.OrdinalIgnoreCase))
                     style.BackgroundGradient = ParseGradient(value);
                 else
@@ -183,8 +151,6 @@ public static class StyleApplier
             case "color": style.TextColor = ParseColor(value); break;
             case "font-size": style.FontSize = ParsePx(value); break;
             case "opacity": style.Opacity = Math.Clamp(ParseFloat(value), 0f, 1f); break;
-            // Render-time transforms (don't affect layout). rotation in degrees, scale unitless,
-            // translate-x/y in px. (CSS `transform:` shorthand is parsed loosely below.)
             case "rotation": style.RotationDegrees = ParseFloat(value.Replace("deg", "")); break;
             case "scale": style.Scale = ParseFloat(value); break;
             case "translate-x": style.TranslateX = ParsePx(value); break;
@@ -199,20 +165,15 @@ public static class StyleApplier
                     || (int.TryParse(value.Trim(), out var fw) && fw >= 600); break;
             case "font-style": style.Italic = value.Trim().Equals("italic", StringComparison.OrdinalIgnoreCase); break;
             case "direction": style.Direction = value.Trim().Equals("rtl", StringComparison.OrdinalIgnoreCase) ? LayoutDirection.RTL : LayoutDirection.LTR; break;
-            // letter-spacing in px or em (em resolved against the current font size, like CSS).
             case "letter-spacing": style.LetterSpacing = ParseEmOrPx(value, style.FontSize); break;
             case "text-align":
             case "-unity-text-align": style.TextAlign = ParseTextAlign(value); break;
 
             default:
-                // Unmodeled property (e.g. box-shadow, transition) — skip without failing the load.
                 break;
         }
     }
 
-    // ---------------------------------------------------------------- value parsers
-
-    // A CSS length: "auto", "50%", or a pixel number ("12px" / "12"). Unknown -> auto.
     static Length ParseLength(string v)
     {
         v = v.Trim();
@@ -222,7 +183,6 @@ public static class StyleApplier
         return Length.Points(ParsePx(v));
     }
 
-    // A pixel scalar: strips a trailing "px", parses the number invariantly. Non-numeric -> 0.
     static float ParsePx(string v)
     {
         v = v.Trim();
@@ -233,11 +193,9 @@ public static class StyleApplier
     static float ParseFloat(string v) =>
         float.TryParse(v.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var f) ? f : 0f;
 
-    // "none" -> the given sentinel (no constraint); otherwise a px scalar.
     static float NoneOrPx(string v, float none) =>
         v.Trim().Equals("none", StringComparison.OrdinalIgnoreCase) ? none : ParsePx(v);
 
-    // aspect-ratio: "16 / 9" or "1.777" or "auto" (auto -> NaN = unset).
     static float ParseAspectRatio(string v)
     {
         v = v.Trim();
@@ -253,9 +211,6 @@ public static class StyleApplier
         return r > 0 ? r : float.NaN;
     }
 
-    // text-shadow: "offsetX offsetY blur color". CSS allows a comma list of shadows; we pick the one
-    // with the LARGEST blur (the glow, the visually dominant layer) since the renderer draws a single
-    // shadow pass in v1. "none" clears it.
     static void ApplyTextShadow(Style style, string value)
     {
         if (value.Trim().Equals("none", StringComparison.OrdinalIgnoreCase))
@@ -281,8 +236,6 @@ public static class StyleApplier
         }
     }
 
-    // box-shadow: "offsetX offsetY blur [spread] color" (CSS). "none" clears. Picks the first shadow in a
-    // comma list (v1 draws one). inset is ignored (outer shadow only).
     static void ApplyBoxShadow(Style style, string value)
     {
         if (value.Trim().Equals("none", StringComparison.OrdinalIgnoreCase)) { style.HasBoxShadow = false; return; }
@@ -303,7 +256,6 @@ public static class StyleApplier
         style.BoxShadowColor = col;
     }
 
-    // "blur(8px)" -> 8. Bare number/px also accepted.
     static float ParseBlurPx(string v)
     {
         v = v.Trim();
@@ -315,7 +267,6 @@ public static class StyleApplier
     static bool TryParseOneShadow(string s, out float ox, out float oy, out float blur, out Color col)
     {
         ox = oy = blur = 0f; col = Color.Transparent;
-        // Pull the color out first (it may contain spaces inside rgba()).
         int rgb = s.IndexOf("rgb", StringComparison.OrdinalIgnoreCase);
         int hash = s.IndexOf('#');
         int colorStart = rgb >= 0 ? rgb : hash;
@@ -335,8 +286,6 @@ public static class StyleApplier
         return true;
     }
 
-    // text-align: accepts CSS keywords (left/center/right -> middle-*) and Unity's compound names
-    // (upper-left, middle-center, lower-right, ...).
     static TextAlign ParseTextAlign(string v) => v.Trim().ToLowerInvariant() switch
     {
         "left" or "middle-left" => TextAlign.MiddleLeft,
@@ -351,15 +300,12 @@ public static class StyleApplier
         _ => TextAlign.MiddleLeft,
     };
 
-    // font-family: takes the FIRST family in a comma list, stripped of quotes (CSS fallback lists like
-    // "'Cinzel', serif" -> "Cinzel").
     static string ParseFontFamily(string v)
     {
         var first = v.Split(',')[0].Trim();
         return first.Trim('\'', '"', ' ');
     }
 
-    // A length that may be em (relative to font size) or px. "0.42em" * fontSize, "5px" -> 5.
     static float ParseEmOrPx(string v, float fontSize)
     {
         v = v.Trim();
@@ -368,8 +314,6 @@ public static class StyleApplier
         return ParsePx(v);
     }
 
-    // Color: #hex (3/4/6/8), rgb()/rgba() (with int OR % channels and modern space syntax), hsl()/hsla(),
-    // or a CSS named color. Unknown -> transparent.
     static Color ParseColor(string v)
     {
         v = v.Trim();
@@ -380,7 +324,6 @@ public static class StyleApplier
             int open = v.IndexOf('('), close = v.IndexOf(')');
             if (open >= 0 && close > open)
             {
-                // Accept comma OR space separators, and an optional "/ alpha" (modern CSS).
                 var body = v[(open + 1)..close].Replace("/", " ");
                 var parts = body.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length >= 3)
@@ -417,7 +360,6 @@ public static class StyleApplier
         return NamedColor(v);
     }
 
-    // One rgb() channel: "255", "100%" -> byte.
     static byte ParseChannel(string p)
     {
         p = p.Trim();
@@ -426,7 +368,6 @@ public static class StyleApplier
         return (byte)Math.Clamp(ParseFloat(p), 0, 255);
     }
 
-    // Alpha: "0.5" or "50%".
     static float ParseAlpha(string p)
     {
         p = p.Trim();
@@ -461,7 +402,6 @@ public static class StyleApplier
         return p;
     }
 
-    // Expanded CSS named-color subset (the ones Claude/game UIs actually emit).
     static Color NamedColor(string v) => v.ToLowerInvariant() switch
     {
         "white" => Color.White,
@@ -485,9 +425,6 @@ public static class StyleApplier
         _ => Color.Transparent,
     };
 
-    // Parses `linear-gradient(<angle>, <stop>, ...)` or `radial-gradient([shape] [at pos], <stop>...)`.
-    // Each stop is "<color> [position%]". Positions default to an even spread when omitted. Returns
-    // null on malformed input (caller leaves the solid background).
     static Gradient ParseGradient(string value)
     {
         value = value.Trim();
@@ -505,8 +442,6 @@ public static class StyleApplier
 
         if (!radial)
         {
-            // Optional leading angle ("90deg" / "to right"). If the first token isn't a color, treat
-            // it as the direction.
             var head = parts[0].Trim();
             if (head.EndsWith("deg", StringComparison.OrdinalIgnoreCase))
             {
@@ -524,12 +459,11 @@ public static class StyleApplier
             }
             else
             {
-                g.AngleDegrees = 180f; // CSS default: to bottom
+                g.AngleDegrees = 180f;
             }
         }
         else
         {
-            // Radial: skip an optional shape/size/"at pos" head token if it isn't a color.
             var head = parts[0].Trim();
             if (!LooksLikeColor(head))
             {
@@ -538,7 +472,6 @@ public static class StyleApplier
             }
         }
 
-        // Color stops. A stop is "<color> [pos%]".
         int stopCount = parts.Count - firstStop;
         for (int i = firstStop; i < parts.Count; i++)
         {
@@ -550,7 +483,6 @@ public static class StyleApplier
 
     static (Color color, float pos) ParseStop(string text, int index, int total)
     {
-        // Split off a trailing percentage position if present (but NOT one inside an rgba()).
         int lastSpace = LastTopLevelSpace(text);
         float pos = total > 1 ? index / (float)(total - 1) : 0f;
         string colorPart = text;
@@ -568,7 +500,6 @@ public static class StyleApplier
 
     static void ParseRadialHead(string head, Gradient g)
     {
-        // e.g. "ellipse 74% 62% at 34% 50%". Pull the "at X% Y%" center; sizes map to radii.
         int at = head.IndexOf(" at ", StringComparison.OrdinalIgnoreCase);
         if (at >= 0)
         {
@@ -591,7 +522,6 @@ public static class StyleApplier
         s.StartsWith("#") || s.StartsWith("rgb", StringComparison.OrdinalIgnoreCase) ||
         s is "white" or "black" or "transparent" or "red" or "green" or "blue" or "gray" or "grey";
 
-    // Splits on top-level commas (commas inside parentheses, e.g. rgba(...), are preserved).
     static List<string> SplitTopLevel(string s)
     {
         var result = new List<string>();
@@ -607,7 +537,6 @@ public static class StyleApplier
         return result;
     }
 
-    // Index of the last space that is NOT inside parentheses (separates a stop's color from its pos).
     static int LastTopLevelSpace(string s)
     {
         int depth = 0, last = -1;
@@ -620,8 +549,6 @@ public static class StyleApplier
         }
         return last;
     }
-
-    // ---------------------------------------------------------------- enum parsers (CSS keyword set)
 
     static FlexDirection ParseFlexDirection(string v) => v.Trim().ToLowerInvariant() switch
     {
@@ -667,7 +594,6 @@ public static class StyleApplier
     {
         "absolute" => PositionType.Absolute,
         "static" => PositionType.Static,
-        // CSS "fixed"/"sticky" have no flex analogue; treat as absolute (closest behaviour).
         "fixed" or "sticky" => PositionType.Absolute,
         _ => PositionType.Relative,
     };
@@ -679,9 +605,6 @@ public static class StyleApplier
         _ => Overflow.Visible,
     };
 
-    // ---------------------------------------------------------------- shorthands
-
-    // "flex: 1" -> grow 1; "flex: 1 1 0" -> grow shrink basis. Partial forms handled leniently.
     static void ApplyFlexShorthand(Style style, string v)
     {
         var parts = v.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -690,7 +613,6 @@ public static class StyleApplier
         if (parts.Length >= 3) style.FlexBasis = ParseLength(parts[2]);
     }
 
-    // CSS box shorthand: 1 value = all; 2 = vertical horizontal; 4 = top right bottom left.
     static void ApplyBoxShorthand(string v, Action<Edge, float> set)
     {
         var parts = v.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -703,7 +625,7 @@ public static class StyleApplier
                 set(Edge.Vertical, ParsePx(parts[0]));
                 set(Edge.Horizontal, ParsePx(parts[1]));
                 break;
-            case 3: // top, horizontal, bottom
+            case 3:
                 set(Edge.Top, ParsePx(parts[0]));
                 set(Edge.Horizontal, ParsePx(parts[1]));
                 set(Edge.Bottom, ParsePx(parts[2]));
@@ -717,7 +639,6 @@ public static class StyleApplier
         }
     }
 
-    // border-radius shorthand (CSS): 1 = all; 2 = TL-BR, TR-BL; 3 = TL, TR-BL, BR; 4 = TL TR BR BL.
     static void ApplyRadiusShorthand(Style style, string v)
     {
         var parts = v.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);

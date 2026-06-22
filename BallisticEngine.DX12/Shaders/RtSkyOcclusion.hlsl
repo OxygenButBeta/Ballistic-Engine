@@ -14,12 +14,15 @@ RaytracingAccelerationStructure Scene : register(t0);
 Texture2D<float>  Depth   : register(t1);
 Texture2D<float4> Normal  : register(t2);   // world normal packed [0,1]
 Texture2D<float>  AoIn    : register(t3);   // GTAO result (SRV read; 1 = unoccluded)
-Texture2D<float2> HistIn  : register(t4);   // previous frame's (skyVis, depth) — temporal EMA source
+Texture2D<float2> HistIn  : register(t4);   // previous frame's (skyVis, worldDist) — temporal EMA source
 RWTexture2D<float> AoOut  : register(u0);   // own target: AoIn * sky-vis (copied back into GTAO's AO afterwards)
-RWTexture2D<float2> HistOut : register(u1); // this frame's (skyVis, depth) for next frame's EMA
+RWTexture2D<float2> HistOut : register(u1); // this frame's (skyVis, worldDist) for next frame's EMA
+
+SamplerState LinearClamp : register(s0);    // bilinear sampling of the reprojected history
 
 cbuffer RtaoConstants : register(b0) {
     float4x4 InvViewProj;   // screen+depth -> world (transposed on upload)
+    float4x4 PrevViewProj;  // world -> previous-frame clip (transposed on upload), for history reprojection
     float2 TexelSize;       // 1/width, 1/height of the AO target
     float  RayLength;       // world-space max occluder distance (beyond this = "open to sky")
     float  NormalBias;      // ray-origin offset along the normal (acne)
@@ -88,18 +91,28 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     }
     float skyVis = open / float(rays);
 
-    // TEMPORAL DENOISE: a few jittered rays per frame give a noisy, frame-varying skyVis (the "grey/black noise
-    // sliding across the screen as the camera moves" report). Blend with the previous frame's skyVis (EMA) so the
-    // few-ray estimate converges to a stable value — sky-occlusion is a low-frequency openness signal, so a plain
-    // depth-guarded EMA (reject the history when this pixel's depth jumped → disocclusion) is enough without full
-    // motion-vector reprojection. Off on the first frame / under deterministic capture (byte-stable goldens).
+    // TEMPORAL DENOISE WITH MOTION-VECTOR REPROJECTION: a few jittered rays per frame give a noisy, frame-varying
+    // skyVis. Without reprojection the history is read from the SAME screen pixel, which is a DIFFERENT world point
+    // once the camera moves — the old occlusion then smears across new geometry as a slow-drifting blob ("AO of
+    // things that aren't there"). Reproject this pixel's worldPos through last frame's ViewProj to find where it
+    // was on screen, sample the history there, and reject it by WORLD-SPACE distance (depth alone can't tell a
+    // panning wall from a real disocclusion). Off on the first frame / under deterministic capture.
+    float curDist = length(worldPos);   // camera-relative distance; stored as the history's geometry key
     if (HistoryValid > 0.5) {
-        float2 h = HistIn[px];
-        float prevVis = h.x, prevDepth = h.y;
-        // Depth-relative disocclusion reject: if this pixel's depth changed a lot, the history is from different
-        // geometry → discard it (use this frame's value) instead of smearing.
-        bool reuse = abs(prevDepth - depth) <= 0.01 * max(depth, 1e-3);
-        if (reuse) skyVis = lerp(prevVis, skyVis, 0.1);   // 10% new per frame → ~stable in a few frames
+        float4 prevClip = mul(float4(worldPos, 1.0), PrevViewProj);
+        if (prevClip.w > 1e-5) {
+            float2 prevNdc = prevClip.xy / prevClip.w;
+            float2 prevUv = float2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
+            // On-screen last frame? Off-screen history doesn't exist → keep this frame's noisy estimate.
+            if (all(prevUv >= 0.0) && all(prevUv <= 1.0)) {
+                float2 h = HistIn.SampleLevel(LinearClamp, prevUv, 0);
+                float prevVis = h.x, prevDist = h.y;
+                // World-space disocclusion reject: if the reprojected pixel's surface sat at a very different
+                // distance, the history is different geometry (a foreground edge now uncovers a far wall) → drop it.
+                bool reuse = abs(prevDist - curDist) <= 0.05 * max(curDist, 1e-3);
+                if (reuse) skyVis = lerp(prevVis, skyVis, 0.1);   // 10% new per frame → stable in a few frames
+            }
+        }
     }
 
     // Multiply sky-visibility INTO the existing AO (read-modify-write). Intensity lerps from "AO unchanged"
@@ -107,5 +120,5 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
     // IBL ambient to ~0; an open one (skyVis~1) is untouched.
     float ao = AoIn[px];
     AoOut[px] = ao * lerp(1.0, skyVis, saturate(Intensity));
-    HistOut[px] = float2(skyVis, depth);
+    HistOut[px] = float2(skyVis, curDist);
 }

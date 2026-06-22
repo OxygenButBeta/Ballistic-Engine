@@ -1,21 +1,11 @@
 using System.Reflection;
-using System.Text;
 using BallisticEngine.Serialization;
 using SysVec2 = System.Numerics.Vector2;
 using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// File-explorer-style asset browser: navigable folders with a tile grid (folders + assets as
-// boxes). Single click selects (Inspector shows the asset), double click opens (folder/scene),
-// tiles are drag sources carrying the asset GUID(s). Files dropped from the OS land in the
-// current folder and import (wired in EditorApplication via the window FileDrop event).
-//
-// Multi-selection: Ctrl+click toggles, Shift+click range-selects, Ctrl+A selects everything
-// visible, Delete removes the whole selection, dragging a selected tile drags all of them
-// (payload = ';'-joined GUIDs), and the context menu switches to batch actions.
 internal sealed class AssetBrowserPanel : EditorWindow {
-    // Phase-5: draws through the IEditorGui seam (EditorGui.Shared).
     static IEditorGui gui => EditorGui.Shared;
 
     public const string DragType = "BALLISTIC_ASSET";
@@ -28,7 +18,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
 
     string filter = "";
 
-    // Type filter (combo next to the search box). Index 0 = "All".
     int typeFilter;
     static readonly (string label, string[] exts)[] TypeFilters = [
         ("All", []),
@@ -42,59 +31,43 @@ internal sealed class AssetBrowserPanel : EditorWindow {
     ];
     static readonly string[] TypeFilterLabels = TypeFilters.Select(t => t.label).ToArray();
 
-    // Hidden by default — intermediate/source formats that just generate other assets.
     static readonly string[] HiddenExtensions = [".pyscene"];
     bool showSourceFiles;
 
-    // The Default folder is read-only + hidden — protection logic lives in AssetOps so every site
-    // (delete/move/this panel) shares one rule.
     static bool IsProtected(string path) => AssetOps.IsProtected(path);
 
-    // Inline rename: the project-relative path being renamed + the edit buffer.
     string renamingPath;
     string renameBuffer = "";
     bool renameFocusPending;
 
-    // The tiles drawn this frame in draw order (for shift range-select), and the anchor tile
-    // a shift-range extends from.
     readonly List<(string path, Guid guid)> visibleFiles = new();
     Guid anchorGuid;
 
-    // Project-relative with forward slashes, e.g. "Assets" or "Assets/Default/Sky". BALLISTIC_EDITOR_FOLDER
-    // opens the browser at a given folder on launch — a test door so headless captures can land on a folder
-    // with previewable assets (thumbnails/material previews) without manual navigation.
     public string CurrentFolder { get; private set; } =
         Environment.GetEnvironmentVariable("BALLISTIC_EDITOR_FOLDER") is { Length: > 0 } f ? f : "Assets";
 
-    // Set by EditorApplication: synchronously recompiles + hot-reloads game scripts. Invoked
-    // after creating/renaming a .cs so the component shows up in Add Component immediately.
     public Action RequestScriptRebuild;
 
-    // EditorWindow identity (WindowShell owns Begin/End; OnGui routes to the existing DrawContents body).
     protected override void OnGui(IEditorGui gui) => DrawContents();
 
     public AssetBrowserPanel(EditorState state, Func<float> scale) {
         DockKey = EditorLayout.Assets;
         Title = "Assets";
         Icon = EditorIcons.Folder;
-        Singleton = false;        // duplicable via the Add-Tab host
+        Singleton = false;
 
         this.state = state;
         this.scale = scale;
     }
 
-    // Drops cached thumbnail GL textures so freshly (re)imported assets regenerate previews.
-    // Must run on the render thread (deletes GL textures) — call from an import-completion callback.
     public void InvalidateThumbnails() => thumbnails.InvalidateAll();
 
     public void DrawContents() {
         float s = scale();
-        thumbnails.Pump(); // at most one thumbnail decode per frame
+        thumbnails.Pump();
         DrawNavigationBar(s);
         EditorDecoration.DrawDivider();
 
-        // Two panes, Unity-style: folder tree on the left, tile grid on the right,
-        // separated by a draggable splitter (width persists in EditorPrefs).
         float treeW = Math.Clamp(EditorPrefs.Current.AssetTreeWidth, 140f, 420f) * s;
         gui.BeginChild("##foldertree", new SysVec2(treeW, 0), border: false);
         DrawFolderTree();
@@ -108,15 +81,12 @@ internal sealed class AssetBrowserPanel : EditorWindow {
     }
 
     void DrawGridPane(float s) {
-        // The inspector may have asked to REVEAL an asset (clicking an asset reference): navigate to
-        // its folder and select it here, instead of swapping the inspector to it.
         if (state.ConsumeRevealAsset() is { } revealPath)
             RevealAsset(revealPath);
 
         var searching = filter.Length > 0;
         var assets = AssetDatabase.EnumerateAssets().OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase);
 
-        // Folders from disk (so empty/new folders show up), assets from the pipeline.
         var folders = new List<string>();
         var files = new List<(string path, Guid guid)>();
         var prefix = CurrentFolder + "/";
@@ -126,7 +96,7 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             if (Directory.Exists(currentAbsolute)) {
                 foreach (var dir in Directory.GetDirectories(currentAbsolute)) {
                     string rel = prefix + Path.GetFileName(dir);
-                    if (IsProtected(rel)) continue;   // hide the read-only Default folder
+                    if (IsProtected(rel)) continue;
                     folders.Add(rel);
                 }
             }
@@ -136,15 +106,9 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         bool PassesType(string path) =>
             typeExts.Length == 0 || typeExts.Contains(Path.GetExtension(path).ToLowerInvariant());
 
-        // Source/intermediate files (Falcor .pyscene) are hidden by default — they auto-generate a
-        // sibling .scene and just clutter the view. "Show Source Files" in the grid menu reveals them.
         bool Hidden(string path) =>
-            IsProtected(path) ||   // the Default folder's assets are never listed
-            (!showSourceFiles && HiddenExtensions.Contains(Path.GetExtension(path).ToLowerInvariant()));
+            IsProtected(path) || (!showSourceFiles && HiddenExtensions.Contains(Path.GetExtension(path).ToLowerInvariant()));
 
-        // Unity-style "t:Type" search: "t:material", "t:texture", "t:scene" ... filter by asset KIND
-        // (the TypeFilters categories, prefix-matched) instead of by path text. Anything else is a
-        // plain path-substring match. "t:" alone shows every asset.
         bool MatchesFilter(string path) {
             if (filter.StartsWith("t:", StringComparison.OrdinalIgnoreCase)) {
                 string term = filter[2..].Trim();
@@ -174,8 +138,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
                 files.Add((path, guid));
         }
 
-        // A type filter implies a recursive search across the project (folders are hidden),
-        // so you can e.g. see every material at once. "All" keeps the folder-by-folder view.
         if (typeFilter != 0 && !searching) {
             folders.Clear();
             files.Clear();
@@ -189,20 +151,16 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         DrawNewAssetPrompt();
     }
 
-    // Unity-style "name it first" creation for every NON-script asset (material, scene, terrain,
-    // folder, data assets): the menu item arms a prompt instead of writing "New X" immediately, so the
-    // file is named BEFORE it lands and gets imported (no "New Material.mat then rename + reimport").
     bool openNewAssetPrompt;
     string newAssetName = "";
-    string newAssetExt = "";              // ".mat", ".scene", "" for a folder
-    string newAssetKind = "Asset";        // shown in the prompt title
-    Func<string, string> newAssetContent; // name (no ext) -> file text; null = a folder (no file)
-    Action newAssetPostCreate;            // e.g. RequestScriptRebuild; runs before the refresh
+    string newAssetExt = "";
+    string newAssetKind = "Asset";
+    Func<string, string> newAssetContent;
+    Action newAssetPostCreate;
 
-    string pendingDefaultName = "";   // applied to newAssetName ON the popup-opening frame (see below)
-    bool focusNewAssetName;           // one-shot: focus the name field only on the first open frame
+    string pendingDefaultName = "";
+    bool focusNewAssetName;
 
-    // Arms the generic prompt. content is null for a folder. postCreate runs after the file is written.
     void PromptNewAsset(string kind, string defaultName, string ext, Func<string, string> content,
         Action postCreate = null) {
         newAssetKind = kind;
@@ -217,7 +175,7 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         if (openNewAssetPrompt) {
             openNewAssetPrompt = false;
             newAssetName = pendingDefaultName;
-            focusNewAssetName = true;   // focus the field on the first drawn frame only (see below)
+            focusNewAssetName = true;
             gui.OpenPopup("##newasset");
         }
 
@@ -228,16 +186,12 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             return;
         }
 
-        // Bright title (the default text is dim/grey which read as "disabled").
         gui.PushColor(EditorStyleColor.Text, EditorTheme.Text);
         gui.TextUnformatted($"New {newAssetKind}");
         gui.PopColor();
         gui.Separator();
         gui.Spacing();
         gui.TextUnformatted("Name");
-        // Focus ONLY on the first frame the popup is open. IsWindowAppearing can re-fire (AlwaysAutoResize
-        // relayouts the modal), and re-grabbing focus every frame was resetting the input -> typed text
-        // never stuck. A one-shot flag avoids that.
         if (focusNewAssetName) {
             focusNewAssetName = false;
             gui.SetKeyboardFocusHere();
@@ -262,7 +216,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         PopPromptStyle();
     }
 
-    // A lighter, roomier look for the create modals (the default was a dim, cramped box).
     static void PushPromptStyle() {
         gui.PushWindowPadding(new SysVec2(20, 18));
         gui.PushFrameRounding(5f);
@@ -276,14 +229,11 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.PopStyleVar(3);
     }
 
-    // Cancel (neutral) + Create (accent-coloured) button row for the create prompts. `create` is true
-    // when Create was clicked; Cancel closes the popup itself.
     static void PromptButtons(out bool create, bool createEnabled) {
         create = false;
         if (gui.Button("Cancel", new SysVec2(120, 0)))
             gui.CloseCurrentPopup();
         gui.SameLine();
-        // Coloured Create button (greyed when disabled) so it reads as the primary action.
         gui.BeginDisabled(!createEnabled);
         gui.PushColor(EditorStyleColor.Button, EditorTheme.PrimaryAction);
         gui.PushColor(EditorStyleColor.ButtonHovered, EditorTheme.PrimaryActionHovered);
@@ -293,14 +243,12 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.EndDisabled();
     }
 
-    // Writes the named asset (or folder) into the current folder and imports it. Uniqueness still
-    // applies (Name, Name 1, ...) so two same-named creates don't clobber.
     void CreateNamedAsset(string name) {
         string dir = AssetDatabase.Project.ResolveAbsolute(CurrentFolder);
         string absolute = UniquePath(Path.Combine(dir, name + newAssetExt));
         try {
             if (newAssetContent is null) {
-                Directory.CreateDirectory(absolute);   // folder: no import needed
+                Directory.CreateDirectory(absolute);
                 return;
             }
             File.WriteAllText(absolute, newAssetContent(Path.GetFileNameWithoutExtension(absolute)));
@@ -312,9 +260,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         }
     }
 
-    // Unity-style "name it first" script creation: New Script opens a prompt for the class/file name,
-    // and ONLY on confirm is the .cs written (with that exact class name) and compiled. No more
-    // "NewScript.cs then rename" dance.
     bool openNewScriptPrompt;
     string newScriptName = "";
 
@@ -325,7 +270,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             gui.OpenPopup("##newscript");
         }
 
-        // Center the modal (ImGuiViewport has no GetCenter in this binding — compute it).
         gui.CenterNextWindowPos();
         PushPromptStyle();
         if (!gui.BeginPopupModalAutoResize("##newscript")) {
@@ -361,9 +305,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         PopPromptStyle();
     }
 
-    // Folder icon that reflects whether the folder has CONTENT: a filled (open) folder for non-empty,
-    // a plain (thinner-tinted) folder for empty — so an empty folder reads differently at a glance
-    // (the single icon made every folder look empty). Cached per path+mtime to avoid a disk hit/frame.
     (string icon, SysVec4 tint) FolderIcon(string folderPath) {
         bool hasContent = FolderHasContent(folderPath);
         SysVec4 full = new(0.95f, 0.78f, 0.42f, 1f);
@@ -379,11 +320,11 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         bool has = false;
         try {
             var abs = AssetDatabase.Project.ResolveAbsolute(folderPath);
-            // Any file (other than a lone .meta) or any subfolder = "has content".
             has = Directory.EnumerateDirectories(abs).Any() ||
                   Directory.EnumerateFiles(abs).Any(f => !f.EndsWith(".meta", StringComparison.OrdinalIgnoreCase));
         }
-        catch { /* folder vanished mid-frame */ }
+        catch {
+        }
         folderContentCache[folderPath] = has;
         return has;
     }
@@ -397,8 +338,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         return true;
     }
 
-    // Writes <className>.cs with that class name and compiles it (Unity parity: the user named it
-    // up front, so the file + class agree immediately — no template-rename round-trip).
     void CreateScriptNamed(string className) {
         var absolute = UniquePath(Path.Combine(
             AssetDatabase.Project.ResolveAbsolute(CurrentFolder), className + ".cs"));
@@ -418,13 +357,9 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.SameLine();
         DrawBreadcrumb();
 
-        // Right-aligned toolbar cluster (view toggle, refresh, type filter, search). Clamp the start X
-        // so a NARROW panel never pushes the search box off the right edge — it shrinks toward the
-        // breadcrumb instead of vanishing.
         float clusterW = 430 * s;
         float startX = MathF.Max(gui.CursorPosX + 8, gui.WindowWidth - clusterW);
         gui.SameLine(startX);
-        // Grid / list view toggle.
         if (EditorIcons.GhostButton("viewmode", listView ? EditorIcons.Grid : EditorIcons.More,
                 listView ? "Switch to grid view" : "Switch to list view", 30 * s))
             listView = !listView;
@@ -441,11 +376,8 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.InputTextWithHint("##filter", $"{EditorIcons.Search} Search (t:Material)...", ref filter, 128);
     }
 
-    // Set when navigation comes from OUTSIDE the tree (breadcrumb, back, tile double-click):
-    // the tree force-opens the target's ancestors that frame so the selection is always visible.
     bool revealPending;
 
-    // Navigates to an asset's folder and selects it (the inspector "reveal asset reference" jump).
     void RevealAsset(string assetPath) {
         if (string.IsNullOrEmpty(assetPath))
             return;
@@ -453,21 +385,17 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         string folder = slash > 0 ? assetPath[..slash] : "Assets";
         if (!string.Equals(folder, CurrentFolder, StringComparison.OrdinalIgnoreCase))
             NavigateTo(folder);
-        filter = ""; // clear any type filter so the asset is actually visible in its folder
+        filter = "";
         if (AssetDatabase.TryGetGuid(assetPath, out Guid guid))
             state.SelectAsset(assetPath, guid);
     }
 
     void NavigateTo(string folderPath) {
         CurrentFolder = folderPath;
-        folderContentCache.Clear(); // folder contents may have changed since last visit
+        folderContentCache.Clear();
         revealPending = true;
     }
 
-    // ---- Folder tree (left pane) ---------------------------------------------
-
-    // Favourites strip above the folder tree (Unity's left-pane Favorites): pinned folders for one-
-    // click navigation. Add via a folder's context menu ("Add to Favourites"); remove by right-click.
     void DrawFavorites() {
         List<string> favs = EditorPrefs.Current.FavoriteFolders;
         if (favs.Count == 0)
@@ -518,7 +446,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         DrawFolderNode("Assets");
         revealPending = false;
 
-        // Dropping on empty tree space moves assets to the root.
         SysVec2 rest = gui.ContentRegionAvail;
         if (rest.Y > 4) {
             gui.Dummy(rest);
@@ -528,7 +455,7 @@ internal sealed class AssetBrowserPanel : EditorWindow {
 
     void DrawFolderNode(string folderPath) {
         if (IsProtected(folderPath))
-            return;     // the read-only Default folder is hidden from the tree too
+            return;
 
         var absolute = AssetDatabase.Project.ResolveAbsolute(folderPath);
         string[] subDirs;
@@ -537,7 +464,7 @@ internal sealed class AssetBrowserPanel : EditorWindow {
                 .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase).ToArray();
         }
         catch {
-            return;     // folder vanished mid-frame (rename/delete); next frame redraws cleanly
+            return;
         }
 
         var name = folderPath == "Assets" ? "Assets" : folderPath[(folderPath.LastIndexOf('/') + 1)..];
@@ -553,12 +480,11 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         else if (isAncestor)
             if (revealPending) gui.SetNextItemOpenAlways(true); else gui.SetNextItemOpenOnce(true);
 
-        // Leading spaces leave room for the folder icon overlaid after the arrow.
         bool open = gui.TreeNodeEx($"      {name}##tn{folderPath}", flags);
         SysVec2 rowMin = gui.ItemRectMin;
 
         if (gui.IsItemClicked() && !gui.IsItemToggledOpen())
-            CurrentFolder = folderPath;     // already visible in the tree; no reveal needed
+            CurrentFolder = folderPath;
 
         AcceptAssetMoveDrop(folderPath);
 
@@ -576,7 +502,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         }
     }
 
-    // Vertical splitter between the tree and the grid; drag to resize, width persists.
     void DrawTreeSplitter(float s) {
         gui.SameLine(0, 0);
         gui.Input.InvisibleButton("##treesplitter", new SysVec2(6 * s, gui.ContentRegionAvail.Y));
@@ -596,8 +521,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.SameLine(0, 0);
     }
 
-    // Drop target that MOVES the dragged asset(s) into `targetFolder` (GUIDs survive — the .meta
-    // moves with each file, so scene/material references stay intact).
     void AcceptAssetMoveDrop(string targetFolder) {
         if (!gui.BeginDragDropTarget())
             return;
@@ -611,8 +534,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             MoveAssets(guids, targetFolder);
         }
 
-        // Dropping a HIERARCHY entity onto a folder turns it into a .prefab there (Unity's drag-to-create-
-        // prefab). The hierarchy ships the entity's instance-id hash as the payload; resolve it back.
         if (gui.AcceptDragDropPayloadInt("BALLISTIC_ENTITY") is { } hash) {
             Entity entity = FindEntityByHash(hash);
             if (entity is not null)
@@ -629,18 +550,12 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         return null;
     }
 
-    // Captures the entity subtree to a uniquely-named .prefab in `targetFolder` and links the LIVE scene
-    // entity to it (Entity.PrefabSource), so the hierarchy renders it as a prefab instance — then
-    // refreshes the browser so the new asset appears. Mirrors HierarchyPanel.CreatePrefab but binds the
-    // link: the import assigns the GUID, so we bind it in the post-refresh callback (runs on the main
-    // thread) once TryGetGuid resolves the freshly-imported path.
     void CreatePrefabFromEntity(Entity entity, string targetFolder) {
         if (AssetDatabase.Project is null) return;
         string baseName = string.IsNullOrEmpty(entity.Name) ? "Prefab" : entity.Name;
         string dir = AssetDatabase.Project.ResolveAbsolute(targetFolder);
         Directory.CreateDirectory(dir);
 
-        // Unique relative path (Name, Name 1, ...): targetFolder is already project-relative.
         string relPath = $"{targetFolder}/{baseName}.prefab";
         string abs = Path.Combine(dir, baseName + ".prefab");
         for (int i = 1; File.Exists(abs); i++) {
@@ -652,7 +567,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             File.WriteAllText(abs, PrefabAsset.FromEntity(entity).ToYaml());
             EditorUndo.Push("Create Prefab");
             AsyncAssetImport.Request("Creating prefab...", onFinished: () => {
-                // The import stamped a .meta GUID; link the live entity so it becomes a prefab instance.
                 if (AssetDatabase.TryGetGuid(relPath, out Guid guid)) {
                     entity.PrefabSource = guid;
                     state.MarkViewportDirty();
@@ -673,13 +587,12 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         var moved = 0;
         foreach (Guid guid in guids) {
             var assetPath = AssetDatabase.GuidToAssetPath(guid);
-            if (assetPath is null || IsProtected(assetPath))   // can't move a read-only Default asset
-                continue;
+            if (assetPath is null || IsProtected(assetPath)) continue;
 
             var sourceAbsolute = AssetDatabase.Project.ResolveAbsolute(assetPath);
             var destination = Path.Combine(targetAbsolute, Path.GetFileName(sourceAbsolute));
             if (string.Equals(sourceAbsolute, destination, StringComparison.OrdinalIgnoreCase))
-                continue;   // dropped on the folder it's already in
+                continue;
             if (File.Exists(destination)) {
                 Debugging.LogWarning($"Move: '{Path.GetFileName(destination)}' already exists in {targetFolder}; skipped.");
                 continue;
@@ -705,10 +618,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             onFinished: thumbnails.InvalidateAll);
     }
 
-    // Deletes a folder recursively, then re-anchors the browser if the view was inside it. Without the
-    // re-anchor, CurrentFolder would point at a now-missing directory and the grid pane would enumerate
-    // a deleted path every frame; the delete is also wrapped (Windows locks open folders — Rider, an
-    // open Explorer — so it can legitimately throw and must not corrupt the ImGui frame).
     void DeleteFolder(string folderPath) {
         try {
             Directory.Delete(AssetDatabase.Project.ResolveAbsolute(folderPath), recursive: true);
@@ -717,7 +626,7 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             Debugging.LogError($"Could not delete folder '{folderPath}': {e.Message}");
             return;
         }
-        // If we were viewing the deleted folder (or anything under it), drop back to its parent.
+
         bool inside = string.Equals(CurrentFolder, folderPath, StringComparison.OrdinalIgnoreCase) ||
                       CurrentFolder.StartsWith(folderPath + "/", StringComparison.OrdinalIgnoreCase);
         if (inside) {
@@ -728,7 +637,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         AsyncAssetImport.Request("Updating assets...", onFinished: thumbnails.InvalidateAll);
     }
 
-    // Clickable path: each segment jumps to that folder. "Assets > Default > Sky".
     void DrawBreadcrumb() {
         var segments = CurrentFolder.Split('/');
         gui.PushColor(EditorStyleColor.Button, new SysVec4(0, 0, 0, 0));
@@ -758,13 +666,11 @@ internal sealed class AssetBrowserPanel : EditorWindow {
 
     float tileScale = 1f;
     bool gridHovered;
-    bool listView;             // false = tile grid (default), true = sortable detail rows
-    int sortColumn;            // 0 name, 1 type, 2 size, 3 modified
+    bool listView;
+    int sortColumn;
     bool sortAscending = true;
 
     void DrawGrid(List<string> folders, List<(string path, Guid guid)> files, float s) {
-        // Ctrl+scroll over the grid resizes the tiles (uses last frame's hover state).
-        
         if (gridHovered && gui.KeyCtrl && gui.Input.MouseWheel != 0)
             tileScale = Math.Clamp(tileScale + gui.Input.MouseWheel * 0.12f, 0.55f, 2.4f);
 
@@ -797,15 +703,11 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         if (folders.Count == 0 && files.Count == 0)
             DrawEmptyState(s);
 
-        // Click empty space (left button) clears the selection, Windows-Explorer style.
         if (gridHovered && gui.IsMouseClicked(0) &&
             !gui.IsAnyItemHovered() && renamingPath is null)
             state.ClearAssetSelection();
 
-        // Right-click empty space: creation + folder actions.
         if (gui.BeginPopupContextWindowEmpty("##gridctx")) {
-            // Paste into the current folder (empty-space right-click), enabled only when something
-            // was copied/cut.
             if (gui.MenuItem($"{EditorIcons.Add}  Paste", "Ctrl+V", false, ClipboardHasContent))
                 ClipboardPaste();
             gui.Separator();
@@ -840,14 +742,12 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             gui.EndPopup();
         }
 
-        // Selection keyboard ops while the grid has focus and no rename is active.
         if (gui.IsWindowFocusedIncludingChildren() && renamingPath is null &&
             !gui.WantTextInput) {
             if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.A) && visibleFiles.Count > 0)
                 state.SelectAssets(visibleFiles, visibleFiles[^1]);
             if (gui.KeyPressed(EditorGuiKey.Delete) && state.SelectedAssets.Count > 0)
                 AssetOps.DeleteAssets(state, state.SelectedAssets, thumbnails.InvalidateAll);
-            // Explorer-style clipboard: Ctrl+C copy, Ctrl+X cut, Ctrl+V paste, Ctrl+D duplicate.
             if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.C) && state.SelectedAssets.Count > 0) ClipboardCopy(cut: false);
             if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.X) && state.SelectedAssets.Count > 0) ClipboardCopy(cut: true);
             if (gui.KeyCtrl && gui.KeyPressed(EditorGuiKey.V) && ClipboardHasContent) ClipboardPaste();
@@ -857,8 +757,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.EndChild();
     }
 
-    // Detail list view: a sortable table (Name / Type / Size / Modified). Folders sort first; rows
-    // reuse the same click/drag/context/double-click handlers as the grid tiles.
     void DrawList(List<string> folders, List<(string path, Guid guid)> files, float s) {
         const EditorTableFlags flags = EditorTableFlags.Sortable | EditorTableFlags.Resizable |
             EditorTableFlags.RowBg | EditorTableFlags.ScrollY | EditorTableFlags.BordersInnerV |
@@ -874,13 +772,11 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.TableSetupColumn("Modified", EditorColumnFlags.WidthStretch, 1.5f);
         gui.TableHeadersRow();
 
-        // Read the requested sort from the table specs.
         if (gui.TableGetSortSpec(out int sc, out bool asc)) {
             sortColumn = sc;
             sortAscending = asc;
         }
 
-        // Build rows (folders first, then files), enrich with FileInfo, then sort.
         var rows = new List<(string path, Guid guid, bool isFolder, long size, DateTime modified)>();
         foreach (var folder in folders)
             rows.Add((folder, Guid.Empty, true, -1, DirModified(folder)));
@@ -935,7 +831,7 @@ internal sealed class AssetBrowserPanel : EditorWindow {
 
     void SortRows(List<(string path, Guid guid, bool isFolder, long size, DateTime modified)> rows) {
         rows.Sort((a, b) => {
-            if (a.isFolder != b.isFolder) return a.isFolder ? -1 : 1; // folders always first
+            if (a.isFolder != b.isFolder) return a.isFolder ? -1 : 1;
             int c = sortColumn switch {
                 1 => string.Compare(Path.GetExtension(a.path), Path.GetExtension(b.path), StringComparison.OrdinalIgnoreCase),
                 2 => a.size.CompareTo(b.size),
@@ -998,9 +894,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         renameFocusPending = true;
     }
 
-    // Draws the inline rename field for `path` if it's the one being renamed; returns true if it
-    // consumed the tile (so the caller skips its normal label). Commits on Enter/focus-loss via
-    // Directory.Move / File.Move (+ the sidecar .meta), then triggers a refresh.
     bool DrawRenameField(string path, float tile, bool isFolder) {
         if (renamingPath != path)
             return false;
@@ -1021,9 +914,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
     void CommitRename(string path, string newName, bool isFolder) {
         var oldAbsolute = AssetDatabase.Project.ResolveAbsolute(path);
         var parent = Path.GetDirectoryName(oldAbsolute)!;
-        // Preserve the original file extension when the user omits it (the rename field is seeded WITH
-        // the extension, but clearing it and typing a bare name would otherwise strip the extension and
-        // break the asset — e.g. "Player.cs" -> "Enemy" with no type). Unity keeps the extension too.
         if (!isFolder) {
             string oldExt = Path.GetExtension(oldAbsolute);
             if (oldExt.Length > 0 && Path.GetExtension(newName).Length == 0)
@@ -1053,8 +943,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             return;
         }
 
-        // Renamed scripts: keep an untouched template's class name in sync with the file name,
-        // then recompile so the registry (Add Component menu, scene loads) sees the new type.
         if (!isFolder && Path.GetExtension(newAbsolute).Equals(".cs", StringComparison.OrdinalIgnoreCase)) {
             ScriptTemplates.RewriteIfPristine(
                 Path.GetFileNameWithoutExtension(oldAbsolute),
@@ -1071,10 +959,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         Directory.CreateDirectory(absolute);
     }
 
-    // Creates a Behaviour script from the template and compiles it in right away (rebuild runs
-    // BEFORE the async refresh — RebuildScripts no-ops while an import is in flight). Rename the
-    // tile afterwards: while the content is still the untouched template, the class name follows
-    // the file name (see CommitRename).
     void CreateScript() {
         var absolute = UniquePath(Path.Combine(
             AssetDatabase.Project.ResolveAbsolute(CurrentFolder), "NewScript.cs"));
@@ -1099,8 +983,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         AsyncAssetImport.Request("Creating scene...");
     }
 
-    // A fresh .terrain is flat: empty "heights" blob -> the importer expands it to an all-zero field.
-    // Defaults match TerrainDefinition (256^2 grid, 100x100 world units, height scale 20).
     void CreateTerrain() {
         var absolute = UniquePath(Path.Combine(
             AssetDatabase.Project.ResolveAbsolute(CurrentFolder), "New Terrain.terrain"));
@@ -1109,16 +991,12 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         AsyncAssetImport.Request("Creating terrain...");
     }
 
-    // Create-menu entries for every [CreateDataAsset] type (the engine's ScriptableObject equivalent),
-    // grouped under their declared Menu path. Each makes a fresh instance, serializes it, and writes a
-    // .asset next to the current folder. Empty when no game DataAssets are defined.
     void DrawDataAssetCreateMenu() {
         var entries = ComponentRegistry.DataAssetMenu;
         if (entries.Count == 0)
             return;
         gui.Separator();
         foreach (ComponentEntry entry in entries) {
-            // A non-empty Menu nests the item under that submenu; otherwise it's top-level.
             if (string.IsNullOrEmpty(entry.Menu)) {
                 if (gui.MenuItem($"{EditorIcons.Settings}  {entry.DisplayName}"))
                     CreateDataAsset(entry.Type);
@@ -1136,10 +1014,9 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         if (instance is null)
             return;
 
-        // Name it first (Unity parity), defaulting to the [CreateDataAsset] file name / type name.
         var attr = type.GetCustomAttribute<CreateDataAssetAttribute>();
         string fileName = string.IsNullOrEmpty(attr?.FileName) ? type.Name : attr.FileName;
-        string serialized = DataAssetSerializer.Serialize(instance);   // captured for the factory
+        string serialized = DataAssetSerializer.Serialize(instance);
         PromptNewAsset(attr?.DisplayName ?? type.Name, fileName, ".asset", _ => serialized);
     }
 
@@ -1162,9 +1039,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             select ? $"/select,\"{absolutePath}\"" : $"\"{absolutePath}\"");
     }
 
-    // Opens a script with full project context: the IDE gets Scripts.csproj FIRST (engine
-    // references, IntelliSense), then the file itself so it lands focused in that instance —
-    // shell-opening a lone .cs gives a project-less buffer with no completion against the APm.
     static void OpenScript(string path) {
         OpenCSharpProject();
         OpenInDefaultEditor(path);
@@ -1181,7 +1055,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         }
     }
 
-    // Opens the file in whatever the OS associates with it (Rider/VS/VS Code for .cs).
     static void OpenInDefaultEditor(string path) {
         var absolute = AssetDatabase.Project.ResolveAbsolute(path);
         try {
@@ -1215,15 +1088,12 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.PopColor(3);
         gui.PopStyleVar();
 
-        // Full vs empty folder reads at a glance: an open, bright folder when it has content; a plain,
-        // dimmer folder when empty (FolderIcon decides from the folder's contents, cached per mtime).
         (string fIcon, SysVec4 fTint) = FolderIcon(folderPath);
         DrawFolderGlyph(gui.ItemRectMin, gui.ItemRectMax, fIcon, fTint);
 
         if (gui.IsItemHovered() && gui.IsMouseDoubleClicked(0))
             NavigateTo(folderPath);
 
-        // Dropping assets on a folder tile moves them into it (same as the tree).
         AcceptAssetMoveDrop(folderPath);
 
         if (gui.BeginPopupContextItem("##folderctx")) {
@@ -1259,14 +1129,10 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.BeginGroup();
         gui.PushFrameRounding(6f);
 
-        // A tile that's been CUT (Ctrl+X, awaiting paste) dims so you can tell it's "in the clipboard
-        // to move" — Explorer/Unity behaviour. Popped at the end of the group.
         bool cutGhost = clipboardCut && clipboardPaths.Contains(path);
         if (cutGhost)
             gui.PushAlphaScaled(0.45f);
 
-        // Images and meshes render a real preview; everything else gets a dark tile with a big
-        // type icon tinted by category (+ the short tag below it).
         bool clicked;
         var hasPreview = ImageExtensions.Contains(ext) ||
                          ext is ".fbx" or ".obj" or ".gltf" or ".glb" or ".dae" or ".mat";
@@ -1278,8 +1144,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             gui.PushColor(EditorStyleColor.Button, new SysVec4(color.X, color.Y, color.Z, 0.55f));
             gui.PushColor(EditorStyleColor.ButtonHovered, new SysVec4(color.X, color.Y, color.Z, 0.75f));
             gui.PushColor(EditorStyleColor.ButtonActive, new SysVec4(color.X, color.Y, color.Z, 0.95f));
-            // Button fires on RELEASE, so starting a drag does NOT change the selection —
-            // you can drag an asset onto an Inspector slot without losing what's inspected.
             clicked = gui.Button("##typetile", new SysVec2(tile, tile));
             gui.PopColor(3);
             DrawTypeGlyph(gui.ItemRectMin, gui.ItemRectMax, ext, tag);
@@ -1296,7 +1160,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
                 6f, active ? 2.5f : 2f);
         }
 
-        // Extension badge over preview thumbnails (type tiles already show the tag).
         if (thumb != 0 && tile > 64)
             DrawExtensionBadge(tileMin, tileMax, tag, color);
 
@@ -1321,7 +1184,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.PopId();
     }
 
-    // Double-click action shared by grid tiles and list rows: open folders/scenes/scripts/prefabs.
     void OpenAsset(string path, string ext) {
         switch (ext) {
             case ".scene": LoadScene(path); break;
@@ -1330,7 +1192,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         }
     }
 
-    // Explorer-style selection: plain click = single, Ctrl = toggle, Shift = range from anchor.
     void HandleTileClick(string path, Guid guid, int index) {
         
 
@@ -1357,7 +1218,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         if (!gui.BeginPopupContextItem("##assetctx"))
             return;
 
-        // Right-clicking outside the current selection re-targets it (Explorer behavior).
         if (!state.IsAssetSelected(guid)) {
             state.SelectAsset(path, guid);
             anchorGuid = guid;
@@ -1407,10 +1267,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         gui.EndPopup();
     }
 
-    // ---- Asset clipboard (copy / cut / paste files in the browser) -----------------------------
-    // Holds project-relative asset paths + whether this is a MOVE (cut). Paste copies each into the
-    // current folder with a unique name and imports; a cut deletes the originals after a successful
-    // paste. Separate from the OS text clipboard (which only ever holds path strings).
     static readonly List<string> clipboardPaths = new();
     static bool clipboardCut;
 
@@ -1419,7 +1275,7 @@ internal sealed class AssetBrowserPanel : EditorWindow {
     void ClipboardCopy(bool cut) {
         clipboardPaths.Clear();
         foreach (var (p, _) in state.SelectedAssets) {
-            if (cut && IsProtected(p)) continue;   // a read-only Default asset can't be cut (moved away)
+            if (cut && IsProtected(p)) continue;
             clipboardPaths.Add(p);
         }
         clipboardCut = cut;
@@ -1440,12 +1296,11 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             try {
                 if (clipboardCut) {
                     File.Move(srcAbs, destAbs);
-                    // Move the .meta too so the GUID (and all references) survive the move.
                     string srcMeta = srcAbs + ".meta";
                     if (File.Exists(srcMeta)) File.Move(srcMeta, destAbs + ".meta");
                 }
                 else {
-                    File.Copy(srcAbs, destAbs);   // a COPY gets a fresh GUID on import (no .meta carried)
+                    File.Copy(srcAbs, destAbs);
                 }
                 pasted = true;
             }
@@ -1458,8 +1313,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
     }
 
     static void TileLabel(string name, float tile) {
-        // Hard-clipped to the tile width via the draw list (text can never spill into the
-        // neighboring cell); short names are centered.
         SysVec2 pos = gui.CursorScreenPos;
         float height = gui.TextLineHeight;
         SysVec2 textSize = gui.CalcTextSize(name);
@@ -1470,10 +1323,9 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         draw.AddText(new SysVec2(x, pos.Y), gui.ColorU32(gui.StyleColor(EditorStyleColor.Text)), name);
         draw.PopClipRect();
 
-        gui.Dummy(new SysVec2(tile, height)); // reserve exactly the tile's width
+        gui.Dummy(new SysVec2(tile, height));
     }
 
-    // Folder icon glyph centered on the tile (crisp: baked large in the icon atlas).
     static unsafe void DrawFolderGlyph(SysVec2 min, SysVec2 max, string icon, SysVec4 tint) {
         IEditorDrawList draw = gui.WindowDrawList;
         SysVec2 size = max - min;
@@ -1486,14 +1338,12 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             return;
         }
 
-        // Fallback: a simple drawn folder (tab + body), dimmed to the tint's alpha for empty folders.
         var bodyColor = gui.ColorU32(new SysVec4(0.78f, 0.63f, 0.27f, tint.W));
         var tabColor = gui.ColorU32(new SysVec4(0.88f, 0.74f, 0.38f, tint.W));
         draw.AddRectFilled(min + size * new SysVec2(0.18f, 0.24f), min + size * new SysVec2(0.48f, 0.36f), tabColor, 3f);
         draw.AddRectFilled(min + size * new SysVec2(0.18f, 0.32f), min + size * new SysVec2(0.82f, 0.78f), bodyColor, 3f);
     }
 
-    // Big type icon + small tag text for assets without a real preview.
     static unsafe void DrawTypeGlyph(SysVec2 min, SysVec2 max, string ext, string tag) {
         IEditorDrawList draw = gui.WindowDrawList;
         SysVec2 size = max - min;
@@ -1511,7 +1361,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
             gui.ColorU32(new SysVec4(1, 1, 1, 0.55f)), tag);
     }
 
-    // Small rounded extension chip in the thumbnail's bottom-left corner.
     static void DrawExtensionBadge(SysVec2 min, SysVec2 max, string tag, SysVec4 color) {
         IEditorDrawList draw = gui.WindowDrawList;
         SysVec2 textSize = gui.CalcTextSize(tag);
@@ -1524,9 +1373,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         draw.AddText(badgeMin + pad, gui.ColorU32(new SysVec4(1, 1, 1, 0.92f)), tag);
     }
 
-    // Per-extension type taxonomy: the (tag, tint) for an asset's type tile/badge. This is a self-
-    // contained DATA TABLE (one deliberate hue per file category, not editor chrome) so it stays here
-    // rather than in EditorTheme — the EF5b "bypass offenders" were status/surface colors, not this map.
     static (string, SysVec4) Style(string ext) => ext switch {
         ".fbx" or ".obj" or ".gltf" or ".glb" => ("MESH", new SysVec4(0.20f, 0.30f, 0.42f, 1f)),
         ".png" or ".jpg" or ".jpeg" or ".tga" or ".bmp" => ("TEX", new SysVec4(0.18f, 0.34f, 0.25f, 1f)),
@@ -1542,8 +1388,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
         _ => ("FILE", new SysVec4(0.25f, 0.25f, 0.27f, 1f)),
     };
 
-    // Drag source: a tile inside the multi-selection drags the WHOLE selection
-    // (';'-joined GUIDs — single-asset targets take the first).
     unsafe void BeginAssetDragSource(string fileName, Guid guid) {
         if (!gui.BeginDragDropSource())
             return;
@@ -1561,7 +1405,6 @@ internal sealed class AssetBrowserPanel : EditorWindow {
 
     static void LoadScene(string assetPath) => SceneCommands.Open(assetPath);
 
-    // Double-click a .prefab → instantiate it into the current scene and select the root.
     void InstantiatePrefab(string assetPath) {
         PrefabAsset prefab = AssetDatabase.Load<PrefabAsset>(assetPath);
         if (prefab is null)

@@ -4,11 +4,6 @@ using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal render <scene>` — render a scene to images by driving the headless player (deterministic
-// paused captures: BALLISTIC_SCENE + BALLISTIC_SCREENSHOT + BALLISTIC_DETERMINISTIC). One shot of
-// the serialized camera by default; `--orbit N` captures N viewpoints on a circle around --center
-// (camera scene copies go to Library/Temp, never into Assets). Multi-view is the cheap fix for
-// single-viewpoint spatial reasoning: an agent judging a layout looks at 4-8 angles, not one.
 internal sealed class RenderCommand : ICommand {
     public string Name => "render";
     public string Summary => "Render a scene to BMP(s) headlessly; --orbit N for multi-view.";
@@ -65,9 +60,6 @@ internal sealed class RenderCommand : ICommand {
 
         var shots = new List<object>();
         if (eye is { } eyePos) {
-            // EXACT-POSE capture: place the camera at --eye looking at --look (or the scene center).
-            // The cheap way to reproduce a user's free-fly viewpoint headlessly — paused captures of
-            // the serialized camera couldn't hit the angles where view-dependent artifacts show.
             SceneFile.BuildRegistry(sceneAbs);
             SceneDocument doc = SceneFile.Load(sceneAbs);
             EntityDocument cam = (doc.Entities ?? [])
@@ -95,8 +87,6 @@ internal sealed class RenderCommand : ICommand {
             shots.Add(ShotInfo(outPath, null, idmap));
         }
         else {
-            // Orbit: rewrite the scene camera per angle into Library/Temp (asset refs are
-            // project-relative, so a scene loads from anywhere inside the project).
             SceneFile.BuildRegistry(sceneAbs);
             SceneDocument doc = SceneFile.Load(sceneAbs);
             EntityDocument camera = (doc.Entities ?? [])
@@ -135,8 +125,6 @@ internal sealed class RenderCommand : ICommand {
         return 0;
     }
 
-    // Engine camera convention (Transform.EulerAngles -> FromEulerAngles(pitch, yaw, 0)):
-    // forward = (cos p sin y, -sin p, cos p cos y), so pitch = -asin(f.Y), yaw = atan2(f.X, f.Z).
     static Quaternion LookAt(Vector3 eye, Vector3 target) {
         Vector3 f = Vector3.Normalize(target - eye);
         float pitch = -MathF.Asin(Math.Clamp(f.Y, -1f, 1f));
@@ -167,9 +155,6 @@ internal sealed class RenderCommand : ICommand {
         Console.Error.WriteLine($"  rendering {Path.GetFileName(outPath)} ({sceneRel})...");
         using Process process = Process.Start(psi)!;
         string stderr = process.StandardError.ReadToEnd();
-        // Mirror the player's stdout to OUR stderr (stdout carries the command JSON). The player's
-        // [PerfStats] / [Lumen] / [DX12] diagnostics are the agent's window into the headless render — without
-        // this they were silently discarded, so a `bal render` run could not surface GI substrate counts etc.
         string stdout = process.StandardOutput.ReadToEnd();
         if (stdout.Length > 0)
             Console.Error.Write(stdout);
@@ -191,9 +176,6 @@ internal sealed class RenderCommand : ICommand {
         angleDegrees,
     };
 
-    // The player exe sits in the engine repo's build tree. BALLISTIC_ENGINE_ROOT overrides; the
-    // default walks up from bal.exe to the repo root (BallisticEngine.slnx marker) and prefers
-    // the same configuration bal itself was built with.
     static string FindPlayerExe() {
         string? engineRoot = Environment.GetEnvironmentVariable("BALLISTIC_ENGINE_ROOT");
         if (engineRoot is null) {

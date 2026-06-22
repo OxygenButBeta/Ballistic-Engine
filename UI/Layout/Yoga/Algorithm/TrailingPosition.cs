@@ -1,15 +1,7 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// This source code is licensed under the MIT license found in the
-// LICENSE file in the root directory of this source tree.
-
 namespace Facebook.Yoga
 {
     public static class TrailingPosition
     {
-        // Given an offset to an edge, returns the offset to the opposite edge on the
-        // same axis. This assumes that the width/height of both nodes is determined at
-        // this point.
         public static float GetPositionOfOppositeEdge(
             float position,
             FlexDirection axis,

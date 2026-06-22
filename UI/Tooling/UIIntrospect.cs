@@ -2,15 +2,8 @@ using System.Text;
 
 namespace BallisticEngine.UI;
 
-// Headless UI introspection (P8.2/P8.3) — serialize a laid-out VisualElement tree to JSON: per element
-// its type, name, classes, resolved box, and the key resolved-style values. This is the AI-native "or
-// BETTER" edge: an agent can read a UI's structure + computed style + layout the same way `bal scene`
-// reads a scene, instead of eyeballing pixels. Backs both `bal ui dump` and the in-editor UI debugger.
-//
-// Pure (BCL only, no GPU): call after a layout solve so ResolvedRect is valid.
 public static class UIIntrospect
 {
-    // Serialize the tree rooted at `el` to a JSON string. `includeStyle` adds the resolved-style block.
     public static string ToJson(VisualElement el, bool includeStyle = true)
     {
         var sb = new StringBuilder(4096);
@@ -37,7 +30,6 @@ public static class UIIntrospect
         sb.Append(",\"picking\":").Append(el.PickingEnabled ? "true" : "false");
         if (el.Focusable) sb.Append(",\"focusable\":true");
 
-        // Accessibility (P9.2): role + label, so the JSON IS a semantic tree (screen-reader / automation).
         if (!string.IsNullOrEmpty(el.Role)) { sb.Append(",\"role\":"); Json(sb, el.Role); }
         string a11yLabel = el.AccessibleLabel ?? (el is Label lbl ? lbl.Text : null);
         if (!string.IsNullOrEmpty(a11yLabel)) { sb.Append(",\"label\":"); Json(sb, a11yLabel); }
@@ -72,8 +64,6 @@ public static class UIIntrospect
         sb.Append('}');
     }
 
-    // Find the deepest element at a logical point (for the debugger's "pick" tool). Mirrors hit-test but
-    // ignores PickingEnabled so you can inspect overlays too.
     public static VisualElement Pick(VisualElement root, Vector2 p)
     {
         if (root == null || !root.ResolvedRect.Contains(p)) return null;
@@ -86,7 +76,6 @@ public static class UIIntrospect
         return root;
     }
 
-    // A flat one-line summary per element (for `bal ui dump --flat` / quick logs).
     public static string ToTreeText(VisualElement el)
     {
         var sb = new StringBuilder();
@@ -105,7 +94,6 @@ public static class UIIntrospect
         foreach (var k in el.Children) Tree(sb, k, depth + 1);
     }
 
-    // --- tiny JSON writers (no dependency) ---
     static void Str(StringBuilder sb, string k, string v) { sb.Append('"').Append(k).Append("\":"); Json(sb, v); }
     static void Num(StringBuilder sb, string k, float v) { sb.Append('"').Append(k).Append("\":").Append(v.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)); }
     static void Col(StringBuilder sb, string k, Color c)

@@ -1,27 +1,13 @@
-using System.Numerics;
 using BallisticEngine.DX12;
 
 namespace BallisticEngine.Editor;
 
-// A live "Render Pass Toggles" debug window: flip the DX12 renderer's per-pass on/off without restarting
-// with BALLISTIC_DX12_* env vars. Two kinds of toggle, exactly mirroring how each pass is gated in the engine:
-//   - DOOR-gated passes (Shadows/IBL/Sky/SSAO/Bloom/AerialPerspective/Volume-bridge) → renderer.SetDoor(...);
-//     the renderer copies its Doors struct into the next frame's context, so the change takes effect next frame.
-//   - POSTFX/Volume-gated passes (Fog/SSR) → flip the renderer's live PostFX flags (the same object the
-//     Volume framework writes every frame). These were already live; this window just gives them a checkbox too.
-// Diagnostic only — nothing here is serialized; it resets to the env-resolved doors on relaunch.
-//
-// Phase-6 EditorWindow: was a fully-static singleton (static open/Toggle/Draw + a hand-wired [MenuItem] +
-// two Draw() call sites). Now it's an ordinary EditorWindow discovered through [EditorWindowMeta] — the
-// SAME path a user-authored window takes — so the menu entry, the toggle, and the draw are all automatic
-// (UserEditorWindowRegistry). A built-in window eating its own dogfood.
-[EditorWindowMeta("Render Pass Toggles", "Window/Render Pass Toggles", order: 26, Width = 300, Height = 360)]
+[EditorWindowMeta("Render Pass Debug", "Window/Render Pass Debug", order: 26, Width = 340, Height = 560)]
 internal sealed class RenderPassTogglesWindow : EditorWindow {
     public RenderPassTogglesWindow() {
-        NoCollapse = true;   // identity/title/size come from the attribute via ConfigureFromMeta
+        NoCollapse = true;
     }
 
-    // The live DX12 renderer, or null when the active backend isn't DX12 (then the window shows a notice).
     static DX12HDRenderer Renderer =>
         RenderAsset.Current?.Renderer as DX12HDRenderer;
 
@@ -32,38 +18,110 @@ internal sealed class RenderPassTogglesWindow : EditorWindow {
             return;
         }
 
-        gui.TextDisabled("Door-gated passes (live)");
-        gui.Separator();
-        Dx12RenderDoors d = r.Doors;
-        DoorRow(gui, r, "Shadows", "Shadows", d.Shadows);
-        DoorRow(gui, r, "IBL (irradiance / prefilter ambient)", "Ibl", d.Ibl);
-        DoorRow(gui, r, "Sky", "Sky", d.Sky);
-        DoorRow(gui, r, "SSAO", "Ssao", d.Ssao);
-        DoorRow(gui, r, "Bloom", "Bloom", d.Bloom);
-        DoorRow(gui, r, "Aerial Perspective (haze)", "AerialPersp", d.AerialPersp);
-        DoorRow(gui, r, "Volume -> PostFX bridge", "Volumes", d.Volumes);
-
-        gui.Spacing();
-        gui.TextDisabled("PostFX / volume-gated passes (live)");
-        gui.Separator();
         var pfx = r.PostFX;
-        bool fog = pfx.VolumetricEnabled;
-        if (gui.Checkbox("Volumetric Fog", ref fog)) pfx.VolumetricEnabled = fog;
-        bool ssr = pfx.SsrEnabled;
-        if (gui.Checkbox("SSR / Reflections", ref ssr)) {
-            pfx.SsrEnabled = ssr;
-            pfx.ReflectionMode = ssr && pfx.ReflectionMode == ReflectionMode.Off ? ReflectionMode.ScreenSpace
-                               : ssr ? pfx.ReflectionMode : ReflectionMode.Off;
+        Dx12RenderDoors d = r.Doors;
+
+        if (gui.Button("All On")) SetAll(r, pfx, true);
+        gui.SameLine();
+        if (gui.Button("Minimal Base")) SetAll(r, pfx, false);
+        if (d.Minimal) {
+            gui.SameLine();
+            gui.TextDisabled("(launched MINIMAL=1)");
+        }
+        gui.Spacing();
+
+        if (gui.CollapsingHeader("Lighting / Ambient", defaultOpen: true)) {
+            DoorRow(gui, r, "IBL (irradiance / prefilter ambient)", "Ibl", d.Ibl);
+            DoorRow(gui, r, "SSAO (GTAO)", "Ssao", d.Ssao);
+            if (d.Ssao) {
+                gui.Indent();
+                PostBool(gui, "  SSAO enabled (volume flag)", () => pfx.SSAOEnabled, v => pfx.SSAOEnabled = v);
+                gui.Unindent();
+            }
         }
 
-        if (d.Minimal) {
-            gui.Spacing();
-            gui.TextDisabled("(launched with BALLISTIC_DX12_MINIMAL=1)");
+        if (gui.CollapsingHeader("Shadows / GI / Reflections", defaultOpen: true)) {
+            DoorRow(gui, r, "Shadows (sun cascades)", "Shadows", d.Shadows);
+
+            PostBool(gui, "Global Illumination (DDGI)", () => pfx.DdgiEnabled, v => pfx.DdgiEnabled = v);
+            if (pfx.DdgiEnabled) {
+                gui.Indent();
+                PostBool(gui, "  Multi-bounce", () => pfx.DdgiMultiBounce, v => pfx.DdgiMultiBounce = v);
+                PostBool(gui, "  Visibility (leak reject)", () => pfx.DdgiVisibility, v => pfx.DdgiVisibility = v);
+                PostBool(gui, "  GI-driven reflections", () => pfx.DdgiReflections, v => pfx.DdgiReflections = v);
+                gui.Unindent();
+            }
+
+            bool refl = pfx.SsrEnabled && pfx.ReflectionMode != ReflectionMode.Off;
+            if (gui.Checkbox("Reflections (SSR / RT)", ref refl)) {
+                pfx.SsrEnabled = refl;
+                pfx.ReflectionMode = refl
+                    ? (pfx.ReflectionMode == ReflectionMode.Off ? ReflectionMode.ScreenSpace : pfx.ReflectionMode)
+                    : ReflectionMode.Off;
+            }
+            if (refl) {
+                gui.Indent();
+                int mode = (int)pfx.ReflectionMode;
+                gui.SetNextItemWidth(-1);
+                if (gui.Combo("  Mode", ref mode, new[] { "Screen-Space", "Ray-Traced", "Off" }))
+                    pfx.ReflectionMode = (ReflectionMode)mode;
+                gui.Unindent();
+            }
+        }
+
+        if (gui.CollapsingHeader("Atmosphere / Sky / Fog", defaultOpen: true)) {
+            DoorRow(gui, r, "Sky (procedural / skybox)", "Sky", d.Sky);
+
+            DoorRow(gui, r, "Aerial Perspective (pass door)", "AerialPersp", d.AerialPersp);
+            if (d.AerialPersp) {
+                gui.Indent();
+                PostBool(gui, "  AP enabled (volume flag)",
+                    () => pfx.AerialPerspectiveEnabled, v => pfx.AerialPerspectiveEnabled = v);
+                gui.Unindent();
+            }
+
+            PostBool(gui, "Volumetric Fog", () => pfx.VolumetricEnabled, v => pfx.VolumetricEnabled = v);
+            DoorRow(gui, r, "  God-ray shafts (force)", "Shafts", d.Shafts);
+            DoorRow(gui, r, "  Dust motes (force)", "Dust", d.Dust);
+        }
+
+        if (gui.CollapsingHeader("Post-Processing", defaultOpen: true)) {
+            DoorRow(gui, r, "Bloom", "Bloom", d.Bloom);
+            PostBool(gui, "TAA (temporal AA)", () => pfx.TaaEnabled, v => pfx.TaaEnabled = v);
+            DoorRow(gui, r, "Volume -> PostFX bridge", "Volumes", d.Volumes);
+            if (!d.Volumes)
+                gui.TextDisabled("  (bridge off: volume profiles won't drive PostFX)");
         }
     }
 
     static void DoorRow(IEditorGui gui, DX12HDRenderer r, string label, string door, bool value) {
         bool v = value;
         if (gui.Checkbox(label, ref v)) r.SetDoor(door, v);
+    }
+
+    static void PostBool(IEditorGui gui, string label, System.Func<bool> get, System.Action<bool> set) {
+        bool v = get();
+        if (gui.Checkbox(label, ref v)) set(v);
+    }
+
+    static void SetAll(DX12HDRenderer r, PostProcessSettings pfx, bool on) {
+        r.SetDoor("Shadows", on);
+        r.SetDoor("Ibl", on);
+        r.SetDoor("Sky", on);
+        r.SetDoor("Ssao", on);
+        r.SetDoor("Bloom", on);
+        r.SetDoor("AerialPersp", on);
+        r.SetDoor("Volumes", on);
+        r.SetDoor("Shafts", on);
+        r.SetDoor("Dust", on);
+        pfx.SSAOEnabled = on;
+        pfx.DdgiEnabled = on;
+        pfx.TaaEnabled = on;
+        pfx.VolumetricEnabled = on;
+        pfx.AerialPerspectiveEnabled = on;
+        pfx.SsrEnabled = on;
+        pfx.ReflectionMode = on
+            ? (pfx.ReflectionMode == ReflectionMode.Off ? ReflectionMode.ScreenSpace : pfx.ReflectionMode)
+            : ReflectionMode.Off;
     }
 }

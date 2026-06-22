@@ -1,59 +1,41 @@
 using System.Diagnostics;
-using System.Numerics;
 using BallisticEngine.AssetPipeline;
 
 namespace BallisticEngine.Editor;
 
-// Build window (Window > Build) — Unity-style "Build Settings" + "Player Settings" in one panel:
-//   • Player Settings  — product/company/version, icon, window mode + resolution (baked into the exe)
-//   • Scenes In Build  — ordered list (first = startup scene)
-//   • Output           — folder, self-contained toggle, configuration + target RID
-//   • Build            — runs BuildPipeline on a worker thread behind a live log; optional run-after
-//                        and open-folder-after.
-// The build runs on a worker thread behind a live log so the editor stays responsive during the
-// minutes a self-contained publish takes.
-//
-// Phase-4 EditorWindow: the body draws through IEditorGui (no raw ImGui). WindowShell owns Begin/End.
-// Custom widgets (GhostButtonSmall, icon/colour helpers) stay EditorIcons calls (seam-adjacent).
 internal sealed class BuildPanel : EditorWindow {
     readonly BallisticProject project;
 
-    // Ordered build scenes (project-relative "Assets/...scene"). Seeded from the manifest; edits here
-    // are saved into project.json by the build (and by an explicit Save button).
     readonly List<string> scenes = new();
     bool initialized;
 
-    // ---- player settings (edited in-panel, saved into project.json) ----
     string productName = "";
     string companyName = "";
     string version = "1.0.0";
     string iconPath = "";
-    int windowModeIndex;          // 0 Fullscreen, 1 Windowed, 2 Borderless
+    int windowModeIndex;
     int resWidth = 1920, resHeight = 1080;
 
-    // ---- output / toolchain ----
     string outputDir = "";
     bool selfContained = true;
-    int configIndex;              // 0 Release, 1 Debug
-    int ridIndex;                 // 0 win-x64, 1 win-arm64
+    int configIndex;
+    int ridIndex;
     static readonly string[] Configurations = { "Release", "Debug" };
     static readonly string[] Rids = { "win-x64", "win-arm64" };
     static readonly string[] WindowModes = { "Fullscreen", "Windowed", "Borderless" };
 
-    // ---- post-build actions ----
     bool runAfterBuild;
     bool openFolderAfterBuild = true;
 
-    // ---- worker state (touched from the build thread, read on the UI thread under `gate`) ----
     readonly object gate = new();
     readonly List<string> log = new();
     bool building;
     bool? lastSucceeded;
     string lastSummary;
-    string lastExePath;                 // set by the worker on success; drives Run / Open Folder
-    volatile bool runWhenDone;          // snapshot of runAfterBuild for the worker's completion
+    string lastExePath;
+    volatile bool runWhenDone;
     volatile bool openWhenDone;
-    string pendingLaunchExe;            // worker → UI handoff: launch this exe on the next Draw
+    string pendingLaunchExe;
 
     public BuildPanel(BallisticProject project) {
         this.project = project;
@@ -66,8 +48,6 @@ internal sealed class BuildPanel : EditorWindow {
     protected override void OnGui(IEditorGui gui) {
         EnsureInitialized();
 
-        // Worker-requested launch runs here on the UI thread (Process.Start off the worker is fine too,
-        // but doing it here keeps all process spawning on one thread and lets us clear the flag safely).
         if (pendingLaunchExe is not null) {
             LaunchBuiltExe(pendingLaunchExe);
             pendingLaunchExe = null;
@@ -109,8 +89,6 @@ internal sealed class BuildPanel : EditorWindow {
         outputDir = Path.Combine(project.RootPath, "Build", Sanitize(productName));
     }
 
-    // ---- Player Settings ----------------------------------------------------
-
     void DrawPlayerSettings(IEditorGui gui) {
         float scale = gui.Scale;
         if (!gui.CollapsingHeader($"{EditorIcons.Wrench}  Player Settings", defaultOpen: true))
@@ -125,7 +103,6 @@ internal sealed class BuildPanel : EditorWindow {
         LabeledInput(gui, "Version", "##version", ref version, 32,
             "Version baked into the exe (e.g. 1.0.0). Free-form text also allowed.");
 
-        // Icon: read-only path + Browse / Clear.
         gui.TextDisabled("Icon (.ico)");
         if (gui.IsItemHovered())
             gui.Tooltip("A .ico embedded into the exe for its taskbar/file icon. Optional.");
@@ -142,7 +119,6 @@ internal sealed class BuildPanel : EditorWindow {
         if (EditorIcons.GhostButtonSmall("clearicon", EditorIcons.Delete, "Use the engine default icon")) iconPath = "";
         gui.EndDisabled();
 
-        // Window mode + resolution.
         gui.TextDisabled("Window");
         gui.SetNextItemWidth(160 * scale);
         gui.Combo("Mode##winmode", ref windowModeIndex, WindowModes);
@@ -150,7 +126,7 @@ internal sealed class BuildPanel : EditorWindow {
             gui.Tooltip("Fullscreen = borderless at the monitor's resolution.\n" +
                         "Windowed/Borderless use the resolution below.");
 
-        gui.BeginDisabled(windowModeIndex == 0); // resolution is irrelevant for monitor-sized fullscreen
+        gui.BeginDisabled(windowModeIndex == 0);
         gui.SetNextItemWidth(90 * scale);
         gui.InputInt("##resw", ref resWidth, 0);
         gui.SameLine();
@@ -180,14 +156,11 @@ internal sealed class BuildPanel : EditorWindow {
             project.AssetsPath);
         if (string.IsNullOrEmpty(picked))
             return;
-        // Store project-relative when the icon lives under the project; else keep the absolute path.
         if (picked.StartsWith(project.RootPath, StringComparison.OrdinalIgnoreCase))
             iconPath = Path.GetRelativePath(project.RootPath, picked).Replace('\\', '/');
         else
             iconPath = picked;
     }
-
-    // ---- Scenes In Build ----------------------------------------------------
 
     void DrawScenesInBuild(IEditorGui gui) {
         float scale = gui.Scale;
@@ -221,7 +194,6 @@ internal sealed class BuildPanel : EditorWindow {
             gui.SameLine();
             gui.TextDisabled($"  {scenes[i]}");
 
-            // Row actions, right-aligned: up / down / remove (same idiom as InspectorPanel's row eye).
             gui.SameLine();
             float bw = EditorIcons.SmallButtonWidth(EditorIcons.ChevronDown);
             float gap = gui.ItemSpacing.X;
@@ -241,8 +213,6 @@ internal sealed class BuildPanel : EditorWindow {
         gui.EndChild();
 
         if (remove >= 0) scenes.RemoveAt(remove);
-        // Guard BOTH indices against the (possibly just-shrunk) list — a remove in the same pass can
-        // leave moveFrom dangling past the end.
         if (moveFrom >= 0 && moveTo >= 0 && moveFrom < scenes.Count && moveTo < scenes.Count)
             (scenes[moveFrom], scenes[moveTo]) = (scenes[moveTo], scenes[moveFrom]);
 
@@ -284,8 +254,6 @@ internal sealed class BuildPanel : EditorWindow {
         gui.EndPopup();
     }
 
-    // ---- Output + toolchain --------------------------------------------------
-
     void DrawOutputSection(IEditorGui gui) {
         float scale = gui.Scale;
         if (!gui.CollapsingHeader($"{EditorIcons.Folder}  Output", defaultOpen: true))
@@ -294,7 +262,6 @@ internal sealed class BuildPanel : EditorWindow {
         gui.Indent(8 * scale);
         gui.TextDisabled("Output Folder");
 
-        // Field + Browse button on one row: shrink the field to leave room for the button.
         float browseW = gui.CalcTextSize($"{EditorIcons.Folder}  Browse...").X + gui.FramePadding.X * 2;
         gui.SetNextItemWidth(gui.ContentRegionAvail.X - browseW - gui.ItemSpacing.X);
         gui.InputText("##out", ref outputDir, 512);
@@ -318,7 +285,6 @@ internal sealed class BuildPanel : EditorWindow {
     }
 
     void BrowseForOutput() {
-        // Seed the dialog at the current path (or its nearest existing parent, or the project root).
         string seed = outputDir;
         while (!string.IsNullOrEmpty(seed) && !Directory.Exists(seed))
             seed = Path.GetDirectoryName(seed);
@@ -395,8 +361,6 @@ internal sealed class BuildPanel : EditorWindow {
         gui.EndChild();
     }
 
-    // ---- actions ------------------------------------------------------------
-
     void StartBuild() {
         PlayerSettings player = CollectPlayerSettings();
         var options = new BuildPipeline.Options {
@@ -409,7 +373,6 @@ internal sealed class BuildPanel : EditorWindow {
             Player = player,
         };
 
-        // Persist scenes + player settings immediately so they survive even if the build later fails.
         SaveManifest();
 
         runWhenDone = runAfterBuild;
@@ -422,7 +385,7 @@ internal sealed class BuildPanel : EditorWindow {
             lastSummary = "Building...";
             lastExePath = null;
         }
-        BuildProgress.Begin();   // drives the full-window BusyOverlay card
+        BuildProgress.Begin();
 
         var thread = new Thread(() => {
             BuildPipeline.Result result = BuildPipeline.Build(options, Append);
@@ -438,8 +401,6 @@ internal sealed class BuildPanel : EditorWindow {
             }
             BuildProgress.End();
 
-            // Post-build actions (off the worker — folder open is safe anywhere; the exe launch is
-            // handed to the UI thread via pendingLaunchExe so all process spawning happens in Draw).
             if (result.Success) {
                 if (openWhenDone)
                     OpenFolder(result.OutputDir);
@@ -463,9 +424,6 @@ internal sealed class BuildPanel : EditorWindow {
         SelfContained = selfContained,
     };
 
-    // Each pipeline message is appended to the in-window log. Top-level phase headlines (the pipeline
-    // emits one per phase, in order) advance the overlay's determinate bar; indented sub-messages
-    // ("  copying Assets...") only update the card's detail line so the bar doesn't race ahead.
     void Append(string message) {
         lock (gate) log.Add(message);
 
@@ -476,8 +434,6 @@ internal sealed class BuildPanel : EditorWindow {
     }
 
     void AddOpenScene(IEditorGui gui) {
-        // The loaded scene's source path isn't tracked on the Scene object; offer the manifest's
-        // current startup scene as the closest "open scene" proxy, else nudge the user to the picker.
         var current = scenes.Count == 0 ? project.Manifest.StartupScene : null;
         if (!string.IsNullOrEmpty(current) && !scenes.Contains(current, StringComparer.OrdinalIgnoreCase))
             scenes.Add(current);
@@ -497,12 +453,12 @@ internal sealed class BuildPanel : EditorWindow {
 
     static void OpenFolder(string dir) {
         if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
-            try { Process.Start("explorer.exe", $"\"{dir}\""); } catch { /* best effort */ }
+            try { Process.Start("explorer.exe", $"\"{dir}\""); } catch {
+            }
     }
 
     void LaunchBuiltExe(string exePath) {
         try {
-            // Launch with its own directory as the working dir so it finds Data\ next to the exe.
             Process.Start(new ProcessStartInfo(exePath) {
                 WorkingDirectory = Path.GetDirectoryName(exePath),
                 UseShellExecute = true,
@@ -513,8 +469,6 @@ internal sealed class BuildPanel : EditorWindow {
             Append($"Could not launch {Path.GetFileName(exePath)}: {e.Message}");
         }
     }
-
-    // ---- helpers ------------------------------------------------------------
 
     IEnumerable<string> AllScenePaths() =>
         AssetDatabase.EnumerateAssets()

@@ -1,19 +1,9 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
-using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal query <op> <scene> --points "x,y,z;..."` — the AI agent's SPATIAL PERCEPTION over the scene. Drives
-// the headless DX12 player (GpuSceneQuery: inline RayQuery over the scene TLAS) and relays its JSON. Ops:
-//   occupancy  — is each point inside solid geometry?
-//   classify   — open / enclosed / solid per point
-//   nudge      — move each occupied point to the nearest free-space position
-//   rooms      — visibility-cluster labels (which points share a room)
-//   visibility — clear line of sight per A->B pair (use --pairs "ax,ay,az>bx,by,bz; ...")
-// Device-free CLI: spawns BallisticEngine.Runtime.exe with BALLISTIC_QUERY=<spec> (same pattern as
-// `bal render`), so the agent gets sane spatial answers without staring at pixels. JSON to stdout.
 internal sealed class QueryCommand : ICommand {
     public string Name => "query";
     public string Summary => "Spatial scene queries (occupancy/visibility/classify/nudge/rooms) over the TLAS.";
@@ -57,7 +47,6 @@ internal sealed class QueryCommand : ICommand {
         string root = SceneFile.ResolveProjectRoot(sceneAbs);
         string sceneRel = Path.GetRelativePath(root, sceneAbs).Replace('\\', '/');
 
-        // Build the query spec JSON.
         object spec;
         if (op == "visibility") {
             if (pairsSpec is null) throw new CliUsageException("visibility needs --pairs \"ax,ay,az>bx,by,bz; ...\"");
@@ -77,7 +66,6 @@ internal sealed class QueryCommand : ICommand {
             RunPlayer(FindPlayerExe(), root, sceneRel, specPath, outPath);
             if (!File.Exists(outPath))
                 throw new Exception("player exited but wrote no query output");
-            // Relay the player's result JSON verbatim (re-parse so we emit pretty, validated JSON + our exit code).
             using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(outPath));
             bool ok = doc.RootElement.TryGetProperty("ok", out JsonElement okEl) && okEl.GetBoolean();
             Json.WriteRaw(doc.RootElement);
@@ -121,7 +109,7 @@ internal sealed class QueryCommand : ICommand {
         psi.ArgumentList.Add(projectRoot);
         psi.Environment["BALLISTIC_BACKEND"] = "dx12";
         psi.Environment["BALLISTIC_SCENE"] = sceneRel;
-        psi.Environment["BALLISTIC_SCREENSHOT_PAUSED"] = "1";   // edit mode — no scripts/physics, stable geometry
+        psi.Environment["BALLISTIC_SCREENSHOT_PAUSED"] = "1";
         psi.Environment["BALLISTIC_QUERY"] = specPath;
         psi.Environment["BALLISTIC_QUERY_OUT"] = outPath;
 
@@ -138,7 +126,6 @@ internal sealed class QueryCommand : ICommand {
                 + (stderr.Length > 0 ? $" — {stderr[..Math.Min(stderr.Length, 400)]}" : ""));
     }
 
-    // The player exe sits in the engine repo's build tree (mirrors RenderCommand.FindPlayerExe).
     static string FindPlayerExe() {
         string? engineRoot = Environment.GetEnvironmentVariable("BALLISTIC_ENGINE_ROOT");
         if (engineRoot is null) {

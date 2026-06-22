@@ -1,6 +1,3 @@
-using System;
-using System.Collections.Generic;
-using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace Facebook.Yoga
@@ -62,7 +59,7 @@ namespace Facebook.Yoga
         private float _pointScaleFactor = 1.0f;
         private object? _context;
 
-        private static readonly YGLogger DefaultLogger = (config, node, level, msg) => { /* Default logger implementation */ };
+        private static readonly YGLogger DefaultLogger = (config, node, level, msg) => { };
 
         public Config() : this(DefaultLogger) { }
 

@@ -5,29 +5,8 @@ using SysVec4 = System.Numerics.Vector4;
 
 namespace BallisticEngine.Editor;
 
-// Reusable inspector widgets (editor-rework Rule 1 / Phase B3). These four interactive editors —
-// the AnimationCurve editor, the ColorGradient bar, the audio-clip scrubber, and the Animator pose
-// scrubber — used to live INLINE in InspectorPanel (private statics, hand-rolled, predating the drawer
-// pipeline). B3 lifts them VERBATIM into the shared EditorWidgets library (same home as ToggleSwitch /
-// DropShadow) so any caller — the inspector member drawer, an asset view, a future terminal drawer in
-// the B0 stack, the standalone CurveEditorWindow — can reuse them without going through InspectorPanel.
-//
-// ★ BYTE-IDENTICAL by construction: the bodies are MOVED unchanged — same ImGui call sequence, same draw
-//   math, same undo-Push sites. The only structural change is that the per-widget mutable state the audio
-//   and animator scrubbers need (the live voice, the scrub/preview time, the play toggle) is now passed
-//   by `ref` instead of being a static field, so the WIDGET owns no shared state and the CALLER decides
-//   where that state lives (InspectorPanel keeps its existing statics — they're shared with the audio
-//   asset view — and just hands them in by ref). The curve/gradient editors keep their own drag-tracking
-//   statics here (single-widget-at-a-time assumption, exactly as before).
 internal static partial class EditorWidgets {
-
-    // ---- AnimationCurve editor ---------------------------------------------------
-    // An interactive curve widget: a plot box that samples the curve into a polyline, draggable
-    // keyframe dots (drag to move time+value), double-click empty space to add a key, right-click a
-    // key to remove it, and preset buttons (Linear / Ease / Constant). Reusable for ANY AnimationCurve
-    // member. The curve is mutated in place; returns true when an edit happened (caller marks dirty).
-    // The plot auto-fits its value range to the keys (with a small pad) so any amplitude is visible.
-    static int curveDragKey = -1; // index of the key being dragged (-1 = none); single-widget assumption
+    static int curveDragKey = -1;
 
     public static bool CurveEditor(string id, AnimationCurve curve, Action onExternalEdit = null) {
         bool edited = false;
@@ -39,11 +18,9 @@ internal static partial class EditorWidgets {
         var size = new SysVec2(MathF.Max(w, 60f), height);
         var draw = ImGui.GetWindowDrawList();
 
-        // Background + border.
         draw.AddRectFilled(origin, origin + size, ImGui.GetColorU32(new SysVec4(0.10f, 0.11f, 0.13f, 1f)), 4f);
         draw.AddRect(origin, origin + size, ImGui.GetColorU32(new SysVec4(0.30f, 0.32f, 0.36f, 1f)), 4f);
 
-        // Time range = [first key, last key] (default [0,1]); value range auto-fits the keys.
         float t0 = 0f, t1 = 1f, vMin = 0f, vMax = 1f;
         if (curve.Count > 0) {
             t0 = curve.Keys[0].Time;
@@ -65,14 +42,12 @@ internal static partial class EditorWidgets {
             return new SysVec2(origin.X + fx * size.X, origin.Y + (1f - fy) * size.Y);
         }
 
-        // Zero line (if 0 is in the value range) for reference.
         if (vMin < 0f && vMax > 0f) {
             float zy = origin.Y + (1f - (0f - vMin) / (vMax - vMin)) * size.Y;
             draw.AddLine(new SysVec2(origin.X, zy), new SysVec2(origin.X + size.X, zy),
                 ImGui.GetColorU32(new SysVec4(0.4f, 0.4f, 0.45f, 0.4f)));
         }
 
-        // Sample the curve into a polyline across the box width.
         const int Samples = 64;
         uint curveColor = ImGui.GetColorU32(new SysVec4(0.45f, 0.85f, 1f, 1f));
         SysVec2 prev = default;
@@ -83,7 +58,6 @@ internal static partial class EditorWidgets {
             prev = p;
         }
 
-        // An invisible button over the box captures interaction (hover/click/drag).
         ImGui.InvisibleButton("##curvebox", size);
         bool hovered = ImGui.IsItemHovered();
         SysVec2 mouse = ImGui.GetMousePos();
@@ -91,7 +65,6 @@ internal static partial class EditorWidgets {
         float SnapTimeFromMouse() => t0 + (t1 - t0) * Math.Clamp((mouse.X - origin.X) / size.X, 0f, 1f);
         float SnapValueFromMouse() => vMax - (vMax - vMin) * Math.Clamp((mouse.Y - origin.Y) / size.Y, 0f, 1f);
 
-        // Draw + hit-test keyframe dots.
         const float dotR = 5f;
         int hoverKey = -1;
         for (var i = 0; i < curve.Count; i++) {
@@ -104,12 +77,11 @@ internal static partial class EditorWidgets {
             draw.AddCircleFilled(sp, dotR, dc);
         }
 
-        // Begin a drag on a key (snapshot for undo once).
         if (hovered && hoverKey >= 0 && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
             curveDragKey = hoverKey;
             EditorUndo.Push($"Edit {id}");
         }
-        // Drag the held key.
+
         if (curveDragKey >= 0 && curveDragKey < curve.Count && ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
             curveDragKey = curve.MoveKey(curveDragKey, SnapTimeFromMouse(), SnapValueFromMouse());
             edited = true;
@@ -117,20 +89,18 @@ internal static partial class EditorWidgets {
         if (ImGui.IsMouseReleased(ImGuiMouseButton.Left))
             curveDragKey = -1;
 
-        // Double-click empty space adds a key on the curve at that time.
         if (hovered && hoverKey < 0 && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
             EditorUndo.Push($"Add key {id}");
             curve.AddKey(SnapTimeFromMouse(), SnapValueFromMouse());
             edited = true;
         }
-        // Right-click a key removes it (keep at least one).
+
         if (hovered && hoverKey >= 0 && curve.Count > 1 && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
             EditorUndo.Push($"Remove key {id}");
             curve.RemoveKey(hoverKey);
             edited = true;
         }
 
-        // Preset buttons + "open full editor" + key count.
         if (ImGui.SmallButton("Linear")) { EditorUndo.Push($"Preset {id}"); ReplaceCurve(curve, AnimationCurve.Linear()); edited = true; }
         ImGui.SameLine();
         if (ImGui.SmallButton("Ease")) { EditorUndo.Push($"Preset {id}"); ReplaceCurve(curve, AnimationCurve.EaseInOut()); edited = true; }
@@ -146,7 +116,6 @@ internal static partial class EditorWidgets {
         return edited;
     }
 
-    // Replaces a curve's keys with another curve's (in place — preserves the member's instance).
     static void ReplaceCurve(AnimationCurve target, AnimationCurve source) {
         target.Clear();
         for (var i = 0; i < source.Count; i++)
@@ -155,14 +124,8 @@ internal static partial class EditorWidgets {
         target.PostWrap = source.PostWrap;
     }
 
-    // ---- Gradient editor ---------------------------------------------------------
-    // An interactive gradient bar (Unity's gradient editor, trimmed): the bar samples Evaluate across
-    // its width; COLOR stops sit as triangles BELOW the bar (drag horizontally to move, click to open a
-    // color picker, double-click empty to add, right-click to remove), ALPHA stops as triangles ABOVE
-    // (drag horizontally to move, vertical drag to change alpha). Reusable for ANY Gradient member;
-    // mutated in place; returns true on edit. The checkerboard behind the bar shows alpha.
     static int gradColorDrag = -1, gradAlphaDrag = -1;
-    static int gradColorPick = -1; // color stop whose picker popup is open
+    static int gradColorPick = -1;
 
     public static bool GradientEditor(string id, ColorGradient g) {
         bool edited = false;
@@ -171,11 +134,10 @@ internal static partial class EditorWidgets {
         float w = MathF.Max(ImGui.GetContentRegionAvail().X, 60f);
         const float barH = 22f, stopH = 7f;
         SysVec2 cursor = ImGui.GetCursorScreenPos();
-        SysVec2 barOrigin = cursor + new SysVec2(0f, stopH + 2f); // leave room for alpha stops above
+        SysVec2 barOrigin = cursor + new SysVec2(0f, stopH + 2f);
         var barSize = new SysVec2(w, barH);
         var draw = ImGui.GetWindowDrawList();
 
-        // Checkerboard so alpha is visible.
         const float check = 6f;
         for (float x = 0; x < w; x += check)
             for (float y = 0; y < barH; y += check) {
@@ -186,7 +148,6 @@ internal static partial class EditorWidgets {
                 draw.AddRectFilled(a, b, cc);
             }
 
-        // Sample the gradient across the bar width into thin vertical slices.
         const int slices = 96;
         for (var s = 0; s < slices; s++) {
             float t0 = (float)s / slices, t1 = (float)(s + 1) / slices;
@@ -198,7 +159,6 @@ internal static partial class EditorWidgets {
         }
         draw.AddRect(barOrigin, barOrigin + barSize, 0xFF202224);
 
-        // Interaction surface covering the bar + both stop rows.
         SysVec2 totalSize = new SysVec2(w, barH + stopH * 2f + 4f);
         ImGui.SetCursorScreenPos(cursor);
         ImGui.InvisibleButton("##gradbar", totalSize);
@@ -206,10 +166,9 @@ internal static partial class EditorWidgets {
         SysVec2 mouse = ImGui.GetMousePos();
         float mt = Math.Clamp((mouse.X - barOrigin.X) / w, 0f, 1f);
 
-        float alphaRowY = cursor.Y;                       // alpha stops above the bar
-        float colorRowY = barOrigin.Y + barH + 2f;        // color stops below the bar
+        float alphaRowY = cursor.Y;
+        float colorRowY = barOrigin.Y + barH + 2f;
 
-        // ---- Color stops (below) ----
         int hoverColor = -1;
         for (var i = 0; i < g.ColorKeyCount; i++) {
             float kx = barOrigin.X + g.ColorKeys[i].Time * w;
@@ -224,7 +183,6 @@ internal static partial class EditorWidgets {
                 hoverColor = i;
         }
 
-        // ---- Alpha stops (above) ----
         int hoverAlpha = -1;
         for (var i = 0; i < g.AlphaKeyCount; i++) {
             float kx = barOrigin.X + g.AlphaKeys[i].Time * w;
@@ -239,12 +197,11 @@ internal static partial class EditorWidgets {
                 hoverAlpha = i;
         }
 
-        // ---- Begin drags / picker / add / remove ----
         if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
             if (hoverColor >= 0) { gradColorDrag = hoverColor; EditorUndo.Push($"Edit {id}"); }
             else if (hoverAlpha >= 0) { gradAlphaDrag = hoverAlpha; EditorUndo.Push($"Edit {id}"); }
         }
-        // Open a color picker popup on a color-stop click-release (only if not dragged far).
+
         if (hoverColor >= 0 && ImGui.IsMouseReleased(ImGuiMouseButton.Left) && gradColorDrag == hoverColor) {
             gradColorPick = hoverColor;
             ImGui.OpenPopup("##gradcolpick");
@@ -260,25 +217,23 @@ internal static partial class EditorWidgets {
         }
         if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) { gradColorDrag = -1; gradAlphaDrag = -1; }
 
-        // Double-click empty space on the color row adds a color stop (sampled current color).
         if (hovered && hoverColor < 0 && mouse.Y >= colorRowY - 2f && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
             EditorUndo.Push($"Add color {id}");
             g.AddColorKey(mt, g.EvaluateColor(mt));
             edited = true;
         }
-        // Double-click empty space on the alpha row adds an alpha stop.
+
         if (hovered && hoverAlpha < 0 && mouse.Y <= alphaRowY + stopH + 2f && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
             EditorUndo.Push($"Add alpha {id}");
             g.AddAlphaKey(mt, g.EvaluateAlpha(mt));
             edited = true;
         }
-        // Right-click removes the hovered stop (keep at least one of each kind).
+
         if (hovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
             if (hoverColor >= 0 && g.ColorKeyCount > 1) { EditorUndo.Push($"Remove color {id}"); g.RemoveColorKey(hoverColor); edited = true; }
             else if (hoverAlpha >= 0 && g.AlphaKeyCount > 1) { EditorUndo.Push($"Remove alpha {id}"); g.RemoveAlphaKey(hoverAlpha); edited = true; }
         }
 
-        // Color picker popup for the selected color stop.
         if (ImGui.BeginPopup("##gradcolpick")) {
             if (gradColorPick >= 0 && gradColorPick < g.ColorKeyCount) {
                 Vector3 c = g.ColorKeys[gradColorPick].Color;
@@ -291,7 +246,6 @@ internal static partial class EditorWidgets {
             ImGui.EndPopup();
         }
 
-        // Preset buttons + counts.
         if (ImGui.SmallButton("Fire")) { EditorUndo.Push($"Preset {id}"); ReplaceGradient(g, ColorGradient.Fire()); edited = true; }
         ImGui.SameLine();
         if (ImGui.SmallButton("Fade")) { EditorUndo.Push($"Preset {id}"); ReplaceGradient(g, ColorGradient.FadeOut(new Vector3(1f, 1f, 1f))); edited = true; }
@@ -310,19 +264,11 @@ internal static partial class EditorWidgets {
             target.AddAlphaKey(source.AlphaKeys[i].Time, source.AlphaKeys[i].Alpha);
     }
 
-    // ---- Audio scrubber ----------------------------------------------------------
-    // Time slider under the preview button: shows the play head while previewing and lets you scrub.
-    // Dragging seeks the live voice; releasing on a stopped voice restarts playback from that offset
-    // (so you can scrub a finished/idle clip to a spot and hear it from there). The live `voice` and the
-    // persisted `scrubTime` are passed by ref so the CALLER owns that state (it's shared with the audio
-    // asset preview in InspectorPanel); `markDirty` keeps the inspector repainting under on-demand render.
     public static void AudioScrubber(AudioClip clip, float volume, float pitch,
         ref IAudioVoice voice, ref float scrubTime, Action markDirty) {
         float duration = MathF.Max(clip.DurationSeconds, 0.001f);
         bool live = voice is { IsPlaying: true };
 
-        // While playing, the play head drives the slider; otherwise keep the last scrub position so the
-        // handle doesn't snap back to 0 between previews.
         if (live)
             scrubTime = Math.Clamp(voice.TimeSeconds, 0f, duration);
 
@@ -331,25 +277,18 @@ internal static partial class EditorWidgets {
         if (ImGui.SliderFloat("##audioScrub", ref t, 0f, duration, "%.2fs")) {
             scrubTime = Math.Clamp(t, 0f, duration);
             if (voice is { IsPlaying: true })
-                voice.TimeSeconds = scrubTime;   // seek the live voice
+                voice.TimeSeconds = scrubTime;
             else {
-                // Scrubbing an idle clip: start a fresh voice and jump it to the scrub point.
                 voice = Audio.Play(clip, volume, pitch, loop: false);
                 if (voice is not null)
                     voice.TimeSeconds = scrubTime;
             }
         }
 
-        // Keep the inspector repainting so the play head animates under on-demand rendering.
         if (live)
             markDirty();
     }
 
-    // ---- Animator pose scrubber --------------------------------------------------
-    // Animator preview: a play/pause toggle + a scrub slider that evaluates the clip in edit mode, so
-    // you can pose the skinned character without entering play. Drives Animator.EvaluatePreview, which
-    // runs the same sample->skeleton->skinning pipeline as play-mode Tick. The preview time + play toggle
-    // are passed by ref so the caller owns that persistent state; `markDirty` repaints the viewport.
     public static void AnimatorScrubber(Animator animator, ref float previewTime, ref bool playing, Action markDirty) {
         ImGui.Spacing();
         ImGui.SeparatorText("Preview");
@@ -374,7 +313,7 @@ internal static partial class EditorWidgets {
             previewTime += (float)Time.DeltaTime;
             if (animator.Loop && previewTime > duration)
                 previewTime %= duration;
-            markDirty(); // keep the viewport repainting while previewing
+            markDirty();
         }
 
         float t = previewTime;
@@ -383,14 +322,11 @@ internal static partial class EditorWidgets {
             playing = false;
         }
 
-        // Apply the previewed pose this frame (edit mode only — play mode drives it from Tick).
         if (!SceneManager.IsPlaying) {
             animator.EvaluatePreview(previewTime);
             markDirty();
         }
 
-        // Animation events (script-driven). Show the count + the last fired event so you can confirm
-        // they're wired and firing in play mode.
         if (animator.EventCount > 0) {
             ImGui.Spacing();
             ImGui.SeparatorText("Events");

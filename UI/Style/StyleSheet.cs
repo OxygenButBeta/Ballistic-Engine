@@ -1,32 +1,19 @@
-using System;
-using System.Collections.Generic;
 using System.Text;
 
 namespace BallisticEngine.UI;
 
-// A parsed .uss stylesheet: an ordered list of rules (selector + declaration block). Apply() runs the
-// cascade over a VisualElement tree — for each element, every matching rule's declarations are applied
-// in specificity order (low to high) so the most specific rule wins, then inline style="" (applied at
-// load time, highest precedence) sits on top. This is the styling half of a ported design.
-//
-// Supported selectors (Selector.cs): type (Button), .class, #name, :pseudo (hover/active/disabled/
-// focus), descendant combinator (space), and comma-separated selector lists. Comments (/* ... */) and
-// :root-style blocks are tolerated. Unsupported at-rules are skipped, not fatal.
 public sealed class StyleSheet
 {
     public sealed class Rule
     {
         public Selector Selector;
-        public string Declarations;          // raw "prop: val; ..." applied via StyleApplier
-        public int Order;                    // source order, tiebreaker for equal specificity
+        public string Declarations;
+        public int Order;
     }
 
     readonly List<Rule> _rules = new();
     public IReadOnlyList<Rule> Rules => _rules;
 
-    // Custom properties (var tokens) collected from any rule body during Parse — "--name" -> value.
-    // CSS scopes these to the selector; we collect them globally (pragmatic, matches how design tokens
-    // are authored under :root). The resolver merges these across sheets into one var store. (P2.4)
     readonly Dictionary<string, string> _vars = new(StringComparer.Ordinal);
     public IReadOnlyDictionary<string, string> Variables => _vars;
 
@@ -52,14 +39,12 @@ public sealed class StyleSheet
 
             if (selectorPart.Length == 0) continue;
 
-            // Collect custom properties (--name: value) from this body into the global var store.
             sheet.CollectVars(body);
 
-            // A selector list "a, b, c { ... }" produces one rule per selector sharing the body.
             foreach (var sel in selectorPart.Split(',', StringSplitOptions.RemoveEmptyEntries))
             {
                 var parsed = ParseSelector(sel.Trim());
-                if (parsed == null) continue; // unsupported (e.g. an at-rule) — skip quietly
+                if (parsed == null) continue;
                 sheet._rules.Add(new Rule { Selector = parsed, Declarations = body, Order = order++ });
             }
         }
@@ -67,10 +52,6 @@ public sealed class StyleSheet
         return sheet;
     }
 
-    // Runs the cascade over the whole subtree rooted at `root` (inclusive). Kept for callers that want a
-    // sheet to apply its matched declarations on top of the current style (legacy additive path). The
-    // resolved-style pipeline (StyleResolver) uses CollectMatched + a from-scratch resolve instead, which
-    // is what makes :hover revert + inheritance correct.
     public void Apply(VisualElement root)
     {
         ApplyToElement(root);
@@ -86,9 +67,6 @@ public sealed class StyleSheet
             StyleApplier.ApplyInline(el.Style, rule.Declarations);
     }
 
-    // Collect this sheet's rules matching `el`, sorted ascending by specificity then source order, into
-    // `into` (allocated if null). The resolver merges matched rules from multiple sheets before applying,
-    // so it passes a shared list. Returns the list (or null if nothing matched and `into` was null).
     public List<Rule> CollectMatched(VisualElement el, List<Rule> into)
     {
         List<Rule> matched = into;
@@ -106,8 +84,6 @@ public sealed class StyleSheet
         return matched;
     }
 
-    // Extract "--name: value" declarations from a rule body into _vars. Values keep var()/literal text;
-    // the applier resolves nested var() at use time.
     void CollectVars(string body)
     {
         foreach (var decl in body.Split(';', StringSplitOptions.RemoveEmptyEntries))
@@ -127,17 +103,13 @@ public sealed class StyleSheet
         return x.c.CompareTo(y.c);
     }
 
-    // ---------------------------------------------------------------- parsing helpers
-
-    // Parses "Button.primary > .row + Label:hover" into a Selector with real combinators (P2.6).
-    // Returns null for unsupported input (an at-rule like @media, or an empty token).
     static Selector ParseSelector(string text)
     {
         if (text.Length == 0 || text[0] == '@') return null;
 
         var selector = new Selector();
         var tokens = text.Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-        Combinator pending = Combinator.Descendant;   // combinator that joins the NEXT compound to the previous
+        Combinator pending = Combinator.Descendant;
         bool first = true;
 
         foreach (var tok in tokens)
@@ -156,26 +128,23 @@ public sealed class StyleSheet
         return selector.Chain.Count > 0 ? selector : null;
     }
 
-    // Parses one compound like "Button.primary#buy:hover" or ".chip:not(.disabled)" or "*".
     static SimpleSelector ParseCompound(string text)
     {
         var s = new SimpleSelector();
 
-        // Pull out :not(...) groups first (they contain a nested simple selector fragment).
         int notIdx;
         while ((notIdx = text.IndexOf(":not(", StringComparison.OrdinalIgnoreCase)) >= 0)
         {
             int close = text.IndexOf(')', notIdx + 5);
             if (close < 0) break;
             string inner = text[(notIdx + 5)..close].Trim();
-            // minimal: only .class negation is modeled
             if (inner.StartsWith(".")) s.NotClasses.Add(inner[1..]);
             text = text[..notIdx] + text[(close + 1)..];
         }
 
         int idx = 0;
         var token = new StringBuilder();
-        char kind = ' '; // ' ' = type, '.' = class, '#' = name, ':' = pseudo
+        char kind = ' ';
 
         void Flush()
         {
@@ -186,7 +155,7 @@ public sealed class StyleSheet
                 case '.': s.Classes.Add(t); break;
                 case '#': s.Name = t; break;
                 case ':': s.PseudoStates.Add(MapPseudo(t)); break;
-                default: if (t != "*") s.TypeName = t; break; // '*' = universal -> null type
+                default: if (t != "*") s.TypeName = t; break;
             }
             token.Clear();
         }
@@ -209,8 +178,6 @@ public sealed class StyleSheet
         return s;
     }
 
-    // Maps CSS pseudo-class names to the state-class names the input module/elements set. Unknown
-    // pseudos pass through as-is (so a custom state class still matches).
     static string MapPseudo(string pseudo) => pseudo.ToLowerInvariant() switch
     {
         "hover" => "hover",
@@ -223,7 +190,6 @@ public sealed class StyleSheet
 
     static string StripComments(string s)
     {
-        // Remove /* ... */ blocks. Cheap single-pass; USS has no // line comments.
         var sb = new StringBuilder(s.Length);
         for (int i = 0; i < s.Length; i++)
         {

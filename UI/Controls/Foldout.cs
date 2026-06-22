@@ -1,10 +1,5 @@
-using System;
-
 namespace BallisticEngine.UI;
 
-// A collapsible section (P5.6) — UITK's Foldout. A clickable header (arrow + title) that shows/hides a
-// content container. Children added to the Foldout go into the content. Open state toggles the "open"
-// class and the content's display.
 public class Foldout : VisualElement, INotifyValueChanged<bool>
 {
     readonly VisualElement _header;
@@ -24,7 +19,7 @@ public class Foldout : VisualElement, INotifyValueChanged<bool>
     {
         _open = value;
         EnableInClassList("open", value);
-        _arrow.Text = value ? "▼" : "▶";   // ▼ / ▶
+        _arrow.Text = value ? "▼" : "▶";
         ContentContainer.Style.Display = value ? DisplayStyle.Flex : DisplayStyle.None;
     }
 

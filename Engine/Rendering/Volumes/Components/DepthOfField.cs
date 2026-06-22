@@ -1,8 +1,5 @@
 namespace BallisticEngine;
 
-// Thin-lens depth of field. Physical controls so it reads like a real camera: the focal plane
-// sits at focusDistance, and aperture (f-number) + focalLength set how shallow the field is.
-// Off by default — a scene opts in by adding this override to its volume profile.
 public sealed class DepthOfField : VolumeComponent {
     [Tooltip("Enable depth of field.")]
     public readonly BoolParameter enabled = new(false);

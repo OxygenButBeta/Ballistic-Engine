@@ -1,17 +1,8 @@
-using System.Numerics;
 using System.Text;
 using System.Text.RegularExpressions;
 
 namespace BallisticEngine.Editor;
 
-// Debug console: every engine log (info/warning/error) with severity filter chips (icon + live
-// count), a per-row severity icon, a per-message timestamp, free-text search, optional collapsing of
-// consecutive duplicates (with a count badge), copy-to-clipboard, and double-click-to-open-source for
-// rows that carry an "Assets/...cs(line,col)" reference (script errors).
-//
-// Phase-7 EditorWindow: the body now draws entirely through IEditorGui (zero raw ImGui). Per-row severity
-// tinting + the filter chips route through the seam's style scope (gui.PushColor/PopColor); the icon-button
-// (GhostButton) and divider stay EditorIcons/EditorDecoration helper calls (seam-adjacent widgets).
 internal sealed class ConsolePanel : EditorWindow {
     protected override void OnGui(IEditorGui gui) => DrawContents(gui);
 
@@ -25,12 +16,10 @@ internal sealed class ConsolePanel : EditorWindow {
     bool collapse = true;
     string search = "";
 
-    // Severity tints come from the central theme (EditorTheme.LogLevel: info/warning/error).
     static Vector4[] LevelColors => EditorTheme.LogLevel;
 
     static readonly string[] LevelIcons = [EditorIcons.Info, EditorIcons.Warning, EditorIcons.Error];
 
-    // Matches a "Assets/Foo/Bar.cs(12,5)" or "Assets/Foo/Bar.cs:12" source reference in a message.
     static readonly Regex SourceRef =
         new(@"(Assets[\\/][^\s:()]+\.cs)[(:](\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
@@ -38,10 +27,9 @@ internal sealed class ConsolePanel : EditorWindow {
         DockKey = EditorLayout.Console;
         Title = "Console";
         Icon = EditorIcons.Document;
-        Singleton = false;        // duplicable via the Add-Tab host
+        Singleton = false;
 
         Debugging.OnMessage += (message, level) => {
-            // Timestamp at log time (HH:mm:ss). DateTime.Now is fine here — this is wall-clock display.
             string time = DateTime.Now.ToString("HH:mm:ss");
             lock (gate) {
                 entries.Add(new Entry(message, level, time));
@@ -61,7 +49,6 @@ internal sealed class ConsolePanel : EditorWindow {
             snapshot = entries.ToArray();
         }
 
-        // ---- Toolbar row 1: clear / copy / filter chips / auto-scroll ----
         if (EditorIcons.GhostButton("clearlog", EditorIcons.Delete, "Clear the log"))
             lock (gate) entries.Clear();
         gui.SameLine(0, 2);
@@ -81,7 +68,6 @@ internal sealed class ConsolePanel : EditorWindow {
         gui.SameLine(0, 10);
         gui.Checkbox("Auto-scroll", ref autoScroll);
 
-        // ---- Toolbar row 2: search ----
         gui.SetNextItemWidth(-1);
         gui.InputTextWithHint("##consolesearch", $"{EditorIcons.Search} Filter log...", ref search, 128);
         EditorDecoration.DrawDivider();
@@ -96,7 +82,6 @@ internal sealed class ConsolePanel : EditorWindow {
             if (search.Length > 0 && !e.Message.Contains(search, StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            // Collapse: if this row equals the next visible ones, count them and skip ahead.
             int dupCount = 1;
             if (collapse) {
                 while (i + 1 < snapshot.Length &&
@@ -123,19 +108,16 @@ internal sealed class ConsolePanel : EditorWindow {
     void DrawRow(IEditorGui gui, Entry e, int dupCount, int id) {
         gui.PushId(id);
 
-        // Timestamp (dim).
         gui.PushColor(EditorStyleColor.Text, gui.StyleColor(EditorStyleColor.TextDisabled));
         gui.TextUnformatted(e.Time);
         gui.PopColor();
         gui.SameLine(0, 8);
 
-        // Severity icon.
         gui.PushColor(EditorStyleColor.Text, LevelColors[e.Level]);
         gui.TextUnformatted(LevelIcons[e.Level]);
         gui.PopColor();
         gui.SameLine(0, 8);
 
-        // Message (errors/warnings tinted). Selectable so a double-click can open the source ref.
         if (e.Level > 0)
             gui.PushColor(EditorStyleColor.Text, LevelColors[e.Level]);
         gui.Selectable(e.Message, false);
@@ -149,7 +131,6 @@ internal sealed class ConsolePanel : EditorWindow {
                 OpenSource(m.Groups[1].Value, int.Parse(m.Groups[2].Value));
         }
 
-        // Duplicate-count badge on the right.
         if (dupCount > 1) {
             string badge = $"x{dupCount}";
             float right = gui.WindowWidth - gui.CalcTextSize(badge).X - gui.ScrollbarSize - 8;
@@ -168,7 +149,6 @@ internal sealed class ConsolePanel : EditorWindow {
             string absolute = AssetDatabase.Project is not null
                 ? AssetDatabase.Project.ResolveAbsolute(assetRelativePath.Replace('\\', '/'))
                 : assetRelativePath;
-            // Prefer VS Code's go-to-line if available; fall back to the OS default opener.
             try {
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo {
                     FileName = "code", Arguments = $"-g \"{absolute}:{line}\"", UseShellExecute = true,
@@ -198,7 +178,6 @@ internal sealed class ConsolePanel : EditorWindow {
         gui.SetClipboardText(sb.ToString());
     }
 
-    // Icon + count toggle chip; filled with the severity tint while enabled.
     static void FilterChip(IEditorGui gui, string label, int count, int level, ref bool enabled) {
         Vector4 tint = LevelColors[level];
         if (enabled) {

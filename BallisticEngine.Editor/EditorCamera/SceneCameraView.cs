@@ -1,9 +1,6 @@
 
 namespace BallisticEngine.Editor;
 
-// Lets the Game view render from a scene HDCamera in EDIT mode. HDCamera's own projection
-// depends on play-mode initialization and the OS window; this adapter reuses the camera's
-// transform but projects at the Game panel's aspect ratio.
 internal sealed class SceneCameraView : IViewProjectionProvider {
     HDCamera camera;
     float aspect = 16f / 9f;

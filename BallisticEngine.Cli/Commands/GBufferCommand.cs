@@ -1,15 +1,9 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
-using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal gbuffer <scene> [--out dir]` — dump the raw G-buffer (depth / world-normal / albedo) so the AI agent
-// can perceive the scene's geometry directly, not just the final tonemapped pixel. Drives the headless DX12
-// player (BALLISTIC_SCREENSHOT forces the windowless host + renders one deterministic frame;
-// BALLISTIC_GBUFFER_DUMP writes the buffers). Output: depth.bin / normal.bin / albedo.bin + manifest.json
-// (dims + format + decode notes). Device-free CLI — same subprocess pattern as `bal render` / `bal query`.
 internal sealed class GBufferCommand : ICommand {
     public string Name => "gbuffer";
     public string Summary => "Dump the raw G-buffer (depth/normal/albedo) for an agent to read.";
@@ -49,7 +43,6 @@ internal sealed class GBufferCommand : ICommand {
         if (!File.Exists(manifestPath))
             throw new Exception("player exited but wrote no G-buffer manifest");
         using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(manifestPath));
-        // Echo the manifest + absolute paths so the agent knows where the .bin files are.
         Json.Write(new {
             ok = doc.RootElement.TryGetProperty("ok", out JsonElement okEl) && okEl.GetBoolean(),
             scene = sceneRel, dir = outDir, manifest = manifestPath,
@@ -63,8 +56,6 @@ internal sealed class GBufferCommand : ICommand {
     }
 
     static void RunPlayer(string playerExe, string projectRoot, string sceneRel, string outDir, int frame) {
-        // A throwaway BMP so the screenshot path engages (forces the headless host + a rendered frame). The
-        // G-buffer dump piggybacks the screenshot save.
         string bmp = Path.Combine(outDir, "_frame.bmp");
         var psi = new ProcessStartInfo {
             FileName = playerExe, WorkingDirectory = Path.GetDirectoryName(playerExe)!,

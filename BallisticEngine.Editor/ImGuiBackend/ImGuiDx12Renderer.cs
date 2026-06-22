@@ -7,14 +7,6 @@ using Vortice.DXGI;
 
 namespace BallisticEngine.Editor;
 
-// Dear ImGui DX12 backend — the device-side twin of ImGuiGLRenderer. Records the ImGui draw data into the
-// editor swapchain's OPEN UI command list (resolved via `currentList` at render time, since the swapchain
-// is created after this renderer). One merged upload-heap vertex+index buffer (grown as needed) honoring
-// ImDrawCmd.VtxOffset/IdxOffset (RendererHasVtxOffset is set); an ortho CBV (b0); a single SRV table (t0)
-// + static linear-clamp sampler. The font atlas and every sampled texture live in the shared shader-visible
-// Dx12Backend.UiHeap, so ImTextureID == a GPU descriptor ptr into that heap and one SetDescriptorHeaps
-// covers all draws (the standard imgui_impl_dx12 model). The backbuffer RTV is already bound + cleared by
-// Dx12SwapChain.BeginFrame, so this only records pipeline state + draws.
 internal sealed unsafe class ImGuiDx12Renderer : IImGuiRenderer {
     readonly Func<ID3D12GraphicsCommandList4> currentList;
     Dx12Device Dev => Dx12Backend.Device;
@@ -22,26 +14,24 @@ internal sealed unsafe class ImGuiDx12Renderer : IImGuiRenderer {
     ID3D12RootSignature rootSig;
     ID3D12PipelineState pso;
 
-    // One merged upload-heap vertex+index buffer (mapped, persistent), grown to fit the frame's draw data.
     ID3D12Resource vtxBuffer, idxBuffer;
-    int vtxCapacity, idxCapacity;   // in elements
+    int vtxCapacity, idxCapacity;
     byte* vtxMapped, idxMapped;
 
-    ID3D12Resource orthoCb;         // b0: the ortho projection matrix (transposed on upload, codebase convention)
+    ID3D12Resource orthoCb;
     byte* orthoMapped;
 
     ID3D12Resource fontTexture;
-    int fontUiSlot = -1;            // stable UiHeap slot for the font atlas SRV (re-pointed on DPI rebuild)
-    nint fontHandle;                // ImTextureID for the font atlas (UiHeap GPU ptr)
+    int fontUiSlot = -1;
+    nint fontHandle;
 
-    static readonly int VtxStride = Marshal.SizeOf<ImDrawVert>();   // 20 bytes (pos2 + uv2 + col4)
+    static readonly int VtxStride = Marshal.SizeOf<ImDrawVert>();
 
     public ImGuiDx12Renderer(Func<ID3D12GraphicsCommandList4> currentList) {
         this.currentList = currentList;
     }
 
     public void CreateDeviceResources() {
-        // Root signature: b0 ortho CBV (vertex), t0 SRV table (pixel) + static linear-clamp sampler s0.
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.Vertex);
         var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
         var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
@@ -65,15 +55,13 @@ internal sealed unsafe class ImGuiDx12Renderer : IImGuiRenderer {
                 new InputElementDescription("COLOR", 0, Format.R8G8B8A8_UNorm, 16, 0)),
             PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
             RasterizerState = RasterizerDescription.CullNone,
-            // Straight-alpha blend (SrcAlpha / 1-SrcAlpha) on both color and alpha — matches the GL backend's
-            // BlendFunc(SrcAlpha, OneMinusSrcAlpha). The backbuffer alpha is irrelevant (opaque window).
             BlendState = new BlendDescription(Blend.SourceAlpha, Blend.InverseSourceAlpha),
             DepthStencilState = DepthStencilDescription.None,
             RenderTargetFormats = new[] { Dx12SwapChain.BackbufferFormat }, DepthStencilFormat = Format.Unknown,
             SampleDescription = new SampleDescription(1, 0),
         });
 
-        int cbSize = (64 + 255) & ~255;   // float4x4 ortho, 256-aligned CBV
+        int cbSize = (64 + 255) & ~255;
         orthoCb = Dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
             ResourceDescription.Buffer((ulong)cbSize), ResourceStates.GenericRead);
         orthoMapped = orthoCb.Map<byte>(0);
@@ -111,7 +99,6 @@ internal sealed unsafe class ImGuiDx12Renderer : IImGuiRenderer {
             cl.ResourceBarrierTransition(fontTexture, ResourceStates.CopyDest, ResourceStates.PixelShaderResource);
         });
 
-        // SRV in the shared UI heap (reuse the same slot across DPI rebuilds so the handle stays stable).
         if (fontUiSlot < 0) fontUiSlot = Dx12Backend.UiHeap.Allocate();
         Dev.Device.CreateShaderResourceView(fontTexture, new ShaderResourceViewDescription {
             Format = Format.R8G8B8A8_UNorm,
@@ -144,8 +131,6 @@ internal sealed unsafe class ImGuiDx12Renderer : IImGuiRenderer {
             return;
         EnsureBuffers(totalVtx, totalIdx);
 
-        // Ortho projection: ImGui screen space (top-left origin) -> DX12 NDC. Transposed on upload so the
-        // shader's mul(M, v) is correct (codebase convention).
         var ortho = System.Numerics.Matrix4x4.CreateOrthographicOffCenter(
             0f, io.DisplaySize.X, io.DisplaySize.Y, 0f, 0f, 1f);
         ortho = System.Numerics.Matrix4x4.Transpose(ortho);
@@ -153,7 +138,6 @@ internal sealed unsafe class ImGuiDx12Renderer : IImGuiRenderer {
 
         drawData.ScaleClipRects(io.DisplayFramebufferScale);
 
-        // Render state. The backbuffer RTV is already bound + cleared by Dx12SwapChain.BeginFrame.
         cl.SetGraphicsRootSignature(rootSig);
         cl.SetPipelineState(pso);
         cl.SetDescriptorHeaps(Dx12Backend.UiHeap.Heap);
@@ -163,7 +147,7 @@ internal sealed unsafe class ImGuiDx12Renderer : IImGuiRenderer {
         cl.IASetPrimitiveTopology(Vortice.Direct3D.PrimitiveTopology.TriangleList);
         cl.RSSetViewport(0, 0, fbW, fbH);
 
-        int vtxGlobal = 0, idxGlobal = 0;   // running base offsets (in elements) across cmd lists
+        int vtxGlobal = 0, idxGlobal = 0;
         for (int n = 0; n < drawData.CmdListsCount; n++) {
             ImDrawListPtr list = drawData.CmdLists[n];
             int vCount = list.VtxBuffer.Size, iCount = list.IdxBuffer.Size;
@@ -191,13 +175,6 @@ internal sealed unsafe class ImGuiDx12Renderer : IImGuiRenderer {
     }
 
     void EnsureBuffers(int vtxCount, int idxCount) {
-        // GROW HAZARD (EF3): these are single upload buffers the GPU reads while a prior frame is still in
-        // flight. A window resize/maximize can sharply increase the ImGui vertex count (more/larger panels) and
-        // trip a grow MID-STREAM — disposing the old buffer while the previous frame's draw still references it
-        // is a use-after-free → DXGI_ERROR_DEVICE_HUNG. Drain the GPU BEFORE disposing so no in-flight frame
-        // holds the buffer being freed. The grow is rare (only on a capacity increase), so the Flush is cheap;
-        // the steady-state (no grow) path is untouched. The default editor frame is already synchronous
-        // (FramesInFlight==1, EndFrame waits), but the drain makes correctness independent of that.
         bool grow = (vtxBuffer == null || vtxCount > vtxCapacity) || (idxBuffer == null || idxCount > idxCapacity);
         if (grow && (vtxBuffer != null || idxBuffer != null)) Dev.Flush();
         if (vtxBuffer == null || vtxCount > vtxCapacity) {

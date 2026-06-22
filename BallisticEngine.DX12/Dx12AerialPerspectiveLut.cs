@@ -1,5 +1,3 @@
-using System;
-using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
 using Vortice.Dxc;
@@ -7,28 +5,17 @@ using Vortice.DXGI;
 
 namespace BallisticEngine.DX12;
 
-// Owns the Hillaire-2020 aerial-perspective FROXEL VOLUME for the DX12 procedural sky: a small camera-anchored
-// 32x32x32 RGBA16F 3D texture where each froxel holds the accumulated single-scatter inscatter (rgb) + mean
-// transmittance (a) of a short Rayleigh/Mie march from the camera to that froxel's view distance, using the
-// SAME atmosphere the sky shows. Re-baked every frame from the current view (a compute dispatch on the frame
-// list) — cheap (32k threads, one short march each). The AP pass samples it by (screenUV, linearViewDistance)
-// and applies `scene*T + inscatter` so distant geometry fades into exactly the colour of the sky behind it.
-//
-// This is the physical replacement for the old analytic AP veil (a hardcoded lux-scaled blue tint over a fake
-// linear-distance term). See Docs/Plans/dx12-aerial-perspective-rework.md.
 public sealed class Dx12AerialPerspectiveLut : IDisposable {
-    // Froxel resolution. 32^3 is the Hillaire/Unreal default — the haze is low-frequency so a coarse volume is
-    // plenty, and linear sampling across slices hides the slice boundaries.
     public const int VolW = 32, VolH = 32, VolD = 32;
 
     readonly Dx12Device dev;
-    ID3D12Resource volume;              // 32^3 RGBA16F UAV/SRV froxel volume
-    int srvIndex = -1;                  // persistent SRV "home" in the SrvStore (the AP pass copies it per frame)
-    ID3D12RootSignature rootSig;        // ApLutConstants CBV (b0) + volume UAV (u0)
+    ID3D12Resource volume;
+    int srvIndex = -1;
+    ID3D12RootSignature rootSig;
     ID3D12PipelineState pso;
     ID3D12Resource cb;
     unsafe byte* cbMapped;
-    Dx12DescriptorHeap uavHeap;         // shader-visible: the volume UAV at slot 0 for the bake dispatch
+    Dx12DescriptorHeap uavHeap;
     ResourceStates volumeState;
 
     public ID3D12Resource Volume => volume;
@@ -49,7 +36,6 @@ public sealed class Dx12AerialPerspectiveLut : IDisposable {
     public unsafe Dx12AerialPerspectiveLut(Dx12Device device) {
         dev = device;
 
-        // 32^3 RGBA16F, UAV-writable (bake) + SRV-readable (AP pass).
         var desc = new ResourceDescription {
             Dimension = ResourceDimension.Texture3D,
             Width = VolW, Height = VolH, DepthOrArraySize = VolD, MipLevels = 1,
@@ -61,7 +47,6 @@ public sealed class Dx12AerialPerspectiveLut : IDisposable {
         volume.Name = "AerialPerspectiveLut";
         volumeState = ResourceStates.UnorderedAccess;
 
-        // Persistent SRV home (Texture3D) so the AP pass can CopyDescriptorsSimple it into its own heap per frame.
         srvIndex = Dx12Backend.SrvStore.Allocate();
         dev.Device.CreateShaderResourceView(volume, new ShaderResourceViewDescription {
             Format = Format.R16G16B16A16_Float, ViewDimension = ShaderResourceViewDimension.Texture3D,
@@ -69,7 +54,6 @@ public sealed class Dx12AerialPerspectiveLut : IDisposable {
             Texture3D = new Texture3DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 },
         }, Dx12Backend.SrvStore.Cpu(srvIndex));
 
-        // Root sig: ApLutConstants CBV (b0) + a 1-UAV table (u0 = the volume).
         var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
         var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, baseShaderRegister: 0);
         var uavTable = new RootParameter1(new RootDescriptorTable1(uavRange), ShaderVisibility.All);
@@ -101,11 +85,6 @@ public sealed class Dx12AerialPerspectiveLut : IDisposable {
         volumeState = to;
     }
 
-    // Bake the froxel volume for this frame. Records the compute dispatch on the pipelined frame list (via
-    // dev.ExecuteSync) and leaves the volume in PixelShaderResource for the AP pass to sample. All the haze
-    // tuning (strength/distance/density) comes from the PostFX block (the AerialPerspective volume bridge).
-    // `intensity` is the RESOLVED master strength (PostFX value with any BALLISTIC_DX12_AP_STRENGTH env
-    // override already applied by the caller) — it does NOT read pf.AerialPerspectiveIntensity itself.
     public unsafe void Bake(Matrix4x4 invViewProj, Vector3 camPos, Vector3 sunDir, Vector3 sunRadiance,
                             Vector3 skyTint, ProceduralSky sky, PostProcessSettings pf, float intensity) {
         *(ApLutConstants*)cbMapped = new ApLutConstants {
@@ -129,7 +108,7 @@ public sealed class Dx12AerialPerspectiveLut : IDisposable {
             cl.SetPipelineState(pso);
             cl.SetComputeRootConstantBufferView(0, cb.GPUVirtualAddress);
             cl.SetComputeRootDescriptorTable(1, uavHeap.Gpu(0));
-            cl.Dispatch((VolW + 7) / 8, (VolH + 7) / 8, VolD);   // [numthreads(8,8,1)] over W,H; one row of threads per slice
+            cl.Dispatch((VolW + 7) / 8, (VolH + 7) / 8, VolD);
             Transition(cl, ResourceStates.PixelShaderResource);
         });
     }

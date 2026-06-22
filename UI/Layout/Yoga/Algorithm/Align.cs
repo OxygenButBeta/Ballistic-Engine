@@ -1,8 +1,3 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// This source code is licensed under the MIT license found in the
-// LICENSE file in the root directory of this source tree.
-
 namespace Facebook.Yoga
 {
     internal static class AlignHelper
@@ -37,13 +32,10 @@ namespace Facebook.Yoga
     {
         switch (align)
         {
-            // Fallback to flex-start
             case Align.SpaceBetween:
             case Align.Stretch:
                 return Align.FlexStart;
 
-            // Fallback to safe center. TODO (T208209388): This should be aligned to
-            // Start instead of FlexStart (for row-reverse containers)
             case Align.SpaceAround:
             case Align.SpaceEvenly:
                 return Align.FlexStart;
@@ -60,14 +52,9 @@ namespace Facebook.Yoga
     {
         switch (align)
         {
-            // Fallback to flex-start
             case Justify.SpaceBetween:
-                // TODO: Support `justify-content: stretch`
-                // case Justify.Stretch:
                 return Justify.FlexStart;
 
-            // Fallback to safe center. TODO (T208209388): This should be aligned to
-            // Start instead of FlexStart (for row-reverse containers)
             case Justify.SpaceAround:
             case Justify.SpaceEvenly:
                 return Justify.FlexStart;

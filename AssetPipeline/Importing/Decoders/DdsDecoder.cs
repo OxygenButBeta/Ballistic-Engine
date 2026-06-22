@@ -1,14 +1,8 @@
-using System.Numerics;
-
 namespace BallisticEngine.AssetPipeline;
 
-// Decodes .dds containers to RGBA8 (top mip only). Supports the block-compressed formats the
-// engine is likely to meet in the wild (BC1/DXT1, BC2/DXT2-3, BC3/DXT4-5, BC4/ATI1, BC5/ATI2)
-// plus uncompressed masked RGB(A)/luminance, with or without a DX10 extension header.
-// BC6H/BC7 and packed/planar exotics are rejected with a descriptive error.
 public static class DdsDecoder {
-    const uint DdsMagic = 0x20534444;   // "DDS "
-    const uint FourCcDx10 = 0x30315844; // "DX10"
+    const uint DdsMagic = 0x20534444;
+    const uint FourCcDx10 = 0x30315844;
 
     const uint PfFourCc = 0x4;
     const uint PfRgb = 0x40;
@@ -28,16 +22,15 @@ public static class DdsDecoder {
         if (reader.ReadUInt32() != 124)
             throw new InvalidDataException($"'{path}' has a malformed DDS header.");
 
-        reader.ReadUInt32(); // flags
+        reader.ReadUInt32();
         var height = reader.ReadInt32();
         var width = reader.ReadInt32();
-        reader.ReadUInt32(); // pitchOrLinearSize
-        reader.ReadUInt32(); // depth
-        reader.ReadUInt32(); // mipMapCount
+        reader.ReadUInt32();
+        reader.ReadUInt32();
+        reader.ReadUInt32();
         for (var i = 0; i < 11; i++)
-            reader.ReadUInt32(); // reserved1
+            reader.ReadUInt32();
 
-        // DDS_PIXELFORMAT
         if (reader.ReadUInt32() != 32)
             throw new InvalidDataException($"'{path}' has a malformed DDS pixel format.");
         var pfFlags = reader.ReadUInt32();
@@ -48,11 +41,11 @@ public static class DdsDecoder {
         var bMask = reader.ReadUInt32();
         var aMask = reader.ReadUInt32();
 
-        reader.ReadUInt32(); // caps
+        reader.ReadUInt32();
         var caps2 = reader.ReadUInt32();
-        reader.ReadUInt32(); // caps3
-        reader.ReadUInt32(); // caps4
-        reader.ReadUInt32(); // reserved2
+        reader.ReadUInt32();
+        reader.ReadUInt32();
+        reader.ReadUInt32();
 
         BlockFormat block = BlockFormat.None;
         var dx10 = false;
@@ -61,19 +54,19 @@ public static class DdsDecoder {
             if (fourCc == FourCcDx10) {
                 dx10 = true;
                 var dxgiFormat = reader.ReadUInt32();
-                reader.ReadUInt32(); // resourceDimension
-                reader.ReadUInt32(); // miscFlag
-                reader.ReadUInt32(); // arraySize
-                reader.ReadUInt32(); // miscFlags2
+                reader.ReadUInt32();
+                reader.ReadUInt32();
+                reader.ReadUInt32();
+                reader.ReadUInt32();
                 (block, bitCount, rMask, gMask, bMask, aMask) = FromDxgi(path, dxgiFormat);
             }
             else {
                 block = fourCc switch {
-                    0x31545844 => BlockFormat.BC1, // DXT1
-                    0x32545844 or 0x33545844 => BlockFormat.BC2, // DXT2/DXT3
-                    0x34545844 or 0x35545844 => BlockFormat.BC3, // DXT4/DXT5
-                    0x31495441 or 0x55344342 => BlockFormat.BC4, // ATI1 / BC4U
-                    0x32495441 or 0x55354342 => BlockFormat.BC5, // ATI2 / BC5U
+                    0x31545844 => BlockFormat.BC1,
+                    0x32545844 or 0x33545844 => BlockFormat.BC2,
+                    0x34545844 or 0x35545844 => BlockFormat.BC3,
+                    0x31495441 or 0x55344342 => BlockFormat.BC4,
+                    0x32495441 or 0x55354342 => BlockFormat.BC5,
                     _ => throw new InvalidDataException(
                         $"'{path}': unsupported DDS fourCC '{FourCcText(fourCc)}'."),
                 };
@@ -101,16 +94,14 @@ public static class DdsDecoder {
             76 or 77 or 78 => (BlockFormat.BC3, 0, 0u, 0u, 0u, 0u),
             79 or 80 or 81 => (BlockFormat.BC4, 0, 0u, 0u, 0u, 0u),
             82 or 83 or 84 => (BlockFormat.BC5, 0, 0u, 0u, 0u, 0u),
-            27 or 28 or 29 => (BlockFormat.None, 32, 0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u), // RGBA8
-            87 or 88 or 91 or 93 => (BlockFormat.None, 32, 0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0xFF000000u), // BGRA8
+            27 or 28 or 29 => (BlockFormat.None, 32, 0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u),
+            87 or 88 or 91 or 93 => (BlockFormat.None, 32, 0x00FF0000u, 0x0000FF00u, 0x000000FFu, 0xFF000000u),
             94 or 95 or 96 => throw new InvalidDataException(
                 $"'{path}': BC6H DDS textures are not supported yet; re-export as BC1-BC5 or PNG/TGA."),
             97 or 98 or 99 => throw new InvalidDataException(
                 $"'{path}': BC7 DDS textures are not supported yet; re-export as BC1-BC5 or PNG/TGA."),
             _ => throw new InvalidDataException($"'{path}': unsupported DXGI format {dxgiFormat}."),
         };
-
-    // ---- Uncompressed -------------------------------------------------------
 
     static byte[] DecodeUncompressed(BinaryReader reader, int width, int height, int bitCount,
         uint pfFlags, bool dx10, uint rMask, uint gMask, uint bMask, uint aMask, string path) {
@@ -162,8 +153,6 @@ public static class DdsDecoder {
         return (byte)(value * 255 / max);
     }
 
-    // ---- Block-compressed ---------------------------------------------------
-
     static byte[] DecodeBlocks(BinaryReader reader, int width, int height, BlockFormat format, string path) {
         var blocksWide = Math.Max(1, (width + 3) / 4);
         var blocksHigh = Math.Max(1, (height + 3) / 4);
@@ -174,7 +163,7 @@ public static class DdsDecoder {
             throw new InvalidDataException($"'{path}': DDS block data is truncated.");
 
         var pixels = new byte[width * height * 4];
-        Span<byte> block = stackalloc byte[64]; // 4x4 RGBA
+        Span<byte> block = stackalloc byte[64];
 
         for (var by = 0; by < blocksHigh; by++) {
             for (var bx = 0; bx < blocksWide; bx++) {
@@ -204,7 +193,6 @@ public static class DdsDecoder {
                         break;
                 }
 
-                // Copy the 4x4 block into the image, clipping edge blocks.
                 for (var py = 0; py < 4; py++) {
                     var y = by * 4 + py;
                     if (y >= height)
@@ -227,13 +215,11 @@ public static class DdsDecoder {
         return pixels;
     }
 
-    // BC1-style color block (also the color half of BC2/BC3). allowPunchThrough enables the
-    // c0 <= c1 three-color + transparent-black mode (BC1 only; BC2/BC3 are always four-color).
     static void DecodeColorBlock(ReadOnlySpan<byte> src, Span<byte> rgba, bool allowPunchThrough) {
         var c0 = (ushort)(src[0] | src[1] << 8);
         var c1 = (ushort)(src[2] | src[3] << 8);
 
-        Span<byte> colors = stackalloc byte[16]; // 4 RGBA entries
+        Span<byte> colors = stackalloc byte[16];
         Expand565(c0, colors);
         Expand565(c1, colors[4..]);
 
@@ -251,7 +237,7 @@ public static class DdsDecoder {
                 colors[12 + c] = 0;
             }
             colors[11] = 255;
-            colors[15] = 0; // transparent black
+            colors[15] = 0;
         }
 
         var bits = (uint)(src[4] | src[5] << 8 | src[6] << 16 | src[7] << 24);
@@ -275,7 +261,6 @@ public static class DdsDecoder {
         rgb[3] = 255;
     }
 
-    // BC2: 4-bit explicit alpha per pixel, 8 bytes, low nibble first.
     static void ApplyBc2Alpha(ReadOnlySpan<byte> src, Span<byte> rgba) {
         for (var i = 0; i < 8; i++) {
             rgba[i * 8 + 3] = (byte)((src[i] & 0xF) * 17);
@@ -283,8 +268,6 @@ public static class DdsDecoder {
         }
     }
 
-    // BC4 block: two endpoints + 16 3-bit indices. Writes the decoded channel into RGBA
-    // component `channel` (optionally replicated to R, G and B for grayscale output).
     static void ApplyBc4Channel(ReadOnlySpan<byte> src, Span<byte> rgba, int channel,
         bool replicateRgb = false) {
         var a0 = src[0];
@@ -304,7 +287,6 @@ public static class DdsDecoder {
             values[7] = 255;
         }
 
-        // 48 bits of indices, little-endian across 6 bytes.
         ulong bits = 0;
         for (var i = 0; i < 6; i++)
             bits |= (ulong)src[2 + i] << (8 * i);
@@ -333,7 +315,6 @@ public static class DdsDecoder {
         }
     }
 
-    // BC5 stores X/Y of a unit normal; rebuild Z so the texture works as a tangent-space normal map.
     static void ReconstructNormalZ(Span<byte> rgba) {
         for (var i = 0; i < 16; i++) {
             var o = i * 4;

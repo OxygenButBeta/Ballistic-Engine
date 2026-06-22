@@ -1,5 +1,3 @@
-using System.IO;
-using System.Linq;
 using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.UI;
 using SysVec2 = System.Numerics.Vector2;
@@ -8,31 +6,10 @@ using static BallisticEngine.Editor.Inspector.Preview.ComponentPreviewGuiAccess;
 
 namespace BallisticEngine.Editor.Inspector.Preview;
 
-// Phase-7: the component previews below draw through the IEditorGui seam (zero raw ImGui). A shared static
-// `gui` accessor (imported via `using static`) exposes the seam to every preview class without each
-// needing its own field. EditorGui.Shared is the editor's single stateless seam handle, set at startup.
 internal static class ComponentPreviewGuiAccess {
     internal static IEditorGui gui => EditorGui.Shared;
 }
 
-// The per-component preview sections (editor-rework Rule 1 / Phase B1), one self-registering
-// IComponentPreview each. These REPLACE the `if (behaviour is Renderer/Volume/Terrain/...) DrawXxxSection`
-// instanceof chain that used to live inline in InspectorPanel.DrawComponent. Discovery is by
-// [ComponentPreview] (engine attribute) via TypeCache; order is deterministic by priority then type name
-// (DeterministicResolver). The previews are stateless — per-section preview state stays as statics on
-// InspectorPanel — so the registry keeps a single shared instance per class.
-//
-// RW1.1 (chunk 43): the section BODIES for Renderer/Health/TrailRenderer now LIVE HERE (moved out of the
-// InspectorPanel god-panel) — phase B only moved the DISPATCH to this registry, leaving the bodies behind
-// under an explicit "later chunk" contract; this is that chunk. The relocated bodies are byte-identical to
-// the old inline call: they reach the panel's private EditorState through ctx.Panel.MarkViewportDirty() and
-// the shared grid/row helpers (InspectorPanel.BeginGrid / .Row, widened to internal static for exactly this).
-// The remaining shims (Volume/Terrain/AudioSource/Animator/...) still delegate back into InspectorPanel
-// section methods via the context — RW1.2+ migrate those bodies the same way.
-
-// Renderer: per-submesh material slots (Unity's Materials list). Each submesh of a multi-material mesh
-// gets a real EDITABLE asset slot (drag-drop + picker) bound to a per-submesh override; long lists go in a
-// scrolling box. (Replaced the old read-only label list, capped at 24, in 2026-06-18.)
 [ComponentPreview(typeof(Renderer))]
 internal sealed class RendererPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
@@ -40,15 +17,11 @@ internal sealed class RendererPreview : IComponentPreview {
         DrawSubMeshMaterials(renderer, ctx.Panel);
     }
 
-    // Multi-material meshes carry a baked material ref per submesh (the .mat the importer generated). Each
-    // submesh gets an EDITABLE slot bound to a per-submesh override (Renderer.sharedMaterials); a null
-    // override inherits the baked material, assigning one overrides just that submesh.
     static void DrawSubMeshMaterials(Renderer renderer, InspectorPanel panel) {
         Mesh mesh = renderer.SharedMesh;
         if (mesh?.SubMeshes is not { Length: > 1 } subMeshes)
             return;
 
-        // A single-submesh renderer (one entity per source part) shows just its own slot.
         int only = renderer.SubMeshIndex;
         if (only >= 0 && only < subMeshes.Length) {
             EditorDecoration.DrawSectionHeader("Material");
@@ -56,8 +29,6 @@ internal sealed class RendererPreview : IComponentPreview {
             return;
         }
 
-        // Whole-mesh renderers of split imports can have hundreds of submeshes; keep the rows in a scrolling
-        // box (every slot reachable, no silent truncation) rather than capping the visible count.
         EditorDecoration.DrawSectionHeader($"Materials ({subMeshes.Length})");
         const int ScrollThreshold = 8;
         bool scroll = subMeshes.Length > ScrollThreshold;
@@ -72,8 +43,6 @@ internal sealed class RendererPreview : IComponentPreview {
             gui.EndChild();
     }
 
-    // One submesh row: the submesh name as a label, then its editable material-override slot below it. A null
-    // override inherits the material baked into the mesh; assigning one overrides just that submesh.
     static void DrawSlotRow(Renderer renderer, InspectorPanel panel, SubMeshData sub, int i) {
         gui.PushId(i);
         string label = string.IsNullOrEmpty(sub.Name) ? $"Submesh {i}" : sub.Name;
@@ -88,13 +57,8 @@ internal sealed class RendererPreview : IComponentPreview {
     }
 }
 
-// Inline profile editing under a Volume component, Unity-style: the profile's overrides are
-// edited in place (and saved straight back to the .volume asset), or a fresh profile asset
-// can be created and assigned in one click. Body moved here in RW1.3.
 [ComponentPreview(typeof(Volume))]
 internal sealed class VolumePreview : IComponentPreview {
-    // Volume-profile undo bookkeeping: the snapshot from before the current drag began, and the
-    // last settled (clean) snapshot to use as its baseline.
     static object volumeUndoBefore;
     static object volumeUndoLastClean;
 
@@ -112,26 +76,15 @@ internal sealed class VolumePreview : IComponentPreview {
         }
 
         EditorDecoration.DrawSectionHeader("Overrides");
-        // UNDO for volume-profile edits (bug 2b): the profile is a .volume ASSET, outside scene-undo.
-        // Snapshot before drawing; if a parameter changed, push a callback undo step when the edit
-        // SETTLES (no item active) so a slider drag is one entry, not hundreds. The before-snapshot is
-        // captured at the start of a drag (the frame the change first appears) and held until release.
         object beforeSnap = VolumeProfileEditor.Snapshot(volume.Profile);
         if (VolumeProfileEditor.Draw(volume.Profile)) {
             VolumeProfileEditor.SaveToAsset(volume.Profile);
             panel.MarkViewportDirty();
 
             VolumeProfile prof = volume.Profile;
-            // Remember the state from BEFORE this drag started (first changed frame).
             volumeUndoBefore ??= volumeUndoLastClean;
             volumeUndoBefore ??= beforeSnap;
 
-            // Commit one undo step when the interaction ends (mouse released / instantaneous widget).
-            // F2: route the .volume ASSET edit through the EditorCommands.EditAsset choke point (which is
-            // EditorUndo.PushCallback under the hood) so every asset edit shares one undo entry point. The
-            // edit already happened during VolumeProfileEditor.Draw above, so the mutate step is a no-op --
-            // EditAsset only records the before/after revert pair here. Byte-identical to the prior
-            // PushCallback (same label, same applyOld/applyNew closures).
             if (!gui.IsAnyItemActive()) {
                 object before = volumeUndoBefore;
                 object after = VolumeProfileEditor.Snapshot(prof);
@@ -143,7 +96,6 @@ internal sealed class VolumePreview : IComponentPreview {
             }
         }
         else if (!gui.IsAnyItemActive()) {
-            // Idle: this clean snapshot is the "before" for the next edit.
             volumeUndoLastClean = beforeSnap;
             volumeUndoBefore = null;
         }
@@ -164,10 +116,6 @@ internal sealed class VolumePreview : IComponentPreview {
 
         VolumeProfileLoader.Save(new VolumeProfile(), AssetDatabase.Project.ResolveAbsolute(assetPath));
 
-        // The new file needs a refresh pass to get its meta/GUID before it can be loaded + assigned.
-        // Single-entity edit (the Volume's own entity is reachable), so scope it to that entity --
-        // PushEntity restores just it in place (Push->PushEntity scoping aside, byte-identical). The
-        // snapshot still fires inside the deferred callback right before the mutate.
         AsyncAssetImport.Request("Importing profile...", onFinished: () => {
             EditorCommands.EditEntity(entity, "Assign Profile",
                 () => volume.Profile = AssetDatabase.Load<VolumeProfile>(assetPath));
@@ -175,10 +123,6 @@ internal sealed class VolumePreview : IComponentPreview {
     }
 }
 
-// Terrain sculpting palette: a Sculpt toggle that arms the Scene-view brush, the brush mode, and
-// radius/strength (and a target height for Flatten/Set). Drives TerrainTool's static state; the
-// actual sculpting happens in the viewport. Not part of scene undo — brush settings are editor
-// tool state, and each stroke pushes its own undo + saves the .terrain asset. Body moved here in RW1.3.
 [ComponentPreview(typeof(Terrain))]
 internal sealed class TerrainPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) => DrawTerrainBrushSection((Terrain)ctx.Behaviour);
@@ -203,7 +147,6 @@ internal sealed class TerrainPreview : IComponentPreview {
         if (!armed)
             return;
 
-        // Brush mode.
         string[] modes = ["Raise", "Lower", "Smooth", "Flatten", "Set"];
         int mode = (int)TerrainTool.Brush;
         gui.SetNextItemWidth(-1);
@@ -218,7 +161,6 @@ internal sealed class TerrainPreview : IComponentPreview {
         if (gui.SliderFloat("Strength", ref strength, 0.01f, 2f, "%.2f"))
             TerrainTool.Strength = strength;
 
-        // Flatten/Set converge toward a target height (0..1 of the terrain's HeightScale).
         if (TerrainTool.Brush is TerrainSculpt.Brush.Flatten or TerrainSculpt.Brush.Set) {
             float target = TerrainTool.TargetHeight;
             if (gui.SliderFloat("Target Height", ref target, 0f, 1f, "%.2f"))
@@ -231,11 +173,6 @@ internal sealed class TerrainPreview : IComponentPreview {
     }
 }
 
-// AudioSource preview: a Preview/Stop button so you can hear a clip without entering play mode.
-// Uses the static Audio facade (play-mode-independent), so it works in edit mode; AudioSource.Play
-// itself is gated to play mode. Graceful no-op when no audio device is present (headless CI).
-// Body moved here in RW1.3 — the audioPreviewVoice/audioPreviewTime statics stay on InspectorPanel
-// (shared with the .wav asset-clip preview DrawAudioClipAsset, an RW1.4 body) and are reached here.
 [ComponentPreview(typeof(AudioSource))]
 internal sealed class AudioSourcePreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
@@ -267,9 +204,6 @@ internal sealed class AudioSourcePreview : IComponentPreview {
     }
 }
 
-// Animator preview: a play/pause toggle + a scrub slider that evaluates the clip in edit mode, so
-// you can pose the skinned character without entering play. Drives Animator.EvaluatePreview, which
-// runs the same sample->skeleton->skinning pipeline as play-mode Tick. Body moved here in RW1.2.
 [ComponentPreview(typeof(Animator))]
 internal sealed class AnimatorPreview : IComponentPreview {
     static bool animatorPreviewPlaying;
@@ -280,12 +214,6 @@ internal sealed class AnimatorPreview : IComponentPreview {
             ctx.Panel.MarkViewportDirty);
 }
 
-// AnimatorController: a live view of the state machine. The graph is script-built (states +
-// transitions are wired in OnBegin), so this is a runtime DEBUG/DRIVE surface — it lists the states
-// with the current one highlighted, and renders a poker for each declared parameter (checkbox for
-// bool, slider for float/int, a button for triggers) so you can drive the graph from the inspector
-// in play mode without writing test code (very AI-managed-friendly: set "Speed" and watch it cross
-// from idle->walk->run live). Body moved here in RW1.2.
 [ComponentPreview(typeof(AnimatorController))]
 internal sealed class AnimatorControllerPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
@@ -301,13 +229,11 @@ internal sealed class AnimatorControllerPreview : IComponentPreview {
         if (!SceneManager.IsPlaying)
             gui.TextDisabled("Enter play mode to drive the graph.");
 
-        // Current state banner.
         string cur = controller.CurrentStateName ?? "(none)";
         gui.Text("Current: ");
         gui.SameLine();
         gui.TextColored(EditorTheme.Info, cur);
 
-        // State list with the active one highlighted.
         gui.Spacing();
         gui.TextDisabled($"States ({controller.StateCount})");
         foreach (AnimatorController.State s in controller.States) {
@@ -318,12 +244,10 @@ internal sealed class AnimatorControllerPreview : IComponentPreview {
                 gui.TextColored(EditorTheme.Info, $"{label}  ->  {clipName}");
             else
                 gui.TextDisabled($"{label}  ->  {clipName}");
-            // A click jumps to the state (play mode) — handy for testing.
             if (SceneManager.IsPlaying && gui.IsItemClicked())
                 controller.Play(s.Name);
         }
 
-        // Parameter pokers.
         var prms = controller.Parameters;
         if (prms.Count > 0) {
             EditorDecoration.DrawSectionHeader("Parameters");
@@ -347,7 +271,7 @@ internal sealed class AnimatorControllerPreview : IComponentPreview {
                         if (gui.DragInt(name, ref iv)) controller.SetInt(name, iv);
                         break;
                     }
-                    default: { // Float
+                    default: {
                         float fv = controller.GetFloat(name);
                         if (gui.DragFloat(name, ref fv, 0.05f)) controller.SetFloat(name, fv);
                         break;
@@ -357,14 +281,10 @@ internal sealed class AnimatorControllerPreview : IComponentPreview {
         }
 
         if (SceneManager.IsPlaying)
-            ctx.Panel.MarkViewportDirty(); // keep repainting so transitions show live
+            ctx.Panel.MarkViewportDirty();
     }
 }
 
-// LightAnimator: a live preview toggle that animates the light IN EDIT MODE (so you can dial in a
-// flicker/pulse without entering play), plus a warning if there's no light on the entity to drive.
-// The IntensityCurve / ColorOverTime members render their curve+gradient widgets automatically via
-// the reflection DrawMember, so this only adds the preview control. Body moved here in RW1.2.
 [ComponentPreview(typeof(LightAnimator))]
 internal sealed class LightAnimatorPreview : IComponentPreview {
     static bool lightAnimPreview;
@@ -386,12 +306,11 @@ internal sealed class LightAnimatorPreview : IComponentPreview {
                 new SysVec2(140, 0))) {
             lightAnimPreview = !lightAnimPreview;
             if (lightAnimPreview) lightAnimPreviewClock = 0f;
-            else { lightAnim.RestoreBase(); ctx.Panel.MarkViewportDirty(); } // un-dim the light when stopping
+            else { lightAnim.RestoreBase(); ctx.Panel.MarkViewportDirty(); }
         }
         gui.SameLine();
         gui.TextDisabled(lightAnim.Animation.ToString());
 
-        // Drive the light in edit mode along its own preview clock (play mode runs Tick itself).
         if (lightAnimPreview && !SceneManager.IsPlaying) {
             lightAnimPreviewClock += (float)Time.DeltaTime;
             lightAnim.Apply(lightAnimPreviewClock);
@@ -400,9 +319,6 @@ internal sealed class LightAnimatorPreview : IComponentPreview {
     }
 }
 
-// Spawner: live alive/pooled counts + a manual Spawn One / Clear. Spawning only runs in play mode
-// (Tick), so the manual button is most useful there; in edit mode it instantiates immediately so
-// you can preview the prefab placement, and Clear cleans those up. Body moved here in RW1.2.
 [ComponentPreview(typeof(Spawner))]
 internal sealed class SpawnerPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
@@ -429,11 +345,10 @@ internal sealed class SpawnerPreview : IComponentPreview {
         }
 
         if (SceneManager.IsPlaying && spawner.AliveCount > 0)
-            ctx.Panel.MarkViewportDirty(); // keep repainting while instances live/expire
+            ctx.Panel.MarkViewportDirty();
     }
 }
 
-// Health: a live HP bar + edit-mode damage/heal/kill/revive test buttons. Body moved here in RW1.1.
 [ComponentPreview(typeof(Health))]
 internal sealed class HealthPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
@@ -441,7 +356,6 @@ internal sealed class HealthPreview : IComponentPreview {
         EditorDecoration.DrawSectionHeader("Health");
 
         float frac = health.HealthFraction;
-        // Manual bar (green->red by remaining fraction), so it works without ProgressBar styling.
         IEditorDrawList draw = gui.WindowDrawList;
         SysVec2 p = gui.CursorScreenPos;
         float w = MathF.Max(gui.ContentRegionAvail.X, 60f);
@@ -469,10 +383,6 @@ internal sealed class HealthPreview : IComponentPreview {
     }
 }
 
-// UIDocument's Uxml/Uss are string PATHS; give them drag-drop target fields so you can drop a
-// .uxml/.uss (or .uihtml/.uss) asset from the browser instead of typing the address (item 15).
-// Body moved here in RW1.3 — DrawPathDropField came along as a private static helper; the shared
-// AcceptGuidDrop stays on InspectorPanel (used by 8 sites) and is reached as InspectorPanel.AcceptGuidDrop.
 [ComponentPreview(typeof(UIDocument))]
 internal sealed class UIDocumentPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
@@ -484,19 +394,15 @@ internal sealed class UIDocumentPreview : IComponentPreview {
         gui.TextDisabled("Drag a markup/style asset here, or type its Assets/... path.");
     }
 
-    // A text field for an asset PATH that also accepts a drag-drop of a matching-extension asset (sets
-    // the field to the dropped asset's path). `exts` are the accepted extensions (lowercase, with dot).
     static void DrawPathDropField(InspectorPanel panel, string label, string current, string[] exts, Action<string> apply) {
         gui.PushId(label);
         gui.TextDisabled(label);
         var s = current ?? "";
         gui.SetNextItemWidth(-1);
         if (gui.InputText("##path", ref s, 256)) {
-            // `apply` is an opaque closure that may write any target (UIDocument paths etc.) and the
-            // entity is not reachable here, so this stays a whole-scene structural snapshot.
             EditorCommands.Structural($"Edit {label}", () => { apply(s); panel.MarkViewportDirty(); });
         }
-        // Drop target over the field: accept a single matching asset and write its path.
+
         if (InspectorPanel.AcceptGuidDrop(out Guid guid)) {
             string path = AssetDatabase.GuidToAssetPath(guid);
             if (path is not null && exts.Any(e => path.EndsWith(e, StringComparison.OrdinalIgnoreCase))) {
@@ -507,18 +413,12 @@ internal sealed class UIDocumentPreview : IComponentPreview {
     }
 }
 
-// ParticleSystem preview: it already animates live in the editor (AdvanceAll runs every editor
-// frame), so this just adds a Restart (clear) + a one-shot Emit test + a live count, and keeps the
-// viewport repainting while particles are alive so you see the motion. Body moved here in RW1.2.
 [ComponentPreview(typeof(ParticleSystem))]
 internal sealed class ParticleSystemPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {
         var particles = (ParticleSystem)ctx.Behaviour;
         EditorDecoration.DrawSectionHeader("Preview");
 
-        // Two equal half-width buttons that fill the row (auto-width 110px clipped the labels to
-        // "Resta.../Emit 5" in a narrow inspector); the live count goes on its own line so nothing
-        // gets squeezed off.
         float spacing = gui.ItemSpacing.X;
         float w = (gui.ContentRegionAvail.X - spacing) * 0.5f;
         if (gui.Button($"{EditorIcons.Refresh}  Restart", new SysVec2(w, 0)))
@@ -533,7 +433,6 @@ internal sealed class ParticleSystemPreview : IComponentPreview {
     }
 }
 
-// TrailRenderer: animates live in the editor; a Clear + a live point count. Body moved here in RW1.1.
 [ComponentPreview(typeof(TrailRenderer))]
 internal sealed class TrailRendererPreview : IComponentPreview {
     public void Draw(in ComponentPreviewContext ctx) {

@@ -1,9 +1,5 @@
 namespace BallisticEngine;
 
-// Stylistic grade components, all neutral/off by default so the calibrated PBR output
-// isn't silently distorted. Split per effect, Unity-style, so a profile only carries
-// the looks it actually overrides.
-
 public sealed class ColorAdjustments : VolumeComponent {
     [Tooltip("Midtone contrast around mid-grey.")]
     public readonly ClampedFloatParameter contrast = new(1f, 0.5f, 2f);

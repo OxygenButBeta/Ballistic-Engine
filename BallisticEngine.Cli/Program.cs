@@ -2,13 +2,6 @@ using BallisticEngine.Cli.Commands;
 
 namespace BallisticEngine.Cli;
 
-// `bal` — the engine's command-line surface (AI-operability roadmap layer 1). Every verb prints JSON
-// to stdout and returns an honest exit code: 0 = success, 1 = a handled error (printed as a JSON
-// {"error": ...} object), 2 = usage error (unknown verb / bad args). Diagnostics go to stderr so
-// stdout stays machine-parseable.
-//
-// Build order (per the roadmap): schema -> validate -> scene CRUD -> import -> map/describe. This is
-// the foundation; verbs are added as separate ICommand implementations with zero central plumbing.
 internal static class Program {
     static readonly IReadOnlyDictionary<string, ICommand> Commands = new ICommand[] {
         new SchemaCommand(),
@@ -49,8 +42,6 @@ internal static class Program {
             return 2;
         }
         catch (Exception ex) {
-            // A handled failure: emit the error as JSON on stdout (so a caller parsing stdout sees it)
-            // and a human line on stderr.
             Json.WriteError(ex.Message);
             Console.Error.WriteLine($"bal {verb}: {ex.Message}");
             return 1;

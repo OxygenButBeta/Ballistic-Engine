@@ -1,13 +1,5 @@
 namespace BallisticEngine;
 
-// Reflections override — the single product control for realtime specular reflections. One dropdown picks the
-// technique: Off (specular comes from the IBL/skybox cube only), Screen Space (SSR — fast, screen-bounded), or
-// Ray Traced (DXR — off-screen + sky reflect correctly, falls back to SSR without hardware RT). The mode IS the
-// master gate: Off skips the reflections pass entirely (drives PostFX.SsrEnabled = mode != Off in the bridge).
-//
-// Defaults mirror PostProcessSettings (mode Off, intensity 1, cache-fed RT on) so a scene with no Reflection
-// volume behaves byte-identically to the engine defaults. Drives the DX12 reflections pass via
-// VolumePostProcessing.Apply → PostProcessSettings.{ReflectionMode,SsrEnabled,SsrIntensity,LumenReflections}.
 public sealed class Reflections : VolumeComponent {
     [Tooltip("Reflection technique. Off = IBL/skybox cube only. Screen Space = SSR (fast, screen-bounded). " +
              "Ray Traced = DXR (off-screen + sky reflect correctly; falls back to SSR without hardware RT).")]

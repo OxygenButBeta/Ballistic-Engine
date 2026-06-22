@@ -2,12 +2,8 @@ using System.Runtime.InteropServices;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Engine-native binary audio, Library\Artifacts\<guid>.baud:
-//   u32 magic 'BAUD' | u32 version | i32 channels | i32 sampleRate | i32 sampleCount | i16[sampleCount]
-// Samples are interleaved 16-bit signed PCM (AudioData's canonical form). The decode step (WAV/OGG)
-// already normalized to this, so loading is a straight blit — no per-load format conversion.
 public static class AudioArtifact {
-    const uint Magic = 0x44554142; // "BAUD"
+    const uint Magic = 0x44554142;
     const uint FormatVersion = 1;
 
     public static void Write(string path, in AudioData data) {
@@ -31,7 +27,7 @@ public static class AudioArtifact {
             Debugging.LogError($"'{assetPath ?? "audio"}': not a BAUD artifact (bad magic).");
             return default;
         }
-        reader.ReadUInt32(); // version (only 1 exists)
+        reader.ReadUInt32();
         int channels = reader.ReadInt32();
         int sampleRate = reader.ReadInt32();
         int sampleCount = reader.ReadInt32();

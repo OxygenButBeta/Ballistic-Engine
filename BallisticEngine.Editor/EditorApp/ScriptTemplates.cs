@@ -2,11 +2,7 @@ using System.Text;
 
 namespace BallisticEngine.Editor;
 
-// Templates for the asset browser's "New Script" (and the pristine-rename rewrite that keeps the
-// class name matching the file name, Unity-style). The engine itself never cares about file/class
-// name agreement — ComponentRegistry keys on the type name — this is purely least-surprise.
 internal static class ScriptTemplates {
-    // "New Script 2" -> "NewScript2"; leading digit gets a '_' prefix; empty -> "NewScript".
     public static string ClassName(string fileStem) {
         var builder = new StringBuilder(fileStem.Length);
         foreach (var c in fileStem)
@@ -20,8 +16,6 @@ internal static class ScriptTemplates {
         return builder.ToString();
     }
 
-    // Lifecycle overrides are plain `protected` — game assemblies override the engine's
-    // `protected internal` members across an assembly boundary (C# drops the `internal` half).
     public static string Behaviour(string fileStem) =>
         $$"""
         using BallisticEngine;
@@ -38,8 +32,6 @@ internal static class ScriptTemplates {
 
         """;
 
-    // If the renamed script still has its untouched template content, regenerate it for the new
-    // name so the class follows the file. Any user edit (even whitespace) disables the rewrite.
     public static void RewriteIfPristine(string oldStem, string newStem, string absolutePath) {
         try {
             if (File.ReadAllText(absolutePath) == Behaviour(oldStem))

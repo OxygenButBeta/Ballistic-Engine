@@ -1,20 +1,6 @@
 namespace BallisticEngine;
 
-// Volumetric Lighting: the one-stop atmospheric override that bundles three layers driven off a single
-// camera-direction raymarch (no extra GPU pass — they share the fog march that already samples the sun
-// cascades each step):
-//
-//   • Fog       — physical exponential height fog (extinction + sun/sky in-scatter). Same medium as the
-//                 old VolumetricFog override (which this supersedes; that one is now hidden from the menu).
-//   • God Rays  — an AESTHETIC light-shaft layer with its OWN visibility density, DECOUPLED from the fog
-//                 density. The point: crisp sun shafts WITHOUT cranking the fog to non-physical values.
-//   • Dust      — procedural sun-lit motes floating in the air (a 3D noise field along the same march),
-//                 shadow-gated so they only sparkle where the sun reaches, drifting over time.
-//
-// Everything off by default — it's an atmospheric, scene-dependent look. Turning the override on with
-// default values reproduces the old physical fog exactly; God Rays and Dust are independent opt-ins.
 public sealed class VolumetricLighting : VolumeComponent {
-    // --- Fog (physical) ---
     [Tooltip("Master toggle for the physical fog medium (the height fog + sun/sky in-scatter).")]
     public readonly BoolParameter enabled = new(false);
 
@@ -54,7 +40,6 @@ public sealed class VolumetricLighting : VolumeComponent {
     [Tooltip("Colour grade on the fog's in-scatter (extinction stays neutral).")]
     public readonly ColorParameter tint = new(Vector3.One);
 
-    // --- God Rays (aesthetic shafts, independent of fog density) ---
     [FoldoutGroup("God Rays", defaultOpen: false)]
     [Tooltip("Turn on the aesthetic light-shaft layer. Works even with the fog density at a physical (low) value.")]
     public readonly BoolParameter shaftsEnabled = new(false);
@@ -79,7 +64,6 @@ public sealed class VolumetricLighting : VolumeComponent {
     [Tooltip("Colour grade on the shafts only.")]
     public readonly ColorParameter shaftTint = new(Vector3.One);
 
-    // --- Dust (procedural floating motes) ---
     [FoldoutGroup("Dust", defaultOpen: false)]
     [Tooltip("Turn on procedural sun-lit dust motes floating in the air (no scene objects; a noise field along the march).")]
     public readonly BoolParameter dustEnabled = new(false);

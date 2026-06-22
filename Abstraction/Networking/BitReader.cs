@@ -1,6 +1,5 @@
 namespace BallisticEngine.Networking;
 
-// The read half of BitWriter — same bit order, same quantization. Reads a payload the writer packed.
 public ref struct BitReader {
     readonly ReadOnlySpan<byte> buffer;
     int bitPos;
@@ -37,8 +36,6 @@ public ref struct BitReader {
 
     public float ReadQuantized(float min, float max, int bits) {
         uint q = ReadBits(bits);
-        // 64-bit shift so `bits == 32` gives 0xFFFFFFFF, not 0 (see BitWriter.WriteQuantized) — the
-        // `(1u << 32) - 1` form wraps to 0 in C# and would make every bits=32 field decode to `min`.
         uint levels = (uint)((1UL << bits) - 1UL);
         float t = levels > 0 ? q / (float)levels : 0f;
         return min + t * (max - min);

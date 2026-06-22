@@ -1,15 +1,5 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// This source code is licensed under the MIT license found in the
-// LICENSE file in the root directory of this source tree.
-//
-// Original: yoga/YGEnums.h, yoga/YGEnums.cpp
-
 namespace Facebook.Yoga
 {
-    // YG-prefixed enums for C-style public API compatibility.
-    // These mirror the internal enums (Direction, Align, etc.) with the same ordinal values.
-
     public enum YGAlign
     {
         Auto,
@@ -24,8 +14,6 @@ namespace Facebook.Yoga
         Start,
         End
     }
-
-    // YGBoxSizing is defined in enums\BoxSizing.cs
 
     public enum YGDimension
     {
@@ -60,8 +48,6 @@ namespace Facebook.Yoga
         Vertical,
         All
     }
-
-    // YGErrata is defined in enums\Errata.cs
 
     public enum YGExperimentalFeature
     {
@@ -117,8 +103,6 @@ namespace Facebook.Yoga
         Fatal
     }
 
-    // YGMeasureMode is defined in event\event.cs
-
     public enum YGNodeType
     {
         Default,
@@ -162,8 +146,6 @@ namespace Facebook.Yoga
     /// </summary>
     public static class YGEnumExtensions
     {
-        // Conversion: YG* enum <-> internal enum (same ordinal values, safe to cast)
-
         public static Direction ToInternal(this YGDirection value) => (Direction)(byte)value;
         public static YGDirection ToYG(this Direction value) => (YGDirection)(byte)value;
 
@@ -217,8 +199,6 @@ namespace Facebook.Yoga
 
         public static Unit ToInternal(this YGUnit value) => (Unit)(byte)value;
         public static YGUnit ToYG(this Unit value) => (YGUnit)(byte)value;
-
-        // Fast string conversion methods
 
         public static string ToStringFast(this YGAlign value)
         {

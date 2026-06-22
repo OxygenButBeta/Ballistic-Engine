@@ -1,20 +1,8 @@
-using System;
-using System.Linq;
-using System.Numerics;
 using BallisticEngine.UI;
 using Color = BallisticEngine.UI.Color;
 
 namespace BallisticEngine.Editor;
 
-// The right-hand properties pane of the UI Builder: edits the selected element's identity (name, classes),
-// text, and the full Style surface through the IEditorGui seam. Edits write onto the live VisualElement's
-// Style for instant WYSIWYG, then reconcile the element's INLINE OVERRIDE store (doc.SyncInline) so a
-// class-provided value is never frozen into the saved inline style (the inline-shadows-class fix). One undo
-// entry is pushed per edit gesture.
-//
-// Hand-authored (not the attribute DrawerRegistry): Style is a CSS-semantics type (Length units, per-edge
-// box model, premultiplied colors) the component-member pipeline doesn't model; the widgets here are
-// CSS-shaped, which is the right vocabulary for a stylesheet editor.
 internal sealed class UIBuilderInspector
 {
     bool _gesturePushed;
@@ -47,7 +35,6 @@ internal sealed class UIBuilderInspector
         if (el is Image && gui.CollapsingHeader("Image", defaultOpen: true)) DrawImage(gui, doc, (Image)el);
     }
 
-    // ---- identity ------------------------------------------------------------
     void DrawIdentity(IEditorGui gui, UIBuilderDocument doc, VisualElement el)
     {
         string name = el.Name ?? "";
@@ -64,7 +51,6 @@ internal sealed class UIBuilderInspector
         }
     }
 
-    // ---- classes (assign / remove; the USS class-list editor side) -----------
     void DrawClasses(IEditorGui gui, UIBuilderDocument doc, VisualElement el)
     {
         gui.TextDisabled("Classes");
@@ -91,7 +77,6 @@ internal sealed class UIBuilderInspector
         }
     }
 
-    // ---- layout --------------------------------------------------------------
     void DrawLayout(IEditorGui gui, UIBuilderDocument doc, VisualElement el)
     {
         var s = el.Style;
@@ -132,7 +117,6 @@ internal sealed class UIBuilderInspector
         !float.IsNaN(s.GetInset(Edge.Left)) || !float.IsNaN(s.GetInset(Edge.Top)) ||
         !float.IsNaN(s.GetInset(Edge.Right)) || !float.IsNaN(s.GetInset(Edge.Bottom));
 
-    // ---- box model (per-edge margin / padding + border width) ----------------
     void DrawBox(IEditorGui gui, UIBuilderDocument doc, VisualElement el)
     {
         var s = el.Style;
@@ -145,7 +129,6 @@ internal sealed class UIBuilderInspector
             s.SetBorderWidth(Edge.All, bw);
     }
 
-    // ---- appearance ----------------------------------------------------------
     void DrawAppearance(IEditorGui gui, UIBuilderDocument doc, VisualElement el)
     {
         var s = el.Style;
@@ -155,7 +138,6 @@ internal sealed class UIBuilderInspector
         float radius = s.BorderRadiusTopLeft;
         if (Edit(gui, doc, el, () => gui.DragFloat("Corner Radius", ref radius, 0.5f, 0, 999)))
             s.BorderRadius = radius;
-        // per-corner
         Corner(gui, doc, el, "  TL", s.BorderRadiusTopLeft, v => s.BorderRadiusTopLeft = v);
         Corner(gui, doc, el, "  TR", s.BorderRadiusTopRight, v => s.BorderRadiusTopRight = v);
         Corner(gui, doc, el, "  BR", s.BorderRadiusBottomRight, v => s.BorderRadiusBottomRight = v);
@@ -164,7 +146,6 @@ internal sealed class UIBuilderInspector
         float op = s.Opacity;
         if (Edit(gui, doc, el, () => gui.SliderFloat("Opacity", ref op, 0f, 1f, "%.2f"))) s.Opacity = op;
 
-        // box-shadow
         bool sh = s.HasBoxShadow;
         if (Edit(gui, doc, el, () => gui.Checkbox("Box Shadow", ref sh))) s.HasBoxShadow = sh;
         if (s.HasBoxShadow)
@@ -206,7 +187,6 @@ internal sealed class UIBuilderInspector
         bool italic = s.Italic;
         if (Edit(gui, doc, el, () => gui.Checkbox("Italic", ref italic))) s.Italic = italic;
 
-        // text-shadow
         bool ts = s.HasTextShadow;
         if (Edit(gui, doc, el, () => gui.Checkbox("Text Shadow", ref ts))) s.HasTextShadow = ts;
         if (s.HasTextShadow)
@@ -224,7 +204,6 @@ internal sealed class UIBuilderInspector
         gui.SetNextItemWidth(-1);
         if (Edit(gui, doc, img, () => gui.InputTextWithHint("Source", "Assets/...png", ref src, 256), reconcile: false))
             img.Texture = string.IsNullOrWhiteSpace(src) ? null : src.Trim();
-        // accept an asset drag-drop onto the field
         if (gui.BeginDragDropTarget())
         {
             string dropped = gui.AcceptDragDropPayloadString("ASSET");
@@ -233,8 +212,6 @@ internal sealed class UIBuilderInspector
         }
         EnumCombo(gui, doc, img, "Scale Mode", img.ScaleMode, v => img.ScaleMode = v, reconcile: false);
     }
-
-    // ---- widget helpers ------------------------------------------------------
 
     void LengthField(IEditorGui gui, UIBuilderDocument doc, VisualElement el, string label, Length cur, Action<Length> apply)
     {
@@ -259,7 +236,6 @@ internal sealed class UIBuilderInspector
         if (Edit(gui, doc, el, () => gui.DragFloat(label, ref v, speed, min, max))) apply(v);
     }
 
-    // A float field where NaN means "unset" (max-width, aspect-ratio). Shows 0 for NaN; a checkbox toggles set.
     void NanFloatField(IEditorGui gui, UIBuilderDocument doc, VisualElement el, string label, float cur, Action<float> apply)
     {
         bool set = !float.IsNaN(cur);
@@ -275,7 +251,6 @@ internal sealed class UIBuilderInspector
         if (ck || cv) apply(set ? v : float.NaN);
     }
 
-    // An inset field (NaN = unset).
     void InsetField(IEditorGui gui, UIBuilderDocument doc, VisualElement el, string label, Edge edge, float cur, Action<float> apply)
     {
         float v = float.IsNaN(cur) ? 0 : cur;
@@ -288,7 +263,6 @@ internal sealed class UIBuilderInspector
         if (Edit(gui, doc, el, () => gui.DragFloat(label, ref v, 0.5f, 0, 999))) apply(v);
     }
 
-    // A 4-field per-edge composite (L T R B) for margin/padding.
     void EdgeField(IEditorGui gui, UIBuilderDocument doc, VisualElement el, string id, Func<Edge, float> get, Action<Edge, float> set)
     {
         gui.PushId(id);
@@ -330,9 +304,6 @@ internal sealed class UIBuilderInspector
         return false;
     }
 
-    // Wrap a widget so a real change marks dirty, pushes ONE undo step per gesture, and reconciles the
-    // element's inline-override store (so class values aren't frozen into inline). `reconcile` is false for
-    // identity edits (name/text/src) that aren't style.
     bool Edit(IEditorGui gui, UIBuilderDocument doc, VisualElement el, Func<bool> widget, bool reconcile = true)
     {
         bool changed = widget();

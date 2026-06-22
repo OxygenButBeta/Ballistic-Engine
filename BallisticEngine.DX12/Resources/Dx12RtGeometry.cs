@@ -1,41 +1,19 @@
-using System;
-using System.Collections.Generic;
-using System.Numerics;
 using Vortice.Direct3D12;
 using Vortice.DXGI;
 using GLVector3 = System.Numerics.Vector3;
 
 namespace BallisticEngine.DX12;
 
-// Per-instance geometry attributes for the DXR hit shaders (RT-GI P1, reused by RT reflections + the future
-// surface cache). The BLAS carries only positions, so a closest-hit shader can't see normals/UVs/material.
-// This exposes, for every TLAS instance (same iteration order as Dx12SceneAS, so InstanceID() lines up):
-//   - the mesh's INDEX buffer       (typed R32_UInt SRV)   → fetch the 3 indices of PrimitiveIndex()
-//   - the mesh's NORMAL buffer       (StructuredBuffer<float3>) → interpolate the smooth shading normal
-//   - the mesh's UV buffer           (StructuredBuffer<float2>) → interpolate the texcoord for albedo
-//   - a PER-TRIANGLE MaterialId buf  (StructuredBuffer<uint>)   → which GpuMaterials[] entry shades this tri
-// all registered in the shared bindless heap (Dx12Backend.BindlessHeap); the hit shader reads
-// ResourceDescriptorHeap[idx]. A per-instance record {NormalIdx,UvIdx,IndexIdx,TriMatIdx} (root SRV) is
-// indexed by InstanceID(). The per-triangle MaterialId resolves the SAME id GBufferBindless uses (from the
-// GPU-driven renderer's Material→id map), so RT hit shading decodes the material byte-identically to raster.
-//
-// Cached by a (instance-set + material-table) stamp: a static scene builds once. Rebuilt with the bindless
-// heap (it lives in the same heap the GPU-driven material table resets), so EnsureMaterialTable runs FIRST.
 public sealed class Dx12RtGeometry : IDisposable {
     readonly Dx12Device dev;
 
-    // One record per TLAS instance — the bindless indices the hit shader needs. Matches HLSL RtInstance.
-    // PositionIdx (added for Lumen V2 P3 surface cards) exposes the mesh's POSITION buffer so a card-lighting
-    // compute pass can fetch a triangle's world vertices (centroid + area) to light it; the hit shaders that
-    // only need normal/uv/material ignore it. TriCount lets the card cache lay out per-instance triangle ranges.
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     struct RtInstance { public uint NormalIdx, UvIdx, IndexIdx, TriMatIdx; public uint PositionIdx, TriCount, Pad0, Pad1; }
 
-    // Per-unique-mesh bindless indices (so two instances of one mesh share the SRVs + tri-material buffer).
     sealed class MeshEntry { public int NormalIdx, UvIdx, IndexIdx, TriMatIdx, PositionIdx, TriCount; public ID3D12Resource TriMatBuf; }
     readonly Dictionary<Mesh, MeshEntry> byMesh = new();
 
-    ID3D12Resource instanceBuf;     // RtInstance[] — root SRV indexed by InstanceID()
+    ID3D12Resource instanceBuf;
     public ulong InstancesGpuAddress => instanceBuf?.GPUVirtualAddress ?? 0;
     public int InstanceCount { get; private set; }
     public bool Valid => instanceBuf != null && InstanceCount > 0;
@@ -44,13 +22,10 @@ public sealed class Dx12RtGeometry : IDisposable {
 
     public Dx12RtGeometry(Dx12Device device) { dev = device; }
 
-    // Rebuild per-instance geometry records if the instance set or the material table changed. `gpu` supplies
-    // the Material→id map (byte-identical to GBufferBindless). MUST run AFTER gpu.EnsureMaterialTable (which
-    // resets the bindless heap our SRVs live in).
     public unsafe void Ensure(IEnumerable<IStaticMeshRenderer> renderers, Dx12GpuDrivenRenderer gpu) {
         var insts = new List<(Mesh mesh, IStaticMeshRenderer r)>();
         var h = new HashCode();
-        h.Add(gpu.MaterialTableStamp);   // a new material set means baked tri-materials are stale
+        h.Add(gpu.MaterialTableStamp);
         foreach (IStaticMeshRenderer r in renderers) {
             if (r is null || !r.IsActive || !r.IsRenderable) continue;
             Mesh mesh = r.SharedMesh;
@@ -67,8 +42,6 @@ public sealed class Dx12RtGeometry : IDisposable {
     }
 
     unsafe void Rebuild(List<(Mesh mesh, IStaticMeshRenderer r)> insts, Dx12GpuDrivenRenderer gpu) {
-        // The bindless heap was reset by EnsureMaterialTable this frame (on a material change) — our cached
-        // SRV indices are invalid, so drop the per-mesh cache and re-register. Free the old tri-material bufs.
         foreach (MeshEntry e in byMesh.Values) e.TriMatBuf?.Dispose();
         byMesh.Clear();
 
@@ -96,18 +69,13 @@ public sealed class Dx12RtGeometry : IDisposable {
         var ib = (Dx12IndexBuffer)mesh.IndexBuffer;
         var nb = (Dx12Buffer<GLVector3>)mesh.NormalBuffer;
         var ub = mesh.UvBuffer as Dx12Buffer<Vector2>;
-        var vb = (Dx12Buffer<GLVector3>)mesh.VertexBuffer;   // positions (validated present by the caller's guard)
+        var vb = (Dx12Buffer<GLVector3>)mesh.VertexBuffer;
 
         var e = new MeshEntry {
-            // Index buffer as a typed R32_UInt buffer SRV (fetch 3 indices of a triangle).
             IndexIdx = RegisterTypedSrv(ib.Resource, Format.R32_UInt, ib.ElementCount),
-            // Normal buffer as StructuredBuffer<float3> (12B stride).
             NormalIdx = RegisterStructuredSrv(nb.Resource, nb.ElementCount, 12),
-            // Position buffer as StructuredBuffer<float3> (12B) — Lumen card lighting fetches triangle vertices.
             PositionIdx = RegisterStructuredSrv(vb.Resource, vb.ElementCount, 12),
             TriCount = ib.ElementCount / 3,
-            // UV buffer as StructuredBuffer<float2> (8B). Some meshes may lack UVs → reuse normals as a stand-in
-            // (the shader's albedo just samples garbage UVs → BaseColorFactor still tints; acceptable fallback).
             UvIdx = ub?.Resource is not null
                 ? RegisterStructuredSrv(ub.Resource, ub.ElementCount, 8)
                 : RegisterStructuredSrv(nb.Resource, nb.ElementCount, 12),
@@ -117,15 +85,6 @@ public sealed class Dx12RtGeometry : IDisposable {
         return e;
     }
 
-    // Per-triangle MaterialId: for each submesh, every triangle in [IndexStart/3, +IndexCount/3) gets the
-    // submesh material's GBuffer id, resolved the SAME way the raster G-buffer does — gpu.ResolveOrRegister-
-    // MaterialId (R1.0). EnsureMaterialTable registers only WHOLE-MESH (SubMeshIndex<0) renderers, but this
-    // build runs for EVERY active renderer the TLAS traces (incl. SubMeshIndex>=0 split-import children).
-    // Resolve-or-register makes each RT-traced submesh's material present in the table instead of the old
-    // silent `matId=0` fallback, which shaded those triangles with the FIRST whole-mesh material — the cause
-    // of wrong/empty RT-GI/emissive/reflection bounce off color-only & split content (the raster G-buffer was
-    // correct, the RT trace was not). Transparent/null materials resolve to -1 → triangle stays id 0 (the
-    // bounce off a transparent surface is negligible, and the raster path skips it too).
     unsafe void BuildTriMaterials(Mesh mesh, IStaticMeshRenderer r, Dx12GpuDrivenRenderer gpu,
                                   out ID3D12Resource buf, out int bindlessIdx) {
         int triCount = mesh.IndexBuffer.ElementCount / 3;
@@ -134,7 +93,7 @@ public sealed class Dx12RtGeometry : IDisposable {
             SubMeshData sub = mesh.SubMeshes[sm];
             if (sub.IndexCount <= 0) continue;
             int matId = gpu.ResolveOrRegisterMaterialId(r.MaterialFor(sm));
-            if (matId < 0) matId = 0;   // null/transparent/table-full → material 0 (negligible bounce)
+            if (matId < 0) matId = 0;
             int triStart = sub.IndexStart / 3;
             int triEnd = Math.Min((sub.IndexStart + sub.IndexCount) / 3, triCount);
             for (int t = triStart; t < triEnd; t++) triMat[t] = (uint)matId;
@@ -143,7 +102,6 @@ public sealed class Dx12RtGeometry : IDisposable {
         bindlessIdx = RegisterStructuredSrv(buf, triMat.Length, 4);
     }
 
-    // Register a TYPED buffer SRV in the shared bindless heap; returns the heap index for ResourceDescriptorHeap[].
     int RegisterTypedSrv(ID3D12Resource res, Format format, int elementCount) {
         int idx = Dx12Backend.BindlessHeap.Allocate();
         dev.Device.CreateShaderResourceView(res, new ShaderResourceViewDescription {
@@ -157,7 +115,6 @@ public sealed class Dx12RtGeometry : IDisposable {
         return idx;
     }
 
-    // Register a STRUCTURED buffer SRV (StructureByteStride) in the shared bindless heap.
     int RegisterStructuredSrv(ID3D12Resource res, int elementCount, int stride) {
         int idx = Dx12Backend.BindlessHeap.Allocate();
         dev.Device.CreateShaderResourceView(res, new ShaderResourceViewDescription {

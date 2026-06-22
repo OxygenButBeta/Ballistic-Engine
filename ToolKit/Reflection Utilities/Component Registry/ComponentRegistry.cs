@@ -4,32 +4,19 @@ namespace BallisticEngine;
 
 public readonly record struct ComponentEntry(string DisplayName, string Menu, Type Type);
 
-// Discovers all concrete Behaviour types by reflection (mirrors SingleServiceInstaller's pattern)
-// so scene deserialization can resolve a component by name and the editor can list them in an
-// Add Component menu. Built once at startup from EngineBootstrap.
 public static class ComponentRegistry {
     static readonly Dictionary<string, Type> byName = new(StringComparer.Ordinal);
     static readonly List<ComponentEntry> menu = new();
 
-    // SceneBehaviours live in a separate registry: they go on the Scene (the editor's
-    // "Scene" hierarchy), never in the entity Add Component menu.
     static readonly Dictionary<string, Type> sceneByName = new(StringComparer.Ordinal);
     static readonly List<ComponentEntry> sceneMenu = new();
 
-    // VolumeComponents (post-process overrides) — resolved by name when loading .volume
-    // profiles and listed in the editor's Add Override menu.
     static readonly Dictionary<string, Type> volumeByName = new(StringComparer.Ordinal);
     static readonly List<ComponentEntry> volumeMenu = new();
 
-    // RenderFeatures (authored custom render passes — phase 3) — resolved by name when loading a scene's
-    // RenderFeatures list and listed in the editor's Add Render Feature menu. Exact mirror of the volume
-    // branch: a game authors a RenderFeature subclass and it appears here with zero wiring.
     static readonly Dictionary<string, Type> featureByName = new(StringComparer.Ordinal);
     static readonly List<ComponentEntry> featureMenu = new();
 
-    // DataAssets (.asset files) — resolved by name when loading a .asset and listed in the asset
-    // browser's "Create" menu (only types carrying [CreateDataAsset] appear in the menu; ALL
-    // concrete DataAsset types are resolvable by name for loading).
     static readonly Dictionary<string, Type> dataByName = new(StringComparer.Ordinal);
     static readonly List<ComponentEntry> dataMenu = new();
 
@@ -79,10 +66,6 @@ public static class ComponentRegistry {
         dataMenu.Sort((a, b) => string.CompareOrdinal(a.DisplayName, b.DisplayName));
     }
 
-    // RenderFeatures (phase 3) are discovered by base-type like the others, but carry their OWN
-    // [RenderFeature] attribute (not [Component]) — so they need a parallel register that reads it and
-    // honors HideFromAddMenu. Always resolvable by name (for scene loading); the menu entry is gated by
-    // the attribute exactly as Register gates on ComponentAttribute.
     static void RegisterFeature(Type type) {
         var key = featureByName.ContainsKey(type.Name) ? type.FullName : type.Name;
         featureByName[key] = type;
@@ -96,8 +79,6 @@ public static class ComponentRegistry {
             type));
     }
 
-    // DataAssets are always resolvable by name (for loading), but only those carrying
-    // [CreateDataAsset] surface in the browser's Create menu.
     static void RegisterDataAsset(Type type) {
         var key = dataByName.ContainsKey(type.Name) ? type.FullName : type.Name;
         dataByName[key] = type;
@@ -110,18 +91,14 @@ public static class ComponentRegistry {
     public static Type ResolveDataAsset(string typeName) =>
         typeName is null ? null : dataByName.GetValueOrDefault(typeName);
 
-    // The registry key (the name stored in a .asset file) for a DataAsset type.
     public static string DataAssetNameOf(Type type) =>
         dataByName.ContainsKey(type.Name) && dataByName[type.Name] == type ? type.Name : type.FullName;
 
     static void Register(Type type, Dictionary<string, Type> names, List<ComponentEntry> entries) {
-        // Keyed by simple name (FullName disambiguates collisions).
         var key = names.ContainsKey(type.Name) ? type.FullName : type.Name;
         names[key] = type;
 
         ComponentAttribute attr = type.GetCustomAttribute<ComponentAttribute>();
-        // HideFromAddMenu: keep the name->type mapping (above) so existing scenes still deserialize and
-        // the renderer can resolve it, but DON'T list it in the Add-Component menu — it's automatic now.
         if (attr is { HideFromAddMenu: true })
             return;
         entries.Add(new ComponentEntry(
@@ -142,7 +119,6 @@ public static class ComponentRegistry {
     public static Type ResolveFeature(string typeName) =>
         typeName is null ? null : featureByName.GetValueOrDefault(typeName);
 
-    // Returns the registry key (the name used in scene files) for a component instance.
     public static string NameOf(Behaviour behaviour) {
         Type type = behaviour.GetType();
         return byName.ContainsKey(type.Name) && byName[type.Name] == type ? type.Name : type.FullName;
@@ -158,7 +134,6 @@ public static class ComponentRegistry {
         return volumeByName.ContainsKey(type.Name) && volumeByName[type.Name] == type ? type.Name : type.FullName;
     }
 
-    // The registry key (the name stored in a scene's RenderFeatures list) for a feature instance.
     public static string FeatureNameOf(RenderFeature feature) {
         Type type = feature.GetType();
         return featureByName.ContainsKey(type.Name) && featureByName[type.Name] == type ? type.Name : type.FullName;

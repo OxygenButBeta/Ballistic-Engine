@@ -1,8 +1,5 @@
 namespace BallisticEngine.AssetPipeline.Loaders;
 
-// Loads a .prefab (YAML, same shape as a scene's entities block) into a PrefabAsset. Pack-aware via
-// ContentText so a shipped player reads it from the mounted content pack. Never throws — logs and
-// returns null on a missing/garbled file, matching the asset system's conventions.
 public static class PrefabLoader {
     public static PrefabAsset Load(BallisticProject project, string assetPath) {
         string yaml = ContentText.Read(project, assetPath);
@@ -13,7 +10,6 @@ public static class PrefabLoader {
 
         try {
             PrefabAsset prefab = PrefabAsset.FromYaml(yaml);
-            // Stamp the asset GUID so instances link back to this .prefab (Entity.PrefabSource).
             if (AssetDatabase.TryGetGuid(assetPath, out Guid guid))
                 prefab.SourceGuid = guid;
             return prefab;

@@ -1,21 +1,9 @@
 
 namespace BallisticEngine;
 
-// Brush operations on a TerrainAsset's height field, plus the ray<->heightfield intersection the
-// editor tool needs to find where the cursor hits the terrain. Pure engine-layer math (no editor /
-// GL / ImGui), so it's unit-testable headlessly and ready for the deferred TerrainTool to call.
-//
-// All world<->grid mapping matches TerrainMeshBuilder: the grid is centered on the entity origin in
-// LOCAL space, spans Size on X/Z, height = h * HeightScale on Y. The tool passes points already in
-// the terrain's LOCAL space (world ray transformed by the inverse world matrix).
 public static class TerrainSculpt {
     public enum Brush { Raise, Lower, Smooth, Flatten, Set }
 
-    // Applies one brush dab centered at localCenter (terrain-local XZ; Y ignored). radiusWorld and
-    // strength are in world/normalized units. For Flatten/Set, targetHeight is the normalized [0,1]
-    // height to converge toward. Returns true if any sample changed (so the caller can skip a rebuild
-    // when the dab missed the field entirely). Does NOT bump Revision — the caller does that once per
-    // stroke segment so the component rebuilds at most once per frame.
     public static bool Apply(TerrainAsset terrain, Brush brush, Vector3 localCenter,
         float radiusWorld, float strength, float targetHeight = 0f) {
         if (terrain is null)
@@ -27,7 +15,6 @@ public static class TerrainSculpt {
         float stepX = terrain.Size.X / (res - 1);
         float stepZ = terrain.Size.Y / (res - 1);
 
-        // Map the brush circle to a grid index window (inclusive), clamped to the field.
         float cx = localCenter.X, cz = localCenter.Z;
         int minX = Math.Clamp((int)MathF.Floor((cx - radiusWorld + halfX) / stepX), 0, res - 1);
         int maxX = Math.Clamp((int)MathF.Ceiling((cx + radiusWorld + halfX) / stepX), 0, res - 1);
@@ -36,20 +23,18 @@ public static class TerrainSculpt {
         if (minX > maxX || minZ > maxZ)
             return false;
 
-        // Normalize height deltas against the height scale so "strength" reads in world units.
         float scale = MathF.Max(terrain.HeightScale, 1e-4f);
         bool changed = false;
 
         for (int z = minZ; z <= maxZ; z++) {
             for (int x = minX; x <= maxX; x++) {
-                // Sample world position on XZ to measure brush distance with a smooth radial falloff.
                 float wx = -halfX + x * stepX;
                 float wz = -halfZ + z * stepZ;
                 float dist = MathF.Sqrt((wx - cx) * (wx - cx) + (wz - cz) * (wz - cz));
                 if (dist > radiusWorld)
                     continue;
 
-                float falloff = Falloff(dist / radiusWorld); // 1 at center -> 0 at the rim
+                float falloff = Falloff(dist / radiusWorld);
                 if (falloff <= 0f)
                     continue;
 
@@ -65,15 +50,12 @@ public static class TerrainSculpt {
                         next = h - strength / scale * falloff;
                         break;
                     case Brush.Smooth:
-                        // Blend toward the 3x3 neighborhood average (noise/spike removal).
                         next = MathHelper.Lerp(h, NeighborAverage(terrain.Heights, res, x, z), strength * falloff);
                         break;
                     case Brush.Flatten:
-                        // Ease toward the target height (level ground for placement).
                         next = MathHelper.Lerp(h, targetHeight, strength * falloff);
                         break;
                     case Brush.Set:
-                        // Hard-set toward target with falloff (stamp a plateau).
                         next = MathHelper.Lerp(h, targetHeight, falloff);
                         break;
                 }
@@ -89,7 +71,6 @@ public static class TerrainSculpt {
         return changed;
     }
 
-    // Smoothstep-style falloff: 1 at the center, 0 at the rim, soft shoulders. t in [0,1].
     static float Falloff(float t) {
         t = Math.Clamp(1f - t, 0f, 1f);
         return t * t * (3f - 2f * t);
@@ -109,10 +90,6 @@ public static class TerrainSculpt {
         return sum / count;
     }
 
-    // Ray vs terrain heightfield, all in terrain-LOCAL space. Marches the ray across the grid extent
-    // and refines the first segment that crosses the surface (the height function is single-valued in
-    // XZ, so a marched bisection is robust and cheap). Returns the local hit point. step is the march
-    // resolution in world units (smaller = more accurate, default ~ one cell).
     public static bool Raycast(TerrainAsset terrain, Vector3 localOrigin, Vector3 localDir,
         out Vector3 localHit, float maxDistance = 100000f) {
         localHit = default;
@@ -133,13 +110,11 @@ public static class TerrainSculpt {
             traveled += step;
             Vector3 sample = localOrigin + localDir * traveled;
 
-            // Bail once the ray leaves the terrain footprint going away from it.
             if (OutOfBoundsAndLeaving(sample, localDir, halfX, halfZ))
                 break;
 
             float diff = SignedHeightDiff(terrain, sample, halfX, halfZ, out bool inside);
             if (inside && prevDiff > 0f && diff <= 0f) {
-                // Crossed from above the surface to below it: bisect between prev and sample.
                 localHit = Bisect(terrain, prev, sample, halfX, halfZ);
                 return true;
             }
@@ -151,8 +126,6 @@ public static class TerrainSculpt {
         return false;
     }
 
-    // point.Y minus terrain surface height at point.XZ (positive = above the surface). `inside` is
-    // false when the XZ is outside the terrain footprint.
     static float SignedHeightDiff(TerrainAsset terrain, Vector3 point, float halfX, float halfZ, out bool inside) {
         inside = point.X >= -halfX && point.X <= halfX && point.Z >= -halfZ && point.Z <= halfZ;
         return point.Y - SurfaceHeight(terrain, point.X, point.Z, halfX, halfZ);
@@ -178,7 +151,6 @@ public static class TerrainSculpt {
         return (above + below) * 0.5f;
     }
 
-    // Bilinearly interpolated world height at local XZ (clamped to the footprint).
     public static float SurfaceHeight(TerrainAsset terrain, float localX, float localZ, float halfX, float halfZ) {
         int res = terrain.Resolution;
         float fx = (localX + halfX) / terrain.Size.X * (res - 1);

@@ -5,16 +5,7 @@ using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
 
-// Per-project dock layout persistence + the programmatic default arrangement.
-//
-// ImGui's automatic imgui.ini IO is disabled (ImGuiController sets io.IniFilename = null), so the
-// editor owns the layout: it serializes ImGui's window/dock settings to a string and writes it under
-// %AppData%/BallisticEngine/Layouts/<projectHash>.ini, keyed by the project root path. Load() applies
-// it before the first frame; if none exists, BuildDefault() lays out Hierarchy / Inspector / Viewport
-// / Assets+Console via DockBuilder. "Reset Layout" deletes the file and rebuilds the default.
 internal static class EditorLayout {
-    // The window names docked into the default layout (must match the ImGui.Begin titles in BuildUI).
-    // Scene/Game and Entities/SceneComponents are separate dockable windows, tabbed together by default.
     public const string Entities = "Entities";
     public const string SceneComponents = "Scene";
     public const string Inspector = "Inspector";
@@ -29,8 +20,6 @@ internal static class EditorLayout {
         projectKey = string.IsNullOrEmpty(projectRootPath) ? "default" : projectRootPath;
     }
 
-    // Bumped whenever the set of dockable window NAMES changes (a saved layout from an older version
-    // references windows that no longer exist, so we version the file to fall back to BuildDefault).
     const int LayoutVersion = 2;
 
     static string LayoutDir {
@@ -48,16 +37,10 @@ internal static class EditorLayout {
 
     static string LayoutFile => Path.Combine(LayoutDir, $"{ProjectStem}.v{LayoutVersion}.ini");
 
-    // Sidecar to the .ini: the set of CLOSED core panels (one key per line). The dock-layout .ini
-    // persists each window's geometry/dock node but not whether the editor is currently submitting it,
-    // so without this a panel the user closed would re-open on the next launch. Versioned with the .ini.
     static string PanelStateFile => Path.Combine(LayoutDir, $"{ProjectStem}.v{LayoutVersion}.panels");
 
-    // True when a saved layout exists for this project (so the dock host skips BuildDefault).
     public static bool HasSaved => File.Exists(LayoutFile);
 
-    // Apply the saved layout, if any. Call ONCE after the context is created and BEFORE the first
-    // NewFrame (the settings must be in place before windows are submitted).
     public static void Load() {
         try {
             if (File.Exists(LayoutFile))
@@ -68,7 +51,6 @@ internal static class EditorLayout {
         }
     }
 
-    // Persist the current layout. Cheap; called when ImGui flags WantSaveIniSettings and on exit.
     public static unsafe void Save() {
         try {
             byte* ini = ImGui.SaveIniSettingsToMemory();
@@ -81,8 +63,6 @@ internal static class EditorLayout {
         }
     }
 
-    // Forget the saved layout so the next BuildDefault (driven by EditorApplication's reset flag) lays
-    // the panels out fresh. Also clears the panel-visibility sidecar (Reset Layout re-shows every panel).
     public static void DeleteSaved() {
         try {
             if (File.Exists(LayoutFile)) File.Delete(LayoutFile);
@@ -91,16 +71,11 @@ internal static class EditorLayout {
         catch (Exception e) { Debugging.LogWarning($"Could not reset editor layout: {e.Message}"); }
     }
 
-    // Persist which core panels are currently CLOSED (one key per line). Called alongside Save() whenever
-    // the layout changes and on exit. An empty set writes an empty file (so a previously-closed panel that
-    // the user re-opened is remembered as open).
     public static void SavePanelState(IEnumerable<string> hiddenKeys) {
         try { File.WriteAllLines(PanelStateFile, hiddenKeys); }
         catch (Exception e) { Debugging.LogWarning($"Could not save panel state: {e.Message}"); }
     }
 
-    // Read the persisted closed-panel set (empty if none / unreadable). Apply once on startup, before the
-    // first frame submits the panels, so a panel the user closed last session stays closed.
     public static IReadOnlyCollection<string> LoadPanelState() {
         try {
             if (File.Exists(PanelStateFile))
@@ -113,40 +88,24 @@ internal static class EditorLayout {
         return Array.Empty<string>();
     }
 
-    // Builds the default arrangement inside `dockId` (the user-approved layout, EF5e):
-    //   ┌──────────┬──────────┬───────────────────────────┐
-    //   │ Scene    │ Details  │  Scene View / Game View    │
-    //   │ Comps    │          │  (tabbed, fills the center) │
-    //   ├──────────┤          │                            │
-    //   │ Entities │          │                            │
-    //   ├──────────┴──────────┴───────────────────────────┤
-    //   │             Assets + Console (tabbed)            │
-    //   └──────────────────────────────────────────────────┘
-    // Far-left column is split HORIZONTALLY: Scene Components on top, Entities below. The Inspector
-    // ("Details") sits in a second column to the LEFT of the viewport (not on the right). Standalone tool
-    // windows (Tags & Layers, Profiler, Settings) are NOT placed here — they open floating from the Window
-    // menu and the user docks them where they like (they aren't core dockable panels).
-    // Run inside the dock-host window for the frame the layout needs (re)building.
     public static unsafe void BuildDefault(uint dockId, SysVec2 size) {
         ImGuiP.DockBuilderRemoveNode(dockId);
         ImGuiP.DockBuilderAddNode(dockId, ImGuiDockNodeFlags.None);
         ImGuiP.DockBuilderSetNodeSize(dockId, size);
 
         uint center = dockId, leftOuter, details, bottom, leftTop, leftBottom;
-        // Bottom strip first (full width), then the two left columns, leaving the viewport in the center.
         ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Down, 0.26f, &bottom, &center);
-        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Left, 0.15f, &leftOuter, &center);   // far-left: hierarchy column
-        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Left, 0.26f, &details, &center);     // second column: Details
-        // Far-left column split horizontally: Scene Components (top) over Entities (bottom).
+        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Left, 0.15f, &leftOuter, &center);
+        ImGuiP.DockBuilderSplitNode(center, ImGuiDir.Left, 0.26f, &details, &center);
         ImGuiP.DockBuilderSplitNode(leftOuter, ImGuiDir.Up, 0.42f, &leftTop, &leftBottom);
 
         ImGuiP.DockBuilderDockWindow(SceneComponents, leftTop);
         ImGuiP.DockBuilderDockWindow(Entities, leftBottom);
         ImGuiP.DockBuilderDockWindow(Inspector, details);
         ImGuiP.DockBuilderDockWindow(Assets, bottom);
-        ImGuiP.DockBuilderDockWindow(Console, bottom);       // tabbed with Assets
+        ImGuiP.DockBuilderDockWindow(Console, bottom);
         ImGuiP.DockBuilderDockWindow(SceneView, center);
-        ImGuiP.DockBuilderDockWindow(GameView, center);      // tabbed with Scene View
+        ImGuiP.DockBuilderDockWindow(GameView, center);
         ImGuiP.DockBuilderFinish(dockId);
     }
 }

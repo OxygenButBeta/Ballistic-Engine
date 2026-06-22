@@ -1,12 +1,3 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// This source code is licensed under the MIT license found in the
-// LICENSE file in the root directory of this source tree.
-//
-// Original: yoga/YGNodeStyle.h, yoga/YGNodeStyle.cpp
-
-using System;
-
 namespace Facebook.Yoga
 {
     /// <summary>
@@ -15,8 +6,7 @@ namespace Facebook.Yoga
     /// </summary>
     public static class YGNodeStyleAPI
     {
-        // Helper: update a style property (simple value)
-    private static void UpdateStyle<TValue>(
+        private static void UpdateStyle<TValue>(
             Node node,
         Func<Style, TValue> getter,
         Action<Style, TValue> setter,
@@ -31,7 +21,6 @@ namespace Facebook.Yoga
         }
     }
 
-        // Helper: update a style property (indexed value)
         private static void UpdateStyleIndexed<TIdx, TValue>(
             Node node,
         Func<Style, TIdx, TValue> getter,
@@ -47,7 +36,6 @@ namespace Facebook.Yoga
         }
     }
 
-        // Helper: update an enum-style property
         private static void UpdateStyleEnum<TEnum>(
             Node node,
             Func<Style, TEnum> getter,
@@ -63,8 +51,6 @@ namespace Facebook.Yoga
             }
         }
 
-        // --- CopyStyle ---
-
         public static void YGNodeCopyStyle(Node dstNode, Node srcNode)
         {
             if (!dstNode.Style.Equals(srcNode.Style))
@@ -73,8 +59,6 @@ namespace Facebook.Yoga
             dstNode.MarkDirtyAndPropagate();
         }
     }
-
-        // --- Direction ---
 
         public static void YGNodeStyleSetDirection(Node node, YGDirection value)
         {
@@ -89,8 +73,6 @@ namespace Facebook.Yoga
             return node.Style.Direction.ToYG();
         }
 
-        // --- FlexDirection ---
-
         public static void YGNodeStyleSetFlexDirection(Node node, YGFlexDirection value)
         {
             UpdateStyleEnum(node,
@@ -103,8 +85,6 @@ namespace Facebook.Yoga
         {
             return node.Style.FlexDirection.ToYG();
         }
-
-        // --- JustifyContent ---
 
         public static void YGNodeStyleSetJustifyContent(Node node, YGJustify value)
         {
@@ -119,8 +99,6 @@ namespace Facebook.Yoga
             return node.Style.JustifyContent.ToYG();
         }
 
-        // --- JustifyItems ---
-
         public static void YGNodeStyleSetJustifyItems(Node node, YGJustify value)
         {
             UpdateStyleEnum(node,
@@ -133,8 +111,6 @@ namespace Facebook.Yoga
         {
             return node.Style.JustifyItems.ToYG();
         }
-
-        // --- JustifySelf ---
 
         public static void YGNodeStyleSetJustifySelf(Node node, YGJustify value)
         {
@@ -149,8 +125,6 @@ namespace Facebook.Yoga
             return node.Style.JustifySelf.ToYG();
         }
 
-        // --- AlignContent ---
-
         public static void YGNodeStyleSetAlignContent(Node node, YGAlign value)
         {
             UpdateStyleEnum(node,
@@ -163,8 +137,6 @@ namespace Facebook.Yoga
         {
             return node.Style.AlignContent.ToYG();
         }
-
-        // --- AlignItems ---
 
         public static void YGNodeStyleSetAlignItems(Node node, YGAlign value)
         {
@@ -179,8 +151,6 @@ namespace Facebook.Yoga
             return node.Style.AlignItems.ToYG();
         }
 
-        // --- AlignSelf ---
-
         public static void YGNodeStyleSetAlignSelf(Node node, YGAlign value)
         {
             UpdateStyleEnum(node,
@@ -193,8 +163,6 @@ namespace Facebook.Yoga
         {
             return node.Style.AlignSelf.ToYG();
         }
-
-        // --- PositionType ---
 
         public static void YGNodeStyleSetPositionType(Node node, YGPositionType value)
         {
@@ -209,8 +177,6 @@ namespace Facebook.Yoga
             return node.Style.PositionType.ToYG();
         }
 
-        // --- FlexWrap ---
-
         public static void YGNodeStyleSetFlexWrap(Node node, YGWrap value)
         {
             UpdateStyleEnum(node,
@@ -223,8 +189,6 @@ namespace Facebook.Yoga
         {
             return node.Style.FlexWrap.ToYG();
         }
-
-        // --- Overflow ---
 
         public static void YGNodeStyleSetOverflow(Node node, YGOverflow value)
         {
@@ -239,8 +203,6 @@ namespace Facebook.Yoga
             return node.Style.Overflow.ToYG();
         }
 
-        // --- Display ---
-
         public static void YGNodeStyleSetDisplay(Node node, YGDisplay value)
         {
             UpdateStyleEnum(node,
@@ -253,8 +215,6 @@ namespace Facebook.Yoga
         {
             return node.Style.Display.ToYG();
         }
-
-        // --- Flex ---
 
         public static void YGNodeStyleSetFlex(Node node, float flex)
         {
@@ -273,8 +233,6 @@ namespace Facebook.Yoga
                 : node.Style.Flex.Unwrap();
         }
 
-        // --- FlexGrow ---
-
         public static void YGNodeStyleSetFlexGrow(Node node, float flexGrow)
         {
             var newValue = new FloatOptional(flexGrow);
@@ -291,8 +249,6 @@ namespace Facebook.Yoga
                 ? Style.DefaultFlexGrow
                 : node.Style.FlexGrow.Unwrap();
         }
-
-        // --- FlexShrink ---
 
         public static void YGNodeStyleSetFlexShrink(Node node, float flexShrink)
         {
@@ -312,8 +268,6 @@ namespace Facebook.Yoga
                     : Style.DefaultFlexShrink)
                 : node.Style.FlexShrink.Unwrap();
         }
-
-        // --- FlexBasis ---
 
         public static void YGNodeStyleSetFlexBasis(Node node, float flexBasis)
         {
@@ -380,8 +334,6 @@ namespace Facebook.Yoga
             return node.Style.FlexBasis.ToYGValue();
         }
 
-        // --- Position ---
-
         public static void YGNodeStyleSetPosition(Node node, YGEdge edge, float points)
         {
             var internalEdge = edge.ToInternal();
@@ -419,8 +371,6 @@ namespace Facebook.Yoga
         {
             return (YGValue)node.Style.Position(edge.ToInternal());
         }
-
-        // --- Margin ---
 
         public static void YGNodeStyleSetMargin(Node node, YGEdge edge, float points)
         {
@@ -460,8 +410,6 @@ namespace Facebook.Yoga
             return (YGValue)node.Style.Margin(edge.ToInternal());
         }
 
-        // --- Padding ---
-
         public static void YGNodeStyleSetPadding(Node node, YGEdge edge, float points)
         {
             var internalEdge = edge.ToInternal();
@@ -489,8 +437,6 @@ namespace Facebook.Yoga
             return (YGValue)node.Style.Padding(edge.ToInternal());
         }
 
-        // --- Border ---
-
         public static void YGNodeStyleSetBorder(Node node, YGEdge edge, float border)
         {
             var internalEdge = edge.ToInternal();
@@ -512,8 +458,6 @@ namespace Facebook.Yoga
 
         return ((YGValue)border).Value;
     }
-
-        // --- Gap ---
 
         public static void YGNodeStyleSetGap(Node node, YGGutter gutter, float gapLength)
         {
@@ -542,8 +486,6 @@ namespace Facebook.Yoga
             return (YGValue)node.Style.Gap(gutter.ToInternal());
         }
 
-        // --- AspectRatio ---
-
         public static void YGNodeStyleSetAspectRatio(Node node, float aspectRatio)
         {
             var newValue = new FloatOptional(aspectRatio);
@@ -560,8 +502,6 @@ namespace Facebook.Yoga
             return op.IsUndefined() ? YogaConstants.Undefined : op.Unwrap();
         }
 
-        // --- BoxSizing ---
-
         public static void YGNodeStyleSetBoxSizing(Node node, YGBoxSizing boxSizing)
         {
             UpdateStyleEnum(node,
@@ -574,8 +514,6 @@ namespace Facebook.Yoga
         {
             return node.Style.BoxSizing.ToYG();
         }
-
-        // --- Width ---
 
         public static void YGNodeStyleSetWidth(Node node, float points)
         {
@@ -612,8 +550,6 @@ namespace Facebook.Yoga
             return node.Style.Dimension(Dimension.Width).ToYGValue();
         }
 
-        // --- Height ---
-
         public static void YGNodeStyleSetHeight(Node node, float points)
         {
             SetDimension(node, Dimension.Height, StyleSizeLength.Points(points));
@@ -649,8 +585,6 @@ namespace Facebook.Yoga
             return node.Style.Dimension(Dimension.Height).ToYGValue();
         }
 
-        // --- MinWidth ---
-
         public static void YGNodeStyleSetMinWidth(Node node, float minWidth)
         {
             SetMinDimension(node, Dimension.Width, StyleSizeLength.Points(minWidth));
@@ -680,8 +614,6 @@ namespace Facebook.Yoga
         {
             return node.Style.MinDimension(Dimension.Width).ToYGValue();
         }
-
-        // --- MinHeight ---
 
         public static void YGNodeStyleSetMinHeight(Node node, float minHeight)
         {
@@ -713,8 +645,6 @@ namespace Facebook.Yoga
             return node.Style.MinDimension(Dimension.Height).ToYGValue();
         }
 
-        // --- MaxWidth ---
-
         public static void YGNodeStyleSetMaxWidth(Node node, float maxWidth)
         {
             SetMaxDimension(node, Dimension.Width, StyleSizeLength.Points(maxWidth));
@@ -744,8 +674,6 @@ namespace Facebook.Yoga
         {
             return node.Style.MaxDimension(Dimension.Width).ToYGValue();
         }
-
-        // --- MaxHeight ---
 
         public static void YGNodeStyleSetMaxHeight(Node node, float maxHeight)
         {
@@ -777,9 +705,6 @@ namespace Facebook.Yoga
             return node.Style.MaxDimension(Dimension.Height).ToYGValue();
         }
 
-        // --- Grid Item Properties ---
-
-        // GridColumnStart
         public static void YGNodeStyleSetGridColumnStart(Node node, int gridColumnStart)
         {
             var newValue = GridLine.FromInteger(gridColumnStart);
@@ -816,7 +741,6 @@ namespace Facebook.Yoga
             return gridLine.IsInteger() ? gridLine.Integer : 0;
         }
 
-        // GridColumnEnd
         public static void YGNodeStyleSetGridColumnEnd(Node node, int gridColumnEnd)
         {
             var newValue = GridLine.FromInteger(gridColumnEnd);
@@ -853,7 +777,6 @@ namespace Facebook.Yoga
             return gridLine.IsInteger() ? gridLine.Integer : 0;
         }
 
-        // GridRowStart
         public static void YGNodeStyleSetGridRowStart(Node node, int gridRowStart)
         {
             var newValue = GridLine.FromInteger(gridRowStart);
@@ -890,7 +813,6 @@ namespace Facebook.Yoga
             return gridLine.IsInteger() ? gridLine.Integer : 0;
         }
 
-        // GridRowEnd
         public static void YGNodeStyleSetGridRowEnd(Node node, int gridRowEnd)
         {
             var newValue = GridLine.FromInteger(gridRowEnd);
@@ -927,9 +849,6 @@ namespace Facebook.Yoga
             return gridLine.IsInteger() ? gridLine.Integer : 0;
         }
 
-        // --- Grid Container Properties ---
-
-        // Helper: convert YGGridTrackType to GridTrackSize
         private static GridTrackSize GridTrackSizeFromTypeAndValue(YGGridTrackType type, float value)
         {
             return type switch
@@ -943,7 +862,6 @@ namespace Facebook.Yoga
             };
         }
 
-        // Helper: convert YGGridTrackType to StyleSizeLength (for minmax)
         private static StyleSizeLength StyleSizeLengthFromTypeAndValue(YGGridTrackType type, float value)
         {
             return type switch
@@ -957,7 +875,6 @@ namespace Facebook.Yoga
             };
         }
 
-        // GridTemplateColumns
         public static void YGNodeStyleSetGridTemplateColumnsCount(Node node, int count)
         {
             node.Style.ResizeGridTemplateColumns(count);
@@ -986,7 +903,6 @@ namespace Facebook.Yoga
             node.MarkDirtyAndPropagate();
         }
 
-        // GridTemplateRows
         public static void YGNodeStyleSetGridTemplateRowsCount(Node node, int count)
         {
             node.Style.ResizeGridTemplateRows(count);
@@ -1015,7 +931,6 @@ namespace Facebook.Yoga
             node.MarkDirtyAndPropagate();
         }
 
-        // GridAutoColumns
         public static void YGNodeStyleSetGridAutoColumnsCount(Node node, int count)
         {
             node.Style.ResizeGridAutoColumns(count);
@@ -1044,7 +959,6 @@ namespace Facebook.Yoga
             node.MarkDirtyAndPropagate();
         }
 
-        // GridAutoRows
         public static void YGNodeStyleSetGridAutoRowsCount(Node node, int count)
         {
             node.Style.ResizeGridAutoRows(count);
@@ -1072,8 +986,6 @@ namespace Facebook.Yoga
                     StyleSizeLengthFromTypeAndValue(maxType, maxValue)));
             node.MarkDirtyAndPropagate();
         }
-
-        // --- Internal Helpers for Dimension/MinDimension/MaxDimension ---
 
         private static void SetDimension(Node node, Dimension dim, StyleSizeLength value)
         {

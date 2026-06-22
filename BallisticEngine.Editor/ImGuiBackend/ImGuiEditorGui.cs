@@ -1,17 +1,11 @@
-using System.Numerics;
 using Hexa.NET.ImGui;
 
 namespace BallisticEngine.Editor;
 
-// The one concrete IEditorGui: forwards every call to Hexa.NET.ImGui. This is a SEAM adapter, so it is
-// the allowed place to import ImGui (the enforced boundary). One instance is created per editor session
-// and reused for every window each frame — it holds no per-window state (the draw-list/input sub-
-// adapters are lightweight structs created on access).
 internal sealed class ImGuiEditorGui : IEditorGui {
     readonly ImGuiInputAdapter input = new();
     readonly ImGuiDrawListAdapter drawList = new();
 
-    // ---- layout / id / scope ----
     public void PushId(string id) => ImGui.PushID(id);
     public void PushId(int id) => ImGui.PushID(id);
     public void PopId() => ImGui.PopID();
@@ -39,26 +33,22 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public Vector2 FramePadding => ImGui.GetStyle().FramePadding;
     public Vector2 CalcTextSize(string text) => ImGui.CalcTextSize(text);
 
-    // ---- scroll ----
     public float ScrollY => ImGui.GetScrollY();
     public float ScrollMaxY => ImGui.GetScrollMaxY();
     public void SetScrollHereY(float ratio = 0.5f) => ImGui.SetScrollHereY(ratio);
 
-    // ---- text ----
     public void Text(string text) => ImGui.Text(text);
     public void TextUnformatted(string text) => ImGui.TextUnformatted(text);
     public void TextDisabled(string text) => ImGui.TextDisabled(text);
     public void TextWrapped(string text) => ImGui.TextWrapped(text);
     public void TextColored(Vector4 color, string text) => ImGui.TextColored(color, text);
 
-    // ---- buttons / toggles ----
     public bool Button(string label, Vector2 size = default) => ImGui.Button(label, size);
     public bool SmallButton(string label) => ImGui.SmallButton(label);
     public bool ImageButton(string id, nint textureHandle, Vector2 size) =>
         ImGui.ImageButton(id, new ImTextureID((ulong)textureHandle), size, new Vector2(0, 0), new Vector2(1, 1));
     public bool Checkbox(string label, ref bool v) => ImGui.Checkbox(label, ref v);
 
-    // ---- scalars ----
     public bool SliderFloat(string label, ref float v, float min, float max, string format = "%.3f") =>
         ImGui.SliderFloat(label, ref v, min, max, format);
     public bool SliderInt(string label, ref int v, int min, int max) =>
@@ -86,7 +76,6 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         ImGui.PlotLines(label, ref values[0], count, 0, overlay, min, max, size);
     }
 
-    // ---- structure ----
     public bool TreeNode(string label) => ImGui.TreeNode(label);
     public bool TreeNodeEx(string label, EditorTreeFlags flags) => ImGui.TreeNodeEx(label, MapTreeFlags(flags));
     public void TreePop() => ImGui.TreePop();
@@ -149,7 +138,6 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         ImGuiTreeNodeFlags.DefaultOpen | ImGuiTreeNodeFlags.AllowOverlap | ImGuiTreeNodeFlags.Framed |
         ImGuiTreeNodeFlags.SpanAvailWidth | ImGuiTreeNodeFlags.NoTreePushOnOpen);
 
-    // ---- tables ----
     public bool BeginTable(string id, int columns) => ImGui.BeginTable(id, columns);
     public bool BeginTable(string id, int columns, EditorTableFlags flags, Vector2 outerSize = default) =>
         ImGui.BeginTable(id, columns, MapTableFlags(flags), outerSize);
@@ -194,7 +182,6 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         return r;
     }
 
-    // ---- tooltips / item query ----
     public void Tooltip(string text) => ImGui.SetTooltip(text);
     public bool IsItemHovered() => ImGui.IsItemHovered();
     public bool IsWindowHovered() => ImGui.IsWindowHovered();
@@ -221,7 +208,6 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public float TextLineHeightWithSpacing => ImGui.GetTextLineHeightWithSpacing();
     public float FrameHeightWithSpacing => ImGui.GetFrameHeightWithSpacing();
 
-    // ---- item geometry + focus ----
     public Vector2 ItemRectMin => ImGui.GetItemRectMin();
     public Vector2 ItemRectMax => ImGui.GetItemRectMax();
     public Vector2 WindowPos => ImGui.GetWindowPos();
@@ -231,7 +217,6 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public void SetKeyboardFocusHere() => ImGui.SetKeyboardFocusHere();
     public bool KeyPressed(EditorGuiKey key) => input.KeyPressed(key);
 
-    // ---- drag-drop (sources) ----
     public bool BeginDragDropSource() => ImGui.BeginDragDropSource();
     public void EndDragDropSource() => ImGui.EndDragDropSource();
     public unsafe void SetDragDropPayloadInt(string type, int value) =>
@@ -246,7 +231,6 @@ internal sealed class ImGuiEditorGui : IEditorGui {
             ImGui.SetDragDropPayload(type, p, (nuint)payload.Length);
     }
 
-    // ---- misc item / window / tree / input ----
     public bool IsItemDeactivated() => ImGui.IsItemDeactivated();
     public bool IsItemToggledOpen() => ImGui.IsItemToggledOpen();
     public bool IsWindowFocused() => ImGui.IsWindowFocused();
@@ -262,7 +246,6 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public bool KeyCtrl => ImGui.GetIO().KeyCtrl;
     public bool KeyShift => ImGui.GetIO().KeyShift;
 
-    // ---- drag-drop (targets) ----
     public bool BeginDragDropTarget() => ImGui.BeginDragDropTarget();
     public void EndDragDropTarget() => ImGui.EndDragDropTarget();
 
@@ -275,12 +258,9 @@ internal sealed class ImGuiEditorGui : IEditorGui {
     public unsafe string AcceptDragDropPayloadString(string type) {
         ImGuiPayloadPtr payload = ImGui.AcceptDragDropPayload(type);
         if (payload.IsNull || payload.Data == null) return null;
-        // The asset drag payload is a byte string of payload.DataSize bytes (the asset browser writes it as
-        // ANSI; match PtrToStringAnsi exactly so the GUID-list parsing downstream is byte-identical).
         return System.Runtime.InteropServices.Marshal.PtrToStringAnsi((IntPtr)payload.Data, payload.DataSize);
     }
 
-    // ---- fonts ----
     public void PushFont(EditorFont font) => ImGui.PushFont(MapFont(font));
     public void PopFont() => ImGui.PopFont();
     public float FontSize => ImGui.GetFontSize();
@@ -296,7 +276,6 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         _ => EditorTheme.Body,
     };
 
-    // ---- style scope ----
     public void PushColor(EditorStyleColor which, Vector4 rgba) => ImGui.PushStyleColor(MapColor(which), rgba);
     public void PopColor(int count = 1) => ImGui.PopStyleColor(count);
     public void PushFramePadding(Vector2 padding) => ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, padding);
@@ -326,18 +305,15 @@ internal sealed class ImGuiEditorGui : IEditorGui {
         _ => ImGuiCol.Text,
     };
 
-    // ---- misc window metrics / clipboard ----
     public float WindowWidth => ImGui.GetWindowWidth();
     public float ScrollbarSize => ImGui.GetStyle().ScrollbarSize;
     public void SetClipboardText(string text) => ImGui.SetClipboardText(text);
 
-    // ---- custom draw + input ----
     public IEditorInput Input => input;
     public IEditorDrawList WindowDrawList { get { drawList.Bind(ImGui.GetWindowDrawList()); return drawList; } }
     public uint ColorU32(Vector4 rgba) => ImGui.GetColorU32(rgba);
 }
 
-// Mouse/keyboard polling adapter. Stateless — reads the live ImGui IO each call.
 internal sealed class ImGuiInputAdapter : IEditorInput {
     public Vector2 MousePos => ImGui.GetMousePos();
     public Vector2 MouseDelta => ImGui.GetIO().MouseDelta;
@@ -370,8 +346,6 @@ internal sealed class ImGuiInputAdapter : IEditorInput {
     };
 }
 
-// Draw-list adapter. Rebound each frame to the current window's draw list (the getter on ImGuiEditorGui
-// calls Bind before handing it out), so it never holds a stale pointer across windows.
 internal sealed class ImGuiDrawListAdapter : IEditorDrawList {
     ImDrawListPtr draw;
     public void Bind(ImDrawListPtr d) => draw = d;

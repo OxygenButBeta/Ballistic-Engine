@@ -1,23 +1,9 @@
-using System;
 using System.Xml;
 
 namespace BallisticEngine.UI;
 
-// Parses a .uxml document (XML) into a VisualElement tree — the structural half of a ported design.
-// Each XML element becomes a VisualElement via ElementFactory; attributes map to engine concepts:
-//   name="..."          -> Element.Name (the Q<>() handle)
-//   class="a b c"        -> AddToClassList for each token (USS hooks onto these)
-//   text="..."           -> Label/Button text (also inner text content works: <Label>Hi</Label>)
-//   style="..."          -> inline computed style via StyleApplier (highest precedence, like CSS)
-//   picking-mode="Ignore"-> PickingEnabled = false (visual overlays)
-// Unknown attributes are ignored (logged at debug level) so a richer source document degrades
-// gracefully rather than failing the whole load.
-//
-// Resilience is deliberate (Unity/AssetDatabase parity): a malformed document logs and returns null
-// rather than throwing into the caller — UI authoring must never crash the engine.
 public static class UxmlLoader
 {
-    // Builds a tree from raw UXML text. Returns the root element, or null on parse failure.
     public static VisualElement LoadFromText(string uxml)
     {
         if (string.IsNullOrWhiteSpace(uxml))
@@ -50,8 +36,6 @@ public static class UxmlLoader
 
         ApplyAttributes(el, xml);
 
-        // Children: element nodes recurse; significant text becomes the element's text (for
-        // Label/Button) when no explicit text="" attribute was given.
         foreach (XmlNode node in xml.ChildNodes)
         {
             switch (node.NodeType)
@@ -92,8 +76,6 @@ public static class UxmlLoader
                     break;
 
                 case "style":
-                    // Apply now AND remember the raw block: the UIDocument re-applies it after the USS
-                    // cascade so inline always wins (CSS precedence: inline > stylesheet).
                     el.InlineStyle = attr.Value;
                     StyleApplier.ApplyInline(el.Style, attr.Value);
                     break;
@@ -104,13 +86,10 @@ public static class UxmlLoader
 
                 case "src":
                 case "source":
-                    // Image source path — stored as the path string; the asset is resolved by the
-                    // UIDocument/renderer through AssetDatabase (UI/ takes no AssetPipeline dependency).
                     if (el is Image img) img.Texture = attr.Value;
                     break;
 
                 default:
-                    // Tolerate unknown attributes silently-ish — keeps richer source docs loadable.
                     break;
             }
         }

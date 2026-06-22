@@ -2,8 +2,6 @@ using ImageMagick;
 
 namespace BallisticEngine.AssetPipeline;
 
-// OpenEXR decoding via Magick.NET (ImageMagick) -> RGBA32F TextureData.
-// Handles all EXR compressions (ZIP/PIZ/...), unlike pure-managed readers.
 public static class ExrDecoder {
     public static TextureData Decode(string path) {
         using var image = new MagickImage(path);
@@ -17,8 +15,6 @@ public static class ExrDecoder {
         if (source is null)
             throw new IOException($"Failed to decode EXR '{path}'.");
 
-        // Q16-HDRI stores channels as floats scaled by Quantum.Max; normalize back to linear
-        // radiance (values above 1 are preserved — that's the point of HDR).
         var inv = 1f / Quantum.Max;
         var floats = new float[width * height * 4];
 

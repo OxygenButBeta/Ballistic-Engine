@@ -1,6 +1,3 @@
-// This file is ported from C++ source code in the Yoga project.
-// License: MIT
-
 namespace Facebook.Yoga
 {
     public static class Cache

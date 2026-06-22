@@ -8,32 +8,10 @@ using static BallisticEngine.Editor.Inspector.AssetInspectors.AssetInspectorGuiA
 
 namespace BallisticEngine.Editor.Inspector.AssetInspectors;
 
-// Phase-7: the asset inspectors below draw through the IEditorGui seam (zero raw ImGui). Each one is a
-// tiny IAssetInspector; rather than give every class its own gui accessor, this one shared static (imported
-// via `using static` above) exposes `gui` to all of them. EditorGui.Shared is the editor's single stateless
-// seam handle, set once at startup — safe to reach statically from any mid-frame draw.
 internal static class AssetInspectorGuiAccess {
     internal static IEditorGui gui => EditorGui.Shared;
 }
 
-// The per-extension asset inspectors (editor-rework Rule 1 / Phase B2), one self-registering IAssetInspector
-// each. These REPLACE the `switch (ext) { case ".mat": ...; case ".png" or ...: ...; }` body of
-// InspectorPanel.DrawAssetInspector. [AssetInspector(".ext")] registers each for its extension(s).
-//
-// RW1.4 (chunk 46): the section BODIES for every asset extension now LIVE HERE (moved out of the InspectorPanel
-// god-panel) — Phase B2 only moved the DISPATCH to this registry, leaving the bodies behind under an explicit
-// "later chunk" contract; this is that chunk, the asset-side mirror of B1/RW1.x's ComponentPreviews. The
-// relocated bodies are byte-identical to the old inline call: they reach the panel's private EditorState through
-// ctx.Panel (DrawMemberList / MarkViewportDirty / Select) and the shared grid/row + drag-drop helpers
-// (InspectorPanel.BeginGrid / .Row / .AcceptGuidDrop, internal static) and audio-preview statics
-// (InspectorPanel.audioPreviewVoice, shared with the AudioSource component preview).
-//
-// Discovery is by [AssetInspector] (engine attribute) via TypeCache; resolution is by extension, deterministic
-// by priority then type name (DeterministicResolver). Most inspectors are stateless — the registry keeps a
-// single shared instance per class — so the few that need per-asset cache (the material preview thumbnail) hold
-// it as instance state on that one shared instance (the same single-cache lifetime the panel field had).
-
-// Textures: import settings. Covers every image extension the old switch grouped into one case.
 [AssetInspector(".png")]
 [AssetInspector(".jpg")]
 [AssetInspector(".jpeg")]
@@ -75,28 +53,21 @@ internal sealed class TextureAssetInspector : IAssetInspector {
 internal sealed class MaterialAssetInspector : IAssetInspector {
     public void Draw(in AssetInspectorContext ctx) => DrawMaterialEditor(ctx.Panel, ctx.Path, ctx.Guid);
 
-    // Material preview thumbnail state. Re-rendered only when the material (guid) or its serialized
-    // content (hash) changes, so the GL pass runs once per edit, not per frame. Body moved here in RW1.4
-    // (was instance state on InspectorPanel; the registry's single shared inspector instance owns the same
-    // single cache the panel field used to).
     Guid materialPreviewGuid;
     int materialPreviewHash;
-    nint materialPreviewTex;     // ImGui handle: GL texture name or DX12 UiHeap descriptor ptr
-    Dx12EditorPreview.Dx12EditorTexture materialPreviewDx12;   // DX12 backing (disposed on re-render)
+    nint materialPreviewTex;
+    Dx12EditorPreview.Dx12EditorTexture materialPreviewDx12;
     const int MaterialPreviewSize = 128;
     static bool IsDx12 => RenderBackendSelector.Selected == RenderBackend.Dx12;
 
     void DrawMaterialPreview(Guid guid, MaterialDefinition definition) {
-        // DX12: the material-preview GPU render (Dx12EditorPreview) hangs the GPU under load — DISABLED until
-        // root-caused (the inspector just omits the sphere). Re-enable with the thumbnail path once verified.
         if (IsDx12)
             return;
-        // cheap content fingerprint: re-render only when the serialized material changes
         int hash = System.Text.Json.JsonSerializer.Serialize(definition, PipelineJson.Options).GetHashCode();
         if (guid != materialPreviewGuid || hash != materialPreviewHash || materialPreviewTex == 0) {
             try {
                 byte[] pixels = MaterialPreviewRenderer.Render(definition, MaterialPreviewSize);
-                materialPreviewDx12?.Dispose();   // free the previous texture + its UiHeap slot
+                materialPreviewDx12?.Dispose();
                 materialPreviewDx12 = Dx12EditorPreview.UploadTexture(pixels, MaterialPreviewSize);
                 materialPreviewTex = materialPreviewDx12.Handle;
                 materialPreviewGuid = guid;
@@ -128,26 +99,16 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
             return;
         }
 
-        // Unity-style preview sphere: render the material to a thumbnail (re-rendered only when the
-        // material's serialized state changes), upload to a GL texture, show it centered.
         DrawMaterialPreview(guid, definition);
 
         gui.TextDisabled($"Shader: {definition.Shader ?? "(none)"}");
         gui.Spacing();
 
-        // The inspector is GENERATED from the shader's DECLARED properties (Unity ShaderLab style) —
-        // no more hardcoded 6-slot + scalar block. A shader that declares a new property shows it here
-        // with zero editor wiring. The on-disk schema stays MaterialDefinition (the .mat JSON) with its
-        // null-means-default elision; MaterialPropertyBinding joins each declared property (by semantic)
-        // to its MaterialDefinition field, so editing one property writes the same JSON delta the old
-        // hand-rolled UI produced — .mat files don't churn on open.
         var properties = ResolveShaderProperties(guid);
 
         var changed = false;
         if (InspectorPanel.BeginGrid("##matslots")) {
             foreach (var prop in properties) {
-                // Honour the load-time conditional flags (PackedOrm/Cutout auto-detect) so the shown
-                // value matches what actually renders when the .mat leaves them unstated.
                 changed |= DrawShaderProperty(prop, definition);
             }
             gui.EndTable();
@@ -163,20 +124,13 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
         gui.TextDisabled("Drag textures from the Assets panel onto the slots.");
     }
 
-    // The declared property list to render. Prefer the loaded material's actual shader (a custom shader
-    // would declare its own); fall back to the Standard set when the material isn't loaded yet.
     static ShaderProperties ResolveShaderProperties(Guid guid) {
         var mat = AssetDatabase.Load<Material>(guid);
         var declared = mat?.Shader?.Properties;
         return declared is { Count: > 0 } ? declared : StandardShaderProperties.Build();
     }
 
-    // Render one declared property and write any edit back to the MaterialDefinition via its semantic.
-    // Returns true if the value changed. bool-as-float properties (NormalFlipY/Transparent/PackedOrm/
-    // Cutout) draw as checkboxes; IsEmissive is load-derived (not authorable) and skipped.
     static bool DrawShaderProperty(ShaderProperty prop, MaterialDefinition definition) {
-        // Custom (semantic None) props bind by NAME into the .mat's Custom* dicts; Standard props bind by
-        // semantic into the fixed fields. A null binding = a non-authorable channel (e.g. IsEmissive) → skip.
         var binding = prop.Semantic == MaterialSemantic.None
             ? MaterialPropertyBinding.ForCustom(prop)
             : MaterialPropertyBinding.For(prop.Semantic);
@@ -196,7 +150,6 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
     }
 
     static bool DrawTextureSlot(MaterialPropertyBinding b, MaterialDefinition definition) {
-        // Custom (None) texture props live in CustomTextures keyed by name; Standard maps in Textures.
         bool custom = b.CustomTextureKey is not null;
         string key = custom ? b.CustomTextureKey : b.TextureKey;
         var dict = custom ? (definition.CustomTextures ??= new()) : definition.Textures;
@@ -215,7 +168,6 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
 
     static bool DrawColor(MaterialPropertyBinding b, MaterialDefinition definition, ShaderProperty prop) {
         var v = b.GetVector(definition, prop.DefaultVector);
-        // Emissive is RGB-only in the .mat; base color is RGBA. Drive by binding's component count.
         if (b.ColorComponents == 3) {
             var c = new SysVec3(v.X, v.Y, v.Z);
             if (gui.ColorEdit3("##c", ref c)) { b.SetVector(definition, new SysVec4(c.X, c.Y, c.Z, 1f), prop.DefaultVector); return true; }
@@ -259,8 +211,6 @@ internal sealed class MaterialAssetInspector : IAssetInspector {
         material.AO = LoadSlot(definition, TextureType.AO);
         material.Emissive = LoadSlot(definition, TextureType.Emissive);
         MaterialLoader.ApplyScalars(material, definition);
-        // Custom (semantic None) props too, so editing _RimColor etc. in the inspector flows to the render
-        // path live (the renderer reads the material's custom bag for the b2 CB).
         MaterialLoader.ApplyCustomProperties(material, definition);
     }
 
@@ -302,14 +252,12 @@ internal sealed class PysceneAssetInspector : IAssetInspector {
         gui.TextWrapped("Falcor scene. On import it generates a sibling .scene you can open.");
 }
 
-// Native text assets — a hint + Show-in-Explorer. Covers the .shader/.glsl/.cubemap group.
 [AssetInspector(".shader")]
 [AssetInspector(".glsl")]
 [AssetInspector(".cubemap")]
 internal sealed class TextAssetInspector : IAssetInspector {
     public void Draw(in AssetInspectorContext ctx) => DrawTextAssetHint(ctx.Path);
 
-    // Native text assets: show a hint but no noisy "unsupported" line.
     static void DrawTextAssetHint(string path) {
         gui.TextDisabled("Edit this file in a text editor.");
         if (gui.Button($"{EditorIcons.FolderOpen}  Show in Explorer", new SysVec2(-1, 0)))
@@ -318,9 +266,6 @@ internal sealed class TextAssetInspector : IAssetInspector {
     }
 }
 
-// Prefab inspector: its captured entity tree (read-only) + an Instantiate-into-scene action.
-// The backend is capture/instantiate (no live instance overrides), so this views the asset and
-// plants copies; editing happens by instantiating, changing in the scene, and re-creating.
 [AssetInspector(".prefab")]
 internal sealed class PrefabAssetInspector : IAssetInspector {
     public void Draw(in AssetInspectorContext ctx) => DrawPrefabInspector(ctx.Panel, ctx.Path);
@@ -333,7 +278,6 @@ internal sealed class PrefabAssetInspector : IAssetInspector {
         }
 
         if (gui.Button($"{EditorIcons.Add}  Instantiate into Scene", new SysVec2(-1, 0))) {
-            // Plants a new entity tree into the scene -> whole-scene Structural snapshot.
             EditorCommands.Structural("Instantiate Prefab", () => {
                 Entity root = prefab.Instantiate();
                 if (root is not null)
@@ -354,17 +298,10 @@ internal sealed class PrefabAssetInspector : IAssetInspector {
     }
 }
 
-// DataAsset inspector: reflect the loaded instance through the SAME member list the component
-// inspector uses (honors [Range]/[Header]/[Tooltip]/[FoldoutGroup]/asset pickers). Edits write
-// straight back to the .asset file via DataAssetSerializer: an asset edit, not scene state, so NO
-// scene undo (the .volume edit-write-back pattern). Change is detected by a serialized-text diff.
 [AssetInspector(".asset")]
 internal sealed class DataAssetInspector : IAssetInspector {
     public void Draw(in AssetInspectorContext ctx) => DrawDataAssetInspector(ctx.Panel, ctx.Path);
 
-    // The DataAsset (ScriptableObject-equivalent) currently being edited, cached so edits accumulate
-    // on one instance; reloaded when the selected .asset path changes. Was instance state on InspectorPanel;
-    // the registry's single shared inspector instance owns the same single cache (RW1.4).
     string dataAssetPath;
     object dataAssetInstance;
 
@@ -401,10 +338,6 @@ internal sealed class DataAssetInspector : IAssetInspector {
     }
 }
 
-// Audio asset view: a Preview/Stop button + clip stats, so you can audition a .wav/.ogg straight
-// from the asset browser without dropping it on an AudioSource. Same Audio facade as the component
-// preview (play-mode-independent; silent no-op with no audio device). Shares the audioPreviewVoice
-// static on InspectorPanel with the AudioSource component preview (RW1.3).
 [AssetInspector(".wav")]
 [AssetInspector(".wave")]
 [AssetInspector(".ogg")]
@@ -432,9 +365,6 @@ internal sealed class AudioClipAssetInspector : IAssetInspector {
     }
 }
 
-// Animation-clip asset view: clip stats. A skeletal pose preview needs a skinned mesh to drive,
-// which an asset-only view doesn't have - assign the clip to an Animator on a skinned entity and
-// use the Animator scrub. Here we just summarize the clip.
 [AssetInspector(".banim")]
 internal sealed class AnimationClipAssetInspector : IAssetInspector {
     public void Draw(in AssetInspectorContext ctx) => DrawAnimationClipAsset(ctx.Path);

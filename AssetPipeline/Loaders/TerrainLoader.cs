@@ -1,6 +1,5 @@
 namespace BallisticEngine.AssetPipeline.Loaders;
 
-// .bterrain artifact -> TerrainAsset (the editable height field the Terrain component references).
 public static class TerrainLoader {
     public static TerrainAsset Load(AssetImportPipeline pipeline, Guid guid, string assetPath) {
         if (!pipeline.TryReadArtifactBytes(guid, out var bytes)) {

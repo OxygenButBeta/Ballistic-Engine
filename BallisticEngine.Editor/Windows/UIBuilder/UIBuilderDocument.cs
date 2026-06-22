@@ -1,55 +1,26 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
 using System.Text;
 using BallisticEngine.UI;
 
 namespace BallisticEngine.Editor;
 
-// The authoritative model behind the visual UI Builder window: a live VisualElement tree (the same
-// runtime type the player draws + the USS cascade resolves), the current selection, the document's USS
-// rules, file path / dirty state, and a self-contained text-snapshot undo stack.
-//
-// The tree is the single source of truth — the canvas renders it through the real Dx12UIRenderer, the
-// inspector edits Style.* on the selected element, and Save serializes it via UxmlWriter/UssWriter. We do
-// NOT reuse EditorUndo (that is scene-YAML scoped); a UI document round-trips through its OWN
-// (uxml, uss) text pair, which is also exactly what's written to disk, so undo == reload-a-snapshot and
-// can never drift from the save format.
-//
-// PROVENANCE (the inline-shadows-class fix): each element's `InlineStyle` is the AUTHORITATIVE store of
-// its inline overrides — the inspector writes there, the writer reads from there, and the canvas resolves
-// classes through the real StyleResolver so a class-provided value is never frozen into inline. The
-// element's live `Style.*` is the RESOLVED (cascade + inline) value used only for rendering/measure.
-//
-// Public so the headless test harness can exercise add/remove/reparent/undo/save-load + class assignment
-// + the inline/class provenance without a GPU (the document carries NO DX12 dependency).
 public sealed class UIBuilderDocument
 {
-    // Root of the authored tree. Always a Panel sized to the design canvas; children are the user's UI.
     public VisualElement Root { get; private set; }
 
-    // The currently-selected element (null = nothing / the root). The inspector + canvas overlay read it.
     public VisualElement Selection { get; set; }
 
-    // USS rules: selector -> a carrier element whose Style holds the rule body (see UssWriter.Rule). Kept
-    // in insertion order for stable .uss output. The carrier's InlineStyle is the rule's authored body.
     public List<UssWriter.Rule> Rules { get; } = new();
 
-    // Where this document saves (the .uxml path; the .uss is the sibling with the same stem). Null = unsaved.
     public string UxmlPath { get; private set; }
     public string UssPath => UxmlPath is null ? null : Path.ChangeExtension(UxmlPath, ".uss");
 
     public bool Dirty { get; private set; }
 
-    // Bumped on every structural/style mutation so the canvas can skip re-rendering an unchanged document
-    // (the per-frame GPU-flush perf fix). The canvas caches the last version it rendered.
     public int Version { get; private set; }
 
-    // Design canvas size (logical px) — the root's box. Editable from the toolbar.
     public float CanvasWidth { get; set; } = 800f;
     public float CanvasHeight { get; set; } = 480f;
 
-    // ---- undo (self-contained text snapshots, keyed by stable element id) ------
     readonly Stack<Snapshot> _undo = new();
     readonly Stack<Snapshot> _redo = new();
     readonly record struct Snapshot(string Uxml, string Uss, string SelectionId, float W, float H);
@@ -61,7 +32,6 @@ public sealed class UIBuilderDocument
 
     public UIBuilderDocument() => NewDocument();
 
-    // Start a blank document: a single root panel with a neutral dark background so the canvas reads.
     public void NewDocument()
     {
         _nextId = 1;
@@ -79,10 +49,6 @@ public sealed class UIBuilderDocument
         Version++;
     }
 
-    // ---- stable id (survives undo's text round-trip) --------------------------
-    // Every element carries a "uib-id" class as a stable identity token so undo can re-select the SAME
-    // element after the tree is rebuilt from text (names are user-editable + optional). The token class is
-    // hidden from the inspector's class field and never written as a USS selector target.
     const string IdPrefix = "uib-id-";
 
     static string IdOf(VisualElement el)
@@ -97,7 +63,6 @@ public sealed class UIBuilderDocument
         if (IdOf(el) == null) el.AddToClassList(IdPrefix + _nextId++);
     }
 
-    // True for the internal identity-token class (hidden from the user-facing class list).
     public static bool IsInternalClass(string c) => c.StartsWith(IdPrefix, StringComparison.Ordinal);
 
     VisualElement FindById(string id)
@@ -109,14 +74,8 @@ public sealed class UIBuilderDocument
         return null;
     }
 
-    // ---- inline-override provenance -------------------------------------------
-    // Re-derive an element's InlineStyle from its CURRENT Style relative to the value the CLASSES alone
-    // would resolve — so only the genuine inline overrides are stored (never a class-provided value). The
-    // inspector calls this after every edit to the selected element.
     public void SyncInline(VisualElement el)
     {
-        // Baseline = a fresh element carrying the SAME classes, resolved against the sheet. The diff of the
-        // element's live style vs. that baseline is exactly its inline overrides.
         var baseline = new Panel();
         foreach (var c in el.ClassList) baseline.AddToClassList(c);
         var sheet = BuildSheet();
@@ -125,21 +84,13 @@ public sealed class UIBuilderDocument
         Version++;
     }
 
-    // ---- canvas resolve (apply USS classes for real, then inline on top) ------
-    // Resolve the WHOLE tree through the real cascade so classes actually style the canvas. Inline
-    // overrides (el.InlineStyle) are replayed by the resolver as the highest layer. Called by the canvas
-    // before each render.
     public void ResolveForRender()
     {
         var sheet = BuildSheet();
         var sheets = sheet != null ? new List<StyleSheet> { sheet } : null;
-        // Re-apply each element's tracked InlineStyle so the resolver's inline pass sees it (the resolver
-        // reads el.InlineStyle), then resolve from scratch top-down.
         StyleResolver.ResolveTree(Root, sheets, null);
     }
 
-    // Build a StyleSheet from the current Rules (each carrier's InlineStyle is the rule body). Returns null
-    // when there are no rules. Cheap; rebuilt per resolve (correctness over caching).
     StyleSheet BuildSheet()
     {
         if (Rules.Count == 0) return null;
@@ -151,8 +102,6 @@ public sealed class UIBuilderDocument
         }
         return StyleSheet.Parse(sb.ToString());
     }
-
-    // ---- mutation API (every mutating call snapshots first for undo) ----------
 
     public void PushUndo()
     {
@@ -169,10 +118,6 @@ public sealed class UIBuilderDocument
 
     public void MarkDirty() { Dirty = true; Version++; }
 
-    // Drop a NEW element into `parent` at an ABSOLUTE position given a point in PANEL-absolute logical
-    // coords (the drop point). The element is centered on the drop point and absolutely positioned relative
-    // to the parent's content origin — so "drop here" lands here, instead of a flex append. This is the
-    // primary placement path (palette drag-drop). Selects + snapshots like AddElement.
     public VisualElement DropElement(VisualElement parent, VisualElement child, System.Numerics.Vector2 panelPoint)
     {
         parent ??= Root;
@@ -180,10 +125,8 @@ public sealed class UIBuilderDocument
         parent.Add(child);
         EnsureId(child);
 
-        // Element's intended size (defaults already applied by the caller) → center on the drop point.
         float w = child.Style.Width.Unit == Length.Kind.Points ? child.Style.Width.Value : 120;
         float h = child.Style.Height.Unit == Length.Kind.Points ? child.Style.Height.Value : 40;
-        // Parent content-box origin (border + padding) — the reference for an absolute child's left/top.
         var pr = parent.ResolvedRect;
         var ps = parent.Style;
         float ox = pr.X + Nz0(ps.GetBorderWidth(Edge.Left)) + Nz0(ps.GetPadding(Edge.Left));
@@ -199,7 +142,6 @@ public sealed class UIBuilderDocument
     }
     static float Nz0(float v) => float.IsNaN(v) ? 0f : v;
 
-    // Add `child` under `parent` (or the root) at the end. Returns child for chaining. Snapshots undo.
     public VisualElement AddElement(VisualElement parent, VisualElement child)
     {
         PushUndo();
@@ -223,7 +165,6 @@ public sealed class UIBuilderDocument
         Version++;
     }
 
-    // Duplicate an element (deep, via the UXML round-trip) as a sibling right after it. Returns the clone.
     public VisualElement Duplicate(VisualElement el)
     {
         if (el is null || el == Root || el.Parent is null) return null;
@@ -231,7 +172,7 @@ public sealed class UIBuilderDocument
         string uxml = UxmlWriter.Write(el);
         VisualElement clone = UxmlLoader.LoadFromText(uxml);
         if (clone is null) return null;
-        StripIds(clone);                       // fresh ids so the clone is distinct under undo
+        StripIds(clone);
         int idx = IndexInParent(el) + 1;
         el.Parent.Insert(idx, clone);
         AssignIdsRecursive(clone);
@@ -240,7 +181,6 @@ public sealed class UIBuilderDocument
         return clone;
     }
 
-    // Reparent `el` under `newParent` at `index`. No-op on a cycle (dropping into a descendant).
     public void Reparent(VisualElement el, VisualElement newParent, int index)
     {
         if (el is null || newParent is null || el == Root) return;
@@ -265,14 +205,13 @@ public sealed class UIBuilderDocument
         return false;
     }
 
-    // ---- class assignment (the USS class-list editor + inline reconcile) -------
     public void AddClass(VisualElement el, string cls)
     {
         if (el is null || string.IsNullOrWhiteSpace(cls) || IsInternalClass(cls)) return;
         PushUndo();
         el.AddToClassList(cls.Trim());
-        ResolveForRender();      // re-resolve so the class takes effect…
-        SyncInline(el);          // …then re-derive inline so we don't double-store the class's values
+        ResolveForRender();
+        SyncInline(el);
         Version++;
     }
 
@@ -286,13 +225,11 @@ public sealed class UIBuilderDocument
         Version++;
     }
 
-    // The user-facing class list (hides the internal identity token).
     public static IEnumerable<string> UserClasses(VisualElement el)
     {
         foreach (var c in el.ClassList) if (!IsInternalClass(c)) yield return c;
     }
 
-    // ---- USS rules -----------------------------------------------------------
     public VisualElement AddRule(string selector)
     {
         PushUndo();
@@ -321,8 +258,6 @@ public sealed class UIBuilderDocument
         Version++;
     }
 
-    // Called after the inspector edits a rule's carrier style — re-derive the carrier's inline body and
-    // re-resolve the tree so canvas elements carrying that selector update live.
     public void RuleEdited(int index)
     {
         if (index < 0 || index >= Rules.Count) return;
@@ -332,17 +267,14 @@ public sealed class UIBuilderDocument
         Version++;
     }
 
-    // Selectors that currently match the selection (for the inspector's "matched rules" readout).
     public IEnumerable<string> MatchedSelectors(VisualElement el)
     {
         if (el is null) yield break;
         foreach (var c in UserClasses(el)) yield return "." + c;
-        // Type selector if any rule names this element's type.
         foreach (var r in Rules)
             if (r.Selector.Equals(el.TypeName, StringComparison.OrdinalIgnoreCase)) yield return r.Selector;
     }
 
-    // ---- undo / redo ---------------------------------------------------------
     public void Undo()
     {
         if (_undo.Count == 0) return;
@@ -365,14 +297,12 @@ public sealed class UIBuilderDocument
         CanvasWidth = ClampSize(s.W); CanvasHeight = ClampSize(s.H);
         Root.Style.Width = Length.Points(CanvasWidth);
         Root.Style.Height = Length.Points(CanvasHeight);
-        Selection = FindById(s.SelectionId);   // by stable id → survives the rebuild even for unnamed elems
+        Selection = FindById(s.SelectionId);
         Dirty = true;
         Version++;
     }
 
     static float ClampSize(float v) => float.IsNaN(v) || v < 16 ? 16 : MathF.Min(v, 4096);
-
-    // ---- serialization / file I/O --------------------------------------------
 
     public string SerializeUxml() => UxmlWriter.Write(Root);
     public string SerializeUss() => UssWriter.Write(Rules);
@@ -413,7 +343,6 @@ public sealed class UIBuilderDocument
         Root = root;
         if (string.IsNullOrEmpty(Root.Name)) Root.Name = "root";
 
-        // Clamp canvas size from the root's authored size (reject 0/NaN/percent/auto → keep current).
         if (Root.Style.Width.Unit == Length.Kind.Points && Root.Style.Width.Value >= 16)
             CanvasWidth = ClampSize(Root.Style.Width.Value);
         if (Root.Style.Height.Unit == Length.Kind.Points && Root.Style.Height.Value >= 16)
@@ -422,8 +351,6 @@ public sealed class UIBuilderDocument
         Rules.Clear();
         ParseUssIntoRules(uss);
 
-        // Re-issue stable ids to every element (loaded files have none; undo snapshots round-trip them as
-        // the uib-id class so FindById works). Track the high-water mark so new ids don't collide.
         RebuildIdCounter();
         AssignIdsRecursive(Root);
 
@@ -458,9 +385,6 @@ public sealed class UIBuilderDocument
         foreach (var ch in el.Children) StripIds(ch);
     }
 
-    // Parse a .uss into editable rules via the REAL StyleSheet parser (comment/variable/at-rule safe),
-    // re-deriving each rule's editable body from a carrier the cascade applies. We keep the raw declaration
-    // text per rule (the writer re-emits it), so even selectors the carrier can't fully model round-trip.
     void ParseUssIntoRules(string uss)
     {
         if (string.IsNullOrWhiteSpace(uss)) return;
@@ -475,8 +399,6 @@ public sealed class UIBuilderDocument
         }
     }
 
-    // Comment-aware block splitter: strips /* */ comments first, then scans selector{body} pairs. Handles
-    // a '{' inside a comment (the brace-scanner bug) and leaves variable/at-rule bodies intact as text.
     static IEnumerable<(string selector, string body)> UssBlocks(string uss)
     {
         string s = StripComments(uss);

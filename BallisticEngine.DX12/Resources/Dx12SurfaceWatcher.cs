@@ -1,18 +1,9 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-
 namespace BallisticEngine.DX12;
 
-// Live file-watch for custom surface shaders. A FileSystemWatcher on the project Assets\ folder flags
-// changed .surface/.hlsl files; the WATCHER THREAD only enqueues paths (no GPU work, no compile). The
-// renderer drains the queue between frames (DrainPending) and recompiles on the main thread, which is
-// where PSO creation is safe. Mirrors how the editor defers focus-regain script reloads off the OS
-// callback — same discipline, but event-driven (no alt-tab needed) so a save updates the viewport live.
 public sealed class Dx12SurfaceWatcher : IDisposable {
     FileSystemWatcher watcher;
     readonly object gate = new();
-    readonly HashSet<string> pending = new(StringComparer.OrdinalIgnoreCase); // absolute paths changed since last drain
+    readonly HashSet<string> pending = new(StringComparer.OrdinalIgnoreCase);
     readonly string assetsRoot;
 
     public Dx12SurfaceWatcher(string assetsAbsolutePath) {
@@ -43,16 +34,11 @@ public sealed class Dx12SurfaceWatcher : IDisposable {
 
     void OnChanged(object sender, FileSystemEventArgs e) {
         if (!IsSurfaceSource(e.FullPath)) return;
-        lock (gate) pending.Add(e.FullPath);   // thread: just record — no compile, no GPU here
+        lock (gate) pending.Add(e.FullPath);
     }
 
-    // Peek whether any change is queued, WITHOUT draining (the editor polls this to decide whether to
-    // repaint; the actual drain + recompile happens in the next BeginRender).
     public bool HasPending { get { lock (gate) return pending.Count > 0; } }
 
-    // Drain the changed-file set (called by the renderer between frames). Returns absolute paths to
-    // recompile; empty when nothing changed. The caller maps each absolute path back to a project-
-    // relative SourcePath and calls Dx12SurfaceShaderCache.Reload.
     public List<string> DrainPending() {
         lock (gate) {
             if (pending.Count == 0) return null;

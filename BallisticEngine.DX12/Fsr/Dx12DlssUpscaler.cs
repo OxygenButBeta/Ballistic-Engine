@@ -1,30 +1,12 @@
-using System;
 using Vortice.Direct3D12;
 
 namespace BallisticEngine.DX12;
 
-// NVIDIA DLSS (Super Resolution) temporal upscaler via NGX direct (nvngx.dll). Mirrors Dx12FsrUpscaler /
-// Dx12XessUpscaler: init once (NGX init + capability probe + DLSS feature create at a fixed render/display res),
-// dispatch per frame (internal-res HDR color + depth + motion + jitter -> output-res HDR). DLSS does its own
-// temporal AA, so like FSR it REPLACES TAA when active.
-//
-// === HARDWARE NOTE ===
-// DLSS REQUIRES an NVIDIA RTX GPU and the NVIDIA driver-installed nvngx.dll core loader (we ship only the
-// nvngx_dlss.dll model snippet, not the core). On the project's AMD RX 9070 XT test box nvngx.dll is absent, so
-// the FIRST NGX P/Invoke throws DllNotFoundException → TryCreate returns null → the renderer falls back to the
-// FSR equivalent. THIS PATH IS THEREFORE CODE-COMPLETE BUT UNVERIFIED ON HARDWARE (no NVIDIA GPU available).
-// The NGX call sequence, parameter keys, jitter/MV conventions, and HDR flags follow the NGX 1.5 programming
-// guide and nvsdk_ngx_helpers.h, but the exact x64 ABI of the exported C accessors could only be confirmed on
-// an RTX machine.
-//
-// Jitter convention (NGX): InJitterOffsetX/Y is the sub-pixel offset in INPUT (render) pixel space — the SAME
-// signed value applied to the projection (UE/Unity convention), NOT negated like FSR. currentJitter is already
-// in pixels. MV scale = render dims (our motion is UV-space prevUV-currUV).
 public sealed class Dx12DlssUpscaler : IDisposable {
-    IntPtr ngxParams;     // capability/eval parameters (NGX-owned, freed via DestroyParameters)
-    IntPtr dlssFeature;   // the created SuperSampling feature handle
+    IntPtr ngxParams;
+    IntPtr dlssFeature;
     bool ngxInited;
-    bool featurePending = true;   // create the feature on the first Dispatch (needs a recording cmd list)
+    bool featurePending = true;
 
     public int RenderWidth { get; }
     public int RenderHeight { get; }
@@ -38,14 +20,10 @@ public sealed class Dx12DlssUpscaler : IDisposable {
         ngxParams = pars; ngxInited = true; Valid = true;
     }
 
-    // NGX init + DLSS-availability probe. Returns null (logs once) if DLSS can't run here (non-NVIDIA GPU, no
-    // driver nvngx.dll, or DLSS feature not available). The DLSS feature itself is created lazily on the first
-    // Dispatch (CreateFeature needs a recording command list).
     public static Dx12DlssUpscaler TryCreate(Dx12Device dev, int renderW, int renderH, int outputW, int outputH, int perfQuality) {
         bool inited = false;
         IntPtr pars = IntPtr.Zero;
         try {
-            // App id 0 is accepted for non-shipping/eval; the data path is the working dir.
             uint rc = NgxApi.NVSDK_NGX_D3D12_Init(0UL, ".", dev.Device.NativePointer, NgxApi.VersionApi);
             if (rc != NgxApi.ResultSuccess) {
                 Console.WriteLine($"[DLSS] NGX init failed (0x{rc:X8}) — falling back (likely no NVIDIA GPU/driver).");
@@ -58,7 +36,7 @@ public sealed class Dx12DlssUpscaler : IDisposable {
                 NgxApi.NVSDK_NGX_D3D12_Shutdown();
                 return null;
             }
-            // Is the SuperSampling (DLSS) feature available on this GPU/driver?
+
             NgxApi.NVSDK_NGX_Parameter_GetI(pars, NgxApi.P_SuperSamplingAvailable, out int available);
             if (available == 0) {
                 Console.WriteLine("[DLSS] SuperSampling not available on this GPU — falling back.");
@@ -79,8 +57,6 @@ public sealed class Dx12DlssUpscaler : IDisposable {
         }
     }
 
-    // Create the DLSS feature on `cl` (the first Dispatch). HDR color (linear pre-tonemap), low-res motion,
-    // non-inverted depth, auto-exposure (DLSS meters the frame). Returns false (and disables) on failure.
     bool EnsureFeature(ID3D12GraphicsCommandList4 cl) {
         if (!featurePending) return dlssFeature != IntPtr.Zero;
         featurePending = false;
@@ -110,8 +86,6 @@ public sealed class Dx12DlssUpscaler : IDisposable {
         }
     }
 
-    // Record the upscale into `cl`. Inputs must be in NON_PIXEL_SHADER_RESOURCE (NGX reads them in compute);
-    // output in UNORDERED_ACCESS (the caller transitions them). renderW/H = the internal resolution.
     public bool Dispatch(ID3D12GraphicsCommandList4 cl,
         ID3D12Resource color, ID3D12Resource depth, ID3D12Resource motion, ID3D12Resource output,
         int renderW, int renderH, float jitterX, float jitterY, bool reset) {
@@ -122,11 +96,9 @@ public sealed class Dx12DlssUpscaler : IDisposable {
             NgxApi.NVSDK_NGX_Parameter_SetD3d12Resource(ngxParams, NgxApi.P_Output, output?.NativePointer ?? IntPtr.Zero);
             NgxApi.NVSDK_NGX_Parameter_SetD3d12Resource(ngxParams, NgxApi.P_Depth, depth?.NativePointer ?? IntPtr.Zero);
             NgxApi.NVSDK_NGX_Parameter_SetD3d12Resource(ngxParams, NgxApi.P_MotionVectors, motion?.NativePointer ?? IntPtr.Zero);
-            // NGX jitter = applied sub-pixel offset in render pixels (NOT negated).
             NgxApi.NVSDK_NGX_Parameter_SetF(ngxParams, NgxApi.P_JitterX, jitterX);
             NgxApi.NVSDK_NGX_Parameter_SetF(ngxParams, NgxApi.P_JitterY, jitterY);
             NgxApi.NVSDK_NGX_Parameter_SetI(ngxParams, NgxApi.P_Reset, reset ? 1 : 0);
-            // UV-space motion -> pixel space via MV scale = render dims (matches FSR/XeSS).
             NgxApi.NVSDK_NGX_Parameter_SetF(ngxParams, NgxApi.P_MVScaleX, renderW);
             NgxApi.NVSDK_NGX_Parameter_SetF(ngxParams, NgxApi.P_MVScaleY, renderH);
             NgxApi.NVSDK_NGX_Parameter_SetUI(ngxParams, NgxApi.P_RenderSubrectW, (uint)renderW);
@@ -146,6 +118,7 @@ public sealed class Dx12DlssUpscaler : IDisposable {
             if (dlssFeature != IntPtr.Zero) { NgxApi.NVSDK_NGX_D3D12_ReleaseFeature(dlssFeature); dlssFeature = IntPtr.Zero; }
             if (ngxParams != IntPtr.Zero) { NgxApi.NVSDK_NGX_D3D12_DestroyParameters(ngxParams); ngxParams = IntPtr.Zero; }
             if (ngxInited) { NgxApi.NVSDK_NGX_D3D12_Shutdown(); ngxInited = false; }
-        } catch { /* shutdown best-effort */ }
+        } catch {
+        }
     }
 }

@@ -1,10 +1,5 @@
-using System;
-using System.Collections.Generic;
-
 namespace BallisticEngine.UI;
 
-// A tabbed view (P5.6) — UITK's TabView. A row of tab buttons over a content area; clicking a tab shows
-// its page and hides the others. Add tabs via AddTab(title, content).
 public class TabView : VisualElement, INotifyValueChanged<int>
 {
     readonly VisualElement _tabBar;
@@ -63,7 +58,7 @@ public class TabView : VisualElement, INotifyValueChanged<int>
         _pages.Add(content);
         _contents.Add(content);
 
-        if (_selected < 0) Value = 0;   // first tab selected by default
+        if (_selected < 0) Value = 0;
         return content;
     }
 }

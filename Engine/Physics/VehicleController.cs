@@ -1,26 +1,7 @@
-using OpenTK.Windowing.GraphicsLibraryFramework; // Keys enum, same source the Input facade uses
+using OpenTK.Windowing.GraphicsLibraryFramework;
 
 namespace BallisticEngine;
 
-// Arcade vehicle controller (Unreal-starter-content quality). Drives a chassis Rigidbody whose wheels
-// are WheelCollider components on child entities. The wheels do SUSPENSION + grounding; this controller
-// owns the HORIZONTAL dynamics with a velocity-steering ARCADE model that is on-rails by default and
-// keeps its speed through corners — no ice-skating, no spin-out, no scrub-to-stall.
-//
-// THE MODEL (why it is stable where a per-wheel tyre-force model spins out):
-//   * HEADING turns at a controlled yaw rate the steering commands (bicycle model, clamped to MaxTurnRate),
-//     so the car can never rotate faster than the cap — spin-out is structurally impossible.
-//   * SPEED eases toward a throttle target (full throttle → MaxSpeed; lift → engine-brake to a coast;
-//     brake/handbrake → toward a stop). The ease uses the ACTUAL horizontal speed, so a turn never
-//     bleeds it (the old bug projected speed onto the heading and lost it in corners → scrub-to-stall).
-//   * The VELOCITY DIRECTION is rotated toward the heading by GRIP each step, preserving the eased speed.
-//     Grip 1 = glued (the car goes exactly where it points); lower grip / handbrake lets the tail step
-//     out for a controllable, clean-recovering drift.
-//   * Vertical velocity (gravity + suspension) is left untouched, so the car falls, follows terrain, and
-//     the suspension works. STABILITY (anti-roll force pair + downforce) plants it without self-steering.
-//
-// Input: WASD / arrows + gamepad (left stick steer + throttle, RT/LT triggers throttle/brake, A = handbrake,
-// Y or R = flip-recovery reset). All tunable below; the defaults are chosen to feel great out of the box.
 [Component("Vehicle Controller", "Physics")]
 public class VehicleController : Behaviour {
     [Header("Drive")]
@@ -158,28 +139,22 @@ public class VehicleController : Behaviour {
 
     Rigidbody chassis;
     readonly List<WheelCollider> wheels = new();
-    float steer;          // current steer angle (radians), smoothed toward the input
-    float steerVelocity;  // SmoothDamp state for the steer angle
-    bool reversing;       // latched drive intent so a slide can't flip the drive direction mid-slide
+    float steer;
+    float steerVelocity;
+    bool reversing;
 
-    // Gearbox state.
-    int gear = 1;         // current forward gear (1..GearCount); reverse uses a separate model
-    float shiftTimer;     // >0 while mid-shift (torque cut); counts down
-    float engineRpm;      // current engine revs, 0..1 of redline (smoothed, for readout + torque)
+    int gear = 1;
+    float shiftTimer;
+    float engineRpm;
 
-    // ---- Runtime readouts (HUD / SFX / camera) — [NotSerialized] keeps them out of YAML + inspector ----
-
-    // The current smoothed steer, normalized to [-1,1] (right positive). Read by the ChaseCamera to
-    // lead the aim into corners.
     [NotSerialized]
     public float CurrentSteerNormalized =>
         MaxSteerAngle > 0f ? MathHelper.Clamp(steer / (MaxSteerAngle * Mathf.Deg2Rad), -1f, 1f) : 0f;
 
-    // Current gear (1..GearCount forward, 0 = neutral/idle, -1 = reverse) — for a HUD readout.
     [NotSerialized] public int CurrentGear { get; private set; }
-    // Engine revs as a 0..1 fraction of redline — for a tachometer HUD / engine-pitch SFX.
+
     [NotSerialized] public float EngineRpm => engineRpm;
-    // Forward ground speed in m/s — for a speedometer HUD.
+
     [NotSerialized]
     public float SpeedKmh => chassis is not null
         ? new Vector3(chassis.Velocity.X, 0f, chassis.Velocity.Z).Length() * 3.6f : 0f;
@@ -212,15 +187,11 @@ public class VehicleController : Behaviour {
         if (dt <= 0f || wheels.Count == 0)
             return;
 
-        // --- Input ----------------------------------------------------------------------------
-        // Triggers drive on a gamepad if present (RT = throttle, LT = brake/reverse); otherwise W/S.
         float throttle = ReadAxis(Keys.W, Keys.S)
-                       + Input.GetGamepadAxis(GamepadAxis.RightTrigger)
-                       - Input.GetGamepadAxis(GamepadAxis.LeftTrigger)
-                       + Input.GetLeftStick().Y;
+                         + Input.GetGamepadAxis(GamepadAxis.RightTrigger)
+                         - Input.GetGamepadAxis(GamepadAxis.LeftTrigger)
+                         + Input.GetLeftStick().Y;
         throttle = MathHelper.Clamp(throttle, -1f, 1f);
-        // D = steer right, A = steer left. The minus matches the engine's right/yaw convention behind
-        // the chase camera (A/D were reversed without it).
         float steerInput = -(ReadAxis(Keys.D, Keys.A) + Input.GetLeftStick().X);
         steerInput = MathHelper.Clamp(steerInput, -1f, 1f);
         bool handbrake = Input.IsKeyDown(Keys.Space) || Input.IsGamepadButtonDown(GamepadButton.A);
@@ -228,7 +199,6 @@ public class VehicleController : Behaviour {
 
         Transform chassisT = chassis.transform;
 
-        // --- Flip recovery: re-right the car in place while the reset key is held. ---------------------
         if (resetKey) {
             ResetUpright(chassisT);
             return;
@@ -241,46 +211,33 @@ public class VehicleController : Behaviour {
         float signedSpeed = Vector3.Dot(horiz, new Vector3(forwardDir.X, 0f, forwardDir.Z));
         float speedFraction = MathHelper.Clamp(speed / MaxSpeed, 0f, 1f);
 
-        // --- Steering angle: speed-scaled max lock, smoothed toward the input (snappier on return). ----
         float steerScale = MathHelper.Lerp(1f, HighSpeedSteerScale, speedFraction);
         float targetSteer = steerInput * MaxSteerAngle * Mathf.Deg2Rad * steerScale;
         float towardCentre = MathF.Abs(targetSteer) < MathF.Abs(steer) ? 1f : 0f;
         float smoothTime = MathHelper.Lerp(SteerTime, SteerReturnTime, towardCentre);
         steer = Mathf.SmoothDamp(steer, targetSteer, ref steerVelocity, smoothTime, dt);
 
-        // --- Self-right (GTA-style): when the car is rolled onto its side/roof, A/D rolls it back over.
-        // Engages only when actually tipped (the car's up axis is far from world-up); applies an arcade
-        // roll torque about the body-forward axis toward the pressed side, plus a gentle auto-assist so it
-        // keeps coming back even without input once it's badly flipped. Doesn't touch normal driving.
-        float upDot = Vector3.Dot(chassisT.Up, Vector3.UnitY); // 1 = upright, 0 = on its side, -1 = roof
+        float upDot = Vector3.Dot(chassisT.Up, Vector3.UnitY);
         if (SelfRight && upDot < 0.7f) {
-            // Roll the car upright. Axis = up × worldUp brings the car's up toward world-up from ANY
-            // orientation; near fully inverted that cross is ~0 (unstable balance) so bias a roll about
-            // body-forward to commit to a side — A/D pick it, else a default. We drive the roll RATE toward
-            // a target along that axis (decisive flip, doesn't spin forever). While righting we RETURN —
-            // no drive/grip fights it — so the car cleanly rolls back onto its wheels (GTA-style).
             Vector3 axis = Vector3.Cross(chassisT.Up, Vector3.UnitY);
             float steerBias = MathF.Abs(steerInput) > 0.05f ? -steerInput : 1f;
-            float invert = 1f - MathF.Min(1f, axis.Length()); // ~1 when inverted/on-roof, 0 when on its side
+            float invert = 1f - MathF.Min(1f, axis.Length());
             axis += chassisT.Forward * (steerBias * invert);
             if (axis.LengthSquared() > 1e-6f) {
                 Vector3 dir = axis.Normalized();
-                const float flipRate = 4.5f;                               // rad/s flip speed
+                const float flipRate = 4.5f;
                 float curRate = Vector3.Dot(chassis.AngularVelocity, dir);
                 chassis.AddTorque(dir * ((flipRate - curRate) * SelfRightStrength * chassis.Mass));
-                // Kill off-axis spin + horizontal drift so it settles upright in place rather than sliding.
                 Vector3 ang = chassis.AngularVelocity;
-                chassis.AngularVelocity = dir * Vector3.Dot(ang, dir); // keep only the roll-about-axis spin
+                chassis.AngularVelocity = dir * Vector3.Dot(ang, dir);
                 chassis.Velocity = new Vector3(chassis.Velocity.X * 0.9f, chassis.Velocity.Y, chassis.Velocity.Z * 0.9f);
             }
-            return; // don't drive while righting
+            return;
         }
 
-        // --- Latched drive intent so a slide can't flip forward/back mid-corner. -----------------------
         if (throttle < -0.05f) reversing = true;
         else if (throttle > 0.05f) reversing = false;
 
-        // --- Steer the steered wheels (visual) + count grounded wheels + average the ground normal. ----
         Vector3 chassisPos = chassisT.WorldPosition;
         int grounded = 0;
         Vector3 groundNormal = Vector3.Zero;
@@ -293,13 +250,9 @@ public class VehicleController : Behaviour {
                 groundNormal += wheel.ContactNormal;
             }
         }
-        // The average ground normal (world up if somehow zero) — the drive velocity is projected onto
-        // this plane so the car climbs a ramp instead of wedging its horizontal push into the slope.
+
         groundNormal = groundNormal.LengthSquared() > 1e-6f ? groundNormal.Normalized() : Vector3.UnitY;
 
-        // --- Grounded: the on-rails arcade drive + stability. Airborne: free flight + light air control.
-        // The split is the GTA feel — off a ramp the car FLIES (momentum kept, no grip pinning it down),
-        // and you can pitch/roll it a little in the air to set up the landing.
         if (grounded > 0) {
             ApplyArcadeDrive(chassisT, vel, horiz, speed, signedSpeed, throttle, handbrake, groundNormal, dt);
             ApplyStability(chassisT, speedFraction);
@@ -308,26 +261,17 @@ public class VehicleController : Behaviour {
         }
     }
 
-    // Airborne control (GTA-style): the car flies on pure momentum + gravity — NO horizontal velocity is
-    // touched, so a ramp launch keeps all its speed and arc. The only inputs are gentle attitude torques
-    // to set up the landing: throttle pitches the nose (W = nose down to dive, S = nose up), steer rolls
-    // it (A/D = barrel toward that side). Light, capped, and damped so it's a nudge, not a flight sim.
     void ApplyAirControl(Transform chassisT, float throttle, float steerInput, float dt) {
         if (AirControl <= 0f)
             return;
-        Vector3 pitchAxis = chassisT.Right;   // nose up/down about the car's right axis
-        Vector3 rollAxis = chassisT.Forward;  // barrel-roll about the car's forward axis
+        Vector3 pitchAxis = chassisT.Right;
+        Vector3 rollAxis = chassisT.Forward;
         float gain = AirControl * chassis.Mass;
-        // Pitch: W (throttle +) drops the nose, S raises it — the natural "point where you're going" feel.
         chassis.AddTorque(pitchAxis * (-throttle * gain));
         chassis.AddTorque(rollAxis * (steerInput * gain));
-        // Damp the angular velocity a touch so the inputs settle instead of spinning up.
         chassis.AngularVelocity *= 1f / (1f + dt * 1.5f);
     }
 
-    // The on-rails arcade core. Heading turns at a clamped rate; speed eases toward the throttle target
-    // from the ACTUAL speed (never bled by a turn); the velocity direction is rotated to follow the nose
-    // while preserving that speed. The result corners on rails and keeps its speed, and can never spin.
     void ApplyArcadeDrive(Transform chassisT, Vector3 vel, Vector3 horiz, float speed, float signedSpeed,
         float throttle, bool handbrake, Vector3 groundNormal, float dt) {
         Vector3 fwd = chassisT.Forward;
@@ -336,11 +280,6 @@ public class VehicleController : Behaviour {
             return;
         headingDir = headingDir.Normalized();
 
-        // --- Heading: drive the yaw rate toward what the steering commands (bicycle model). The target
-        // scales with ground speed and the latched drive sign (so a big slip angle can't flip it and
-        // fishtail). Clamped to MaxTurnRate (× the handbrake boost) so a corner stays tight but never
-        // spins. A critically-damped blend toward the target CANNOT overshoot — and because the target
-        // is 0 going straight, it actively cancels any yaw the terrain induced (no self-steer).
         float driveSign = reversing ? -1f : 1f;
         float turnCap = MaxTurnRate * (handbrake ? HandbrakeTurnBoost : 1f);
         float targetYaw = speed * driveSign * MathF.Tan(MathHelper.Clamp(steer, -1.2f, 1.2f))
@@ -351,103 +290,69 @@ public class VehicleController : Behaviour {
         float yawRate = Vector3.Dot(chassis.AngularVelocity, yawAxis);
         float yawBlend = 1f - MathF.Exp(-dt / MathF.Max(0.01f, TurnResponse));
         float newYaw = yawRate + (targetYaw - yawRate) * yawBlend;
-        // Write back the corrected yaw, leaving roll/pitch angular velocity untouched (so the suspension
-        // and anti-roll still control those). Hard-clamp the world-yaw as a final spin-proof backstop.
         Vector3 angVel = chassis.AngularVelocity + yawAxis * (newYaw - yawRate);
         angVel.Y = MathHelper.Clamp(angVel.Y, -turnCap, turnCap);
         chassis.AngularVelocity = angVel;
 
-        // --- Speed: ease the signed speed toward the throttle target. The forward pull comes from the
-        // automatic gearbox (UpdateGearbox), which makes acceleration non-linear and car-like. Uses the
-        // actual horizontal speed (signedSpeed) as the start so a turn never bleeds it. -----------------
         float targetSpeed, accel;
         if (throttle > 0.01f && !reversing) {
             targetSpeed = throttle * MaxSpeed;
-            accel = throttle * UpdateGearbox(MathF.Max(0f, signedSpeed), dt) + 0.5f; // +floor: always creeps off 0
+            accel = throttle * UpdateGearbox(MathF.Max(0f, signedSpeed), dt) + 0.5f;
         } else if (throttle < -0.01f && reversing) {
-            // Reverse: single gear, simple taper (no gearbox feel backwards).
             CurrentGear = -1; engineRpm = MathHelper.Clamp(-signedSpeed / MaxReverseSpeed, 0f, 1f);
             float headroom = MathHelper.Clamp(1f - MathF.Max(0f, -signedSpeed) / MaxReverseSpeed, 0f, 1f);
-            targetSpeed = throttle * MaxReverseSpeed; // negative
+            targetSpeed = throttle * MaxReverseSpeed;
             accel = EnginePower * 0.55f * headroom + 0.5f;
         } else {
-            targetSpeed = 0f;                          // coasting: engine-brake toward a stop
+            targetSpeed = 0f;
             accel = CoastDecel;
             UpdateGearboxIdle(MathF.Max(0f, signedSpeed), dt);
         }
-        // Braking: throttle opposing motion decelerates hard and straight (toward a stop, not past it).
+
         if (throttle * signedSpeed < -0.01f)
             accel = BrakeDecel;
         if (handbrake)
             accel = MathF.Max(accel, HandbrakeDecel);
 
-        // --- Drive in the HORIZONTAL plane along the car's heading. The force is applied horizontally
-        // (the heading flattened to the ground), NOT along the pitched body-forward. Two reasons, both
-        // fixing reported issues:
-        //   * A pitched-forward force has an UPWARD component on a slope that flings a light car off small
-        //     bumps at low speed ("düşük hızda fazla uçuyor"). A horizontal force never launches the car.
-        //   * The taper is measured on HORIZONTAL speed, so on a slope the motor keeps a constant
-        //     horizontal push while gravity's downhill component bleeds that speed — the car SLOWS going
-        //     uphill (steeper = slower), which is the realistic GTA feel ("yokuşta da hızlanıyordu").
-        // A sustained horizontal force still climbs: the slope redirects it into the climb via the wheels'
-        // normal force, and it keeps pushing into a kerb until the car rides over it.
         Vector3 carFwd = chassisT.Forward;
         var driveAxis = new Vector3(carFwd.X, 0f, carFwd.Z);
         driveAxis = driveAxis.LengthSquared() > 1e-6f ? driveAxis.Normalized() : headingDir;
 
-        float forwardVel = Vector3.Dot(horiz, driveAxis); // horizontal speed along the heading
+        float forwardVel = Vector3.Dot(horiz, driveAxis);
         float driveAccel;
         if (MathF.Abs(targetSpeed) < 0.01f) {
-            // Coast / brake: decelerate the horizontal forward velocity toward 0 (capped, no reverse kick).
             driveAccel = -MathF.Sign(forwardVel) * MathF.Min(accel, MathF.Abs(forwardVel) / dt);
         } else if (forwardVel * MathF.Sign(targetSpeed) > MathF.Abs(targetSpeed)) {
-            // Over the target horizontal speed (e.g. rolling downhill): ease back down (engine limit).
             driveAccel = MathF.Sign(targetSpeed) * -CoastDecel;
         } else {
-            // Under target: full (gearbox-shaped) push. On a slope gravity opposes this horizontal force,
-            // so the car naturally slows the steeper it climbs.
             driveAccel = MathF.Sign(targetSpeed) * accel;
         }
         chassis.AddForce(driveAxis * (driveAccel * chassis.Mass));
 
-        // GRIP = cancel the sideways slip (along the horizontal right of the heading) as a precise velocity
-        // correction (friction, not propulsion). Horizontal so it never fights the vertical motion. The
-        // handbrake loosens it for a drift.
-        Vector3 sideAxis = new Vector3(driveAxis.Z, 0f, -driveAxis.X); // horizontal, perpendicular to drive
+        Vector3 sideAxis = new Vector3(driveAxis.Z, 0f, -driveAxis.X);
         float rightVel = Vector3.Dot(horiz, sideAxis);
         float grip = handbrake ? Grip * HandbrakeGrip : Grip;
         float newRight = rightVel * MathF.Exp(-grip * dt);
         chassis.AddForce(sideAxis * ((newRight - rightVel) * chassis.Mass / dt));
     }
 
-    // Automatic gearbox. Returns the forward acceleration (m/s²) available THIS step, shaped by the
-    // gear + engine-rev torque curve so acceleration is non-linear and car-like: each gear pulls hard
-    // off its low end, the revs climb to the upshift point, it changes up (a brief torque cut you feel),
-    // and the next gear pulls again from lower revs. Reads/advances gear/engineRpm/shiftTimer state.
     float UpdateGearbox(float forwardSpeed, float dt) {
         int gears = Math.Max(1, GearCount);
         gear = Math.Clamp(gear, 1, gears);
 
-        // Each gear covers an equal slice of the speed range; the engine revs map the car's speed within
-        // the current gear's slice to 0..1 (idle..redline). A geometric-ish spacing would be more
-        // realistic, but equal slices read clearly and tune simply.
         float gearTop = MaxSpeed * gear / gears;
         float gearBottom = MaxSpeed * (gear - 1) / gears;
         float span = MathF.Max(0.1f, gearTop - gearBottom);
         float revs = MathHelper.Clamp((forwardSpeed - gearBottom) / span, 0f, 1.2f);
 
-        // Advance a shift in progress (torque is cut while shifting).
         if (shiftTimer > 0f)
             shiftTimer = MathF.Max(0f, shiftTimer - dt);
 
-        // Auto up/down shift (not while already shifting). Upshift near redline; downshift when the revs
-        // fall below the downshift point, so the gears don't hunt.
         if (shiftTimer <= 0f) {
             if (revs >= UpshiftRpm && gear < gears) { gear++; shiftTimer = ShiftTime; }
             else if (revs <= DownshiftRpm && gear > 1) { gear--; shiftTimer = ShiftTime; }
         }
 
-        // Recompute revs for the (possibly new) gear and smooth them for the readout / SFX.
         gearTop = MaxSpeed * gear / gears;
         gearBottom = MaxSpeed * (gear - 1) / gears;
         span = MathF.Max(0.1f, gearTop - gearBottom);
@@ -455,16 +360,12 @@ public class VehicleController : Behaviour {
         engineRpm += (targetRevs - engineRpm) * (1f - MathF.Exp(-12f * dt));
         CurrentGear = gear;
 
-        // Torque curve: a smooth hump that peaks in the mid-revs and tapers toward idle and redline —
-        // sin(π·revs) shaped by TorqueCurve. A small floor keeps low-rev pull alive (drivability).
         float hump = MathF.Pow(MathF.Sin(MathHelper.Clamp(engineRpm, 0f, 1f) * MathF.PI), 1f / TorqueCurve);
         float torque = 0.35f + 0.65f * hump;
-        float shiftCut = shiftTimer > 0f ? 0.1f : 1f; // torque drops to ~10% during a shift (the "kick")
+        float shiftCut = shiftTimer > 0f ? 0.1f : 1f;
         return EnginePower * torque * shiftCut;
     }
 
-    // Keep the gearbox readout sane when coasting/braking (no throttle): bleed revs toward idle and let
-    // the gear drop as the car slows, so the HUD doesn't freeze on the last driven gear.
     void UpdateGearboxIdle(float forwardSpeed, float dt) {
         int gears = Math.Max(1, GearCount);
         gear = Math.Clamp(gear, 1, gears);
@@ -480,37 +381,27 @@ public class VehicleController : Behaviour {
         CurrentGear = forwardSpeed > 0.2f ? gear : 0;
     }
 
-    // Anti-roll keeps the car upright in hard corners; downforce presses it into the road at speed.
     void ApplyStability(Transform chassisT, float speedFraction) {
         Vector3 worldUp = Vector3.UnitY;
         Vector3 com = chassisT.WorldPosition;
         Vector3 right = chassisT.Right;
         Vector3 fwd = chassisT.Forward;
 
-        // ROLL ONLY, as a VERTICAL FORCE PAIR at the track edges — a real anti-roll bar, NOT a body torque.
-        // A torque about a tilted axis leaks into YAW (the chassis box inertia is very non-uniform, so
-        // I^-1 maps the torque off-axis and it gains a world-up component), which made the car self-steer
-        // on tilted terrain. Equal-and-opposite VERTICAL forces at horizontally-offset points make a roll-
-        // only couple that CANNOT produce a net world-up torque — zero yaw leak. We deliberately don't
-        // level PITCH: a car should follow the terrain's slope nose-up/down.
         Vector3 rightFlat = new Vector3(right.X, 0f, right.Z);
         if (rightFlat.LengthSquared() > 1e-6f) {
             rightFlat = rightFlat.Normalized();
-            float rollLean = Vector3.Dot(right, worldUp);               // +ve = right side up (rolled left)
-            float rollRate = Vector3.Dot(chassis.AngularVelocity, fwd); // roll about the forward axis
+            float rollLean = Vector3.Dot(right, worldUp);
+            float rollRate = Vector3.Dot(chassis.AngularVelocity, fwd);
             float rollForce = (-rollLean * AntiRoll) - (rollRate * AntiRoll * 0.1f);
-            chassis.AddForceAtPosition(worldUp * rollForce, com + rightFlat * 1f);   // ~track half-width
+            chassis.AddForceAtPosition(worldUp * rollForce, com + rightFlat * 1f);
             chassis.AddForceAtPosition(worldUp * -rollForce, com - rightFlat * 1f);
         }
 
-        // Downforce: push straight down, scaling with speed² for a racing feel (grip earns its keep).
         float df = Downforce * speedFraction * speedFraction;
         if (df > 0f)
             chassis.AddForce(-worldUp * df);
     }
 
-    // Re-right the car in place: kill spin, level roll/pitch to upright (keeping heading), lift it a
-    // touch so it doesn't re-clip the ground. Held on the reset key — a held key just keeps it level.
     void ResetUpright(Transform chassisT) {
         Vector3 fwd = chassisT.Forward;
         var flatFwd = new Vector3(fwd.X, 0f, fwd.Z);
@@ -529,10 +420,6 @@ public class VehicleController : Behaviour {
     static float ReadAxis(Keys positive, Keys negative) =>
         (Input.IsKeyDown(positive) ? 1f : 0f) - (Input.IsKeyDown(negative) ? 1f : 0f);
 
-    // ---- Editor gizmos ------------------------------------------------------------------------------
-    // Shows the car's heading (blue), its current velocity (green), and the commanded turn direction
-    // (yellow arc) at the chassis — a debug/feel aid while tuning. Heading always; velocity + turn only
-    // in play. Pure IGizmos lines, no editor dependency.
     public override void OnDrawGizmosSelected(IGizmos gizmos) {
         Transform t = transform;
         Vector3 origin = t.WorldPosition + Vector3.UnitY * 0.4f;
@@ -540,14 +427,12 @@ public class VehicleController : Behaviour {
         var flatFwd = new Vector3(fwd.X, 0f, fwd.Z);
         flatFwd = flatFwd.LengthSquared() > 1e-6f ? flatFwd.Normalized() : Vector3.UnitZ;
 
-        // Heading arrow (blue) — where the nose points.
         gizmos.Color = new Vector3(0.3f, 0.6f, 1f);
         DrawArrow(gizmos, origin, flatFwd, 3f);
 
         if (!SceneManager.IsPlaying || chassis is null)
             return;
 
-        // Velocity arrow (green) — where the car is actually going (the gap to heading is the slip/drift).
         Vector3 vel = chassis.Velocity;
         var horiz = new Vector3(vel.X, 0f, vel.Z);
         if (horiz.Length() > 0.5f) {
@@ -555,7 +440,6 @@ public class VehicleController : Behaviour {
             DrawArrow(gizmos, origin, horiz.Normalized(), MathF.Min(horiz.Length() * 0.15f, 6f));
         }
 
-        // Turn indicator (yellow) — the side the car is steering toward, length ~ steer amount.
         float steerN = CurrentSteerNormalized;
         if (MathF.Abs(steerN) > 0.02f) {
             Vector3 right = t.Right;
@@ -574,7 +458,6 @@ public class VehicleController : Behaviour {
         dir = dir.Normalized();
         Vector3 tip = origin + dir * length;
         gizmos.DrawLine(origin, tip);
-        // Two small barbs at the tip, in the horizontal plane.
         Vector3 side = Vector3.Cross(dir, Vector3.UnitY);
         if (side.LengthSquared() < 1e-6f) side = Vector3.UnitX;
         side = side.Normalized();

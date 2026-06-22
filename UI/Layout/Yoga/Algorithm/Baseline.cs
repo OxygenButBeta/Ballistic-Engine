@@ -1,13 +1,7 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-//
-// This source code is licensed under the MIT license found in the
-// LICENSE file in the root directory of this source tree.
-
 namespace Facebook.Yoga
 {
     internal static class Baseline
     {
-        // Calculate baseline represented as an offset from the top edge of the node.
         public static float CalculateBaseline(Node node)
         {
             if (node.HasBaselineFunc())
@@ -60,7 +54,6 @@ namespace Facebook.Yoga
             return childBaseline + baselineChild.Layout.Position(PhysicalEdge.Top);
         }
 
-        // Whether any of the children of this node participate in baseline alignment
         public static bool IsBaselineLayout(Node node)
         {
             if (node.Style.FlexDirection.IsColumn())

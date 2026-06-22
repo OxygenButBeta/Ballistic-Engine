@@ -1,7 +1,5 @@
 namespace BallisticEngine.Cli;
 
-// Shared "did you mean" scoring for CLI error messages: case-insensitive prefix beats contains
-// beats small edit distance. Returns null when nothing is close enough to be worth suggesting.
 internal static class Suggest {
     public static string? Closest(string typed, IEnumerable<string?> candidates) {
         string? best = null;

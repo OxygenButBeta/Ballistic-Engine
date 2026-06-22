@@ -1,12 +1,7 @@
-using System;
 using System.Collections;
-using System.Collections.Generic;
 
 namespace BallisticEngine.UI;
 
-// An IList that raises a change event (P7.3) — bind it to a ListView so adds/removes/clears auto-refresh
-// the virtualized view (UITK's observable item-source flow). Implements non-generic IList too so it drops
-// straight into ListView.ItemsSource.
 public sealed class ObservableList<T> : IList<T>, IList
 {
     readonly List<T> _items = new();
@@ -35,7 +30,6 @@ public sealed class ObservableList<T> : IList<T>, IList
     public IEnumerator<T> GetEnumerator() => _items.GetEnumerator();
     IEnumerator IEnumerable.GetEnumerator() => _items.GetEnumerator();
 
-    // --- non-generic IList (for ListView.ItemsSource) ---
     object IList.this[int index] { get => _items[index]; set { _items[index] = (T)value; Raise(); } }
     bool IList.IsFixedSize => false;
     bool ICollection.IsSynchronized => false;

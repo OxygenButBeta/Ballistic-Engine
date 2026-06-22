@@ -1,10 +1,5 @@
-using System;
-
 namespace BallisticEngine.UI;
 
-// A checkbox/toggle (P5.3) — UITK's Toggle. A clickable box with a checkmark child + optional label.
-// Click (or Space/Enter when focused) flips Value, firing ValueChanged and toggling the "checked" class
-// (so USS can style the on state, and :checked selectors match).
 public class Toggle : VisualElement, INotifyValueChanged<bool>
 {
     readonly VisualElement _box;

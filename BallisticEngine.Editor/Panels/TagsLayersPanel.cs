@@ -1,21 +1,10 @@
-using System.Numerics;
-using BallisticEngine.AssetPipeline;
-
 namespace BallisticEngine.Editor;
 
-// Project Tags & Layers editor (Window > Tags & Layers). Edits the engine's TagManager / LayerManager
-// directly and persists to ProjectSettings/TagsAndLayers.json via LayerSettings.Save on every change
-// (project-level config, not scene state — no scene undo, same as other project settings).
-// EF8: the Layer Collision Matrix was SPLIT out into LayerCollisionMatrixPanel (Window > Layer Collision
-// Matrix); this panel now owns only tag + layer definitions. Both read the same LayerManager store.
-//
-// Phase-2 EditorWindow: the body draws through IEditorGui (no raw ImGui). WindowShell owns Begin/End and
-// the title###DockKey identity. The few custom widgets (GhostButtonSmall) stay EditorIcons helper calls.
 internal sealed class TagsLayersPanel : EditorWindow {
     string newTag = "";
 
     public TagsLayersPanel() {
-        DockKey = "win.tagslayers";   // stable ImGui ###id for this floating window (matches the old hash target loosely)
+        DockKey = "win.tagslayers";
         Title = "Tags & Layers";
         Icon = EditorIcons.Settings;
         NoCollapse = true;
@@ -37,7 +26,6 @@ internal sealed class TagsLayersPanel : EditorWindow {
         if (!gui.CollapsingHeader("Tags", defaultOpen: true))
             return;
 
-        // Existing tags, each with a remove button. "Untagged" is the reserved default — not removable.
         foreach (string tag in TagManager.Tags.ToArray()) {
             gui.PushId(tag);
             bool reserved = tag == TagManager.Untagged;
@@ -70,8 +58,6 @@ internal sealed class TagsLayersPanel : EditorWindow {
         if (!gui.CollapsingHeader("Layers", defaultOpen: true))
             return;
 
-        // All 32 slots. 0..7 are conventionally builtin (Default etc.) — still editable, Unity lets you
-        // rename them too. An empty name = an undefined/unused layer.
         for (var i = 0; i < LayerManager.LayerCount; i++) {
             gui.PushId(i);
             gui.AlignTextToFramePadding();

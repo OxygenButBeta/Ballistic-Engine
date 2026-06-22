@@ -2,12 +2,8 @@ using System.Text.Json;
 
 namespace BallisticEngine.AssetPipeline;
 
-// A parsed, engine-agnostic view of the JSON sidecar the Blender export script writes (see
-// BlendExportScript). Matrices are world transforms, row-major 16 floats, in Blender's native
-// Z-up space — the Engine-layer converter applies the Z-up -> Y-up rotation. Mirrors the shape of
-// FalcorSceneData so the two scene-producing importers stay parallel.
 public sealed class BlendSceneData {
-    public bool HasMesh { get; set; }                              // a sibling .glb was written
+    public bool HasMesh { get; set; }
     public List<BlendMesh> Meshes { get; } = new();
     public List<BlendCamera> Cameras { get; } = new();
     public List<BlendLight> Lights { get; } = new();
@@ -15,13 +11,13 @@ public sealed class BlendSceneData {
 
 public sealed class BlendMesh {
     public string Name = "Mesh";
-    public float[] Matrix = BlendSceneParser.Identity4();          // world, row-major, Z-up
+    public float[] Matrix = BlendSceneParser.Identity4();
 }
 
 public sealed class BlendCamera {
     public string Name = "Camera";
     public float[] Matrix = BlendSceneParser.Identity4();
-    public float FovY = 0.69f;                                     // radians (~39.6 deg)
+    public float FovY = 0.69f;
     public float Near = 0.1f;
     public float Far = 1000f;
     public bool IsActive = true;
@@ -30,16 +26,15 @@ public sealed class BlendCamera {
 public sealed class BlendLight {
     public string Name = "Light";
     public float[] Matrix = BlendSceneParser.Identity4();
-    public string LightType = "POINT";                             // SUN / POINT / SPOT / AREA
-    public float[] Color = [1f, 1f, 1f];                           // linear RGB
-    public float Energy = 1000f;                                   // W (point/spot) or W/m^2 (sun)
-    public float Range;                                            // 0 = unbounded / use default
-    public float SpotSize = 1.2f;                                  // full cone, radians (spot only)
-    public float SpotBlend = 0.15f;                                // inner/outer falloff (spot only)
+    public string LightType = "POINT";
+    public float[] Color = [1f, 1f, 1f];
+    public float Energy = 1000f;
+    public float Range;
+    public float SpotSize = 1.2f;
+    public float SpotBlend = 0.15f;
 }
 
 public static class BlendSceneParser {
-    // Identity exposed for the DTO defaults above (kept here so the array literal lives in one place).
     public static float[] Identity4() => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 
     public static BlendSceneData Parse(string json) {

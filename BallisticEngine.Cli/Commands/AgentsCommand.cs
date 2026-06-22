@@ -1,12 +1,8 @@
 using System.Text;
 using BallisticEngine.AssetPipeline;
-using BallisticEngine.Serialization;
 
 namespace BallisticEngine.Cli.Commands;
 
-// `bal agents <project>` — generates the project's AGENTS.md: the toolchain manual an AI agent
-// reads first. Project facts (scenes, game components, asset inventory) come from live reflection
-// and the .meta sidecars, so the doc can never go stale — regenerate after adding scripts/scenes.
 internal sealed class AgentsCommand : ICommand {
     public string Name => "agents";
     public string Summary => "Generate the project's AGENTS.md (toolchain + project map).";
@@ -36,7 +32,6 @@ internal sealed class AgentsCommand : ICommand {
         sb.AppendLine("This is a **Ballistic Engine** project (custom C#/.NET 9 engine, Unity-like idioms; NOT Unity).");
         sb.AppendLine();
 
-        // ---- toolchain ----------------------------------------------------------
         sb.AppendLine("## Toolchain (everything works headless)");
         sb.AppendLine();
         sb.AppendLine("`bal` CLI (engine repo: `dotnet build BallisticEngine.slnx`, exe at `BallisticEngine.Cli/bin/Debug/net9.0/bal.exe`):");
@@ -77,7 +72,6 @@ internal sealed class AgentsCommand : ICommand {
         sb.AppendLine($"Structured logs: `Library/Logs/engine.jsonl` (one JSON object per line, truncated per session).");
         sb.AppendLine();
 
-        // ---- project map ----------------------------------------------------------
         sb.AppendLine("## This project");
         sb.AppendLine();
         string? startup = project.Manifest?.StartupScene?.Replace('\\', '/');

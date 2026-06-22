@@ -1,14 +1,9 @@
 
 namespace BallisticEngine;
 
-// One overridable value inside a VolumeComponent (Unity's VolumeParameter). A parameter only
-// influences the blended stack while Overridden is true; Interp defines how the stack's current
-// value moves toward this volume's value under a 0..1 blend factor (camera inside a local box,
-// volume weight, ...). Non-interpolatable types (bool, enums) snap to the target for any t > 0.
 public abstract class VolumeParameter {
     public bool Overridden { get; set; }
 
-    // `this` is the stack's working value; `to` is the overriding volume's parameter.
     internal abstract void Interp(VolumeParameter to, float t);
 
     internal abstract void CopyValueFrom(VolumeParameter source);
@@ -44,7 +39,6 @@ public class FloatParameter(float value, bool overridden = false) : VolumeParame
         value += (((VolumeParameter<float>)to).Value - value) * t;
 }
 
-// Float clamped to [Min, Max]; the editor shows it as a slider over that range.
 public class ClampedFloatParameter : FloatParameter {
     public float Min { get; }
     public float Max { get; }
@@ -62,14 +56,11 @@ public class ClampedFloatParameter : FloatParameter {
     }
 }
 
-// Non-generic view of EnumParameter<T> so the editor (dropdown) and the .volume serializer
-// (name string) can handle any enum without knowing T.
 public interface IEnumParameter {
     string[] Names { get; }
     int Index { get; set; }
 }
 
-// Enum choice; snaps to the target under blending like every non-numeric parameter.
 public class EnumParameter<T>(T value, bool overridden = false) : VolumeParameter<T>(value, overridden), IEnumParameter
     where T : struct, Enum
 {
@@ -113,7 +104,6 @@ public class Vector3Parameter(Vector3 value, bool overridden = false) : VolumePa
         value = Vector3.Lerp(value, ((VolumeParameter<Vector3>)to).Value, t);
 }
 
-// Vector3 drawn as a color picker in the editor (Hdr allows components > 1).
 public class ColorParameter(Vector3 value, bool hdr = false, bool overridden = false)
     : Vector3Parameter(value, overridden)
 {

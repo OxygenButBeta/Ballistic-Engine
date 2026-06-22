@@ -3,13 +3,6 @@ using BallisticEngine;
 
 public static class GraphicAPI
 {
-    // identityExtra distinguishes shaders that share the same vertex/fragment GLSL but DIFFER in their
-    // declared properties or custom surface body (a custom .shader reuses the Standard Vert/Frag.glsl but
-    // adds a `surface:`/`properties:` block). Without it, SharedResources would hand the custom shader and
-    // the plain Standard shader the SAME cached instance — and the loader's SetProperties/SurfaceSource on
-    // one would leak onto the other (every Standard material would inherit the custom surface). Pass the
-    // .shader asset path for such shaders; pass null for the plain Standard shader so its cache key (and
-    // the single shared instance every Standard material uses) is unchanged → byte-identical.
     public static StandardShader CreateStandardShader(string vertexCode, string fragmentCode,
         string identityExtra = null)
     {
@@ -19,8 +12,6 @@ public static class GraphicAPI
         if (SharedResources<Shader>.TryGetResource(identity, out Shader cachedShader))
             return cachedShader as StandardShader;
 
-        // The active backend builds the concrete shader (GL -> GLSL program, DX12 -> HLSL) — no
-        // hardcoded GL type here, so GraphicAPI is backend-agnostic.
         return RenderAsset.Current.CreateStandardShader(vertexCode, fragmentCode, identityExtra);
     }
     public static HDRenderer Renderer => RenderAsset.Current.Renderer;

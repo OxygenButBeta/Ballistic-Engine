@@ -2,23 +2,8 @@ using System.Text;
 
 namespace BallisticEngine.AssetPipeline;
 
-// A mountable content archive (.pak): one file holding many logical entries (artifacts, scenes,
-// materials, ...). The build packs a project's shipped content into content.pak; the player mounts
-// it and reads entries by logical path WITHOUT the loose files existing on disk. Designed for the
-// future: a patch / DLC / streamed level is just ANOTHER .pak mounted on top (last mount wins per
-// path — see ContentMount), so content updates never touch the exe.
-//
-// Format (little-endian):
-//   "BPAK" (4 bytes) | int version | int entryCount
-//   entryCount x:  ushort pathByteLen | path (UTF-8) | long offset | long length
-//   blob region:   concatenated entry bytes (offset/length point in here, from blob region start)
-//
-// Logical paths use forward slashes and are project-relative-ish, mirroring how the engine refers to
-// content: "Library/Artifacts/<guid>.bmesh", "Assets/Levels/Main.scene", "Library/ArtifactDB.json".
-// The index is read fully into memory on mount (a few hundred KB even for thousands of entries); blob
-// bytes are read lazily per request so a huge pack doesn't load into RAM up front (streaming-friendly).
 public sealed class ContentPack : IDisposable {
-    const uint Magic = 0x4B415042;   // "BPAK"
+    const uint Magic = 0x4B415042;
     const int Version = 1;
 
     public sealed record Entry(long Offset, long Length);
@@ -38,7 +23,6 @@ public sealed class ContentPack : IDisposable {
         this.blobStart = blobStart;
     }
 
-    // Opens a pack for reading: parses the index, keeps the stream open for lazy blob reads.
     public static ContentPack Open(string path) {
         var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         var reader = new BinaryReader(fs, Encoding.UTF8, leaveOpen: true);
@@ -66,8 +50,6 @@ public sealed class ContentPack : IDisposable {
 
     public bool Contains(string logicalPath) => entries.ContainsKey(Normalize(logicalPath));
 
-    // Reads an entry's bytes. Thread-safe (seeks under a lock — the stream is shared). Returns null
-    // if the path isn't in this pack.
     public byte[] Read(string logicalPath) {
         if (!entries.TryGetValue(Normalize(logicalPath), out Entry entry))
             return null;
@@ -89,12 +71,7 @@ public sealed class ContentPack : IDisposable {
 
     static string Normalize(string path) => path.Replace('\\', '/');
 
-    // ---- writing (build time) ----------------------------------------------
-
-    // Packs (logicalPath -> source absolute file) into one .pak. Streams each source file straight
-    // into the blob region so packing a multi-GB project never holds it all in memory.
     public static void Write(string packPath, IEnumerable<(string LogicalPath, string SourceFile)> items) {
-        // Materialize so we can write the index first (needs offsets) then the blobs.
         var list = items
             .Where(it => File.Exists(it.SourceFile))
             .Select(it => (Logical: Normalize(it.LogicalPath), it.SourceFile,
@@ -109,7 +86,6 @@ public sealed class ContentPack : IDisposable {
         writer.Write(Version);
         writer.Write(list.Count);
 
-        // Index: offsets are relative to the blob region start (which begins right after the index).
         long offset = 0;
         foreach (var it in list) {
             var pathBytes = Encoding.UTF8.GetBytes(it.Logical);
@@ -120,7 +96,6 @@ public sealed class ContentPack : IDisposable {
             offset += it.Length;
         }
 
-        // Blobs.
         foreach (var it in list) {
             using var src = new FileStream(it.SourceFile, FileMode.Open, FileAccess.Read, FileShare.Read);
             src.CopyTo(fs);

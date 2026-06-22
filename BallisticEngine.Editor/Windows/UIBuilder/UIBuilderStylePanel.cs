@@ -1,28 +1,17 @@
-using System;
-using System.Numerics;
 using BallisticEngine.UI;
 
 namespace BallisticEngine.Editor;
 
-// The StyleSheet (USS) editor pane of the UI Builder — the class-based-styling half Unity's UI Builder has.
-// Lists the document's rules (selectors), lets you create/rename/delete them, and edits the SELECTED rule's
-// body with the SAME inspector widgets used for elements (against the rule's carrier element). Editing a
-// rule re-resolves the tree (doc.RuleEdited) so every canvas element carrying that selector updates live.
-//
-// Pseudo-class rules are authored by naming a selector `.foo:hover` — the engine cascade already toggles
-// the hover/active/focus classes, and the canvas preview dropdown sets them, so a :hover rule previews in
-// place. This makes USS classes first-class (not the decorative side-list they were before).
 internal sealed class UIBuilderStylePanel
 {
     int _selectedRule = -1;
     string _newSelector = "";
-    readonly UIBuilderInspector _ruleInspector = new();   // reuse the element inspector on the carrier
+    readonly UIBuilderInspector _ruleInspector = new();
 
     public void Draw(IEditorGui gui, UIBuilderDocument doc)
     {
         gui.PushFont(EditorFont.Bold); gui.Text("StyleSheet (USS)"); gui.PopFont();
 
-        // New-selector field.
         gui.SetNextItemWidth(gui.ContentRegionAvail.X * 0.55f);
         bool enter = gui.InputTextEnter("##newsel", ref _newSelector, 96);
         gui.SameLine();
@@ -35,7 +24,6 @@ internal sealed class UIBuilderStylePanel
             _newSelector = "";
         }
 
-        // Rule list.
         gui.BeginChild("##rulelist", new Vector2(0, 110 * gui.Scale), border: true);
         for (int i = 0; i < doc.Rules.Count; i++)
         {
@@ -49,7 +37,6 @@ internal sealed class UIBuilderStylePanel
         }
         gui.EndChild();
 
-        // Selected rule editor.
         if (_selectedRule >= 0 && _selectedRule < doc.Rules.Count)
         {
             var rule = doc.Rules[_selectedRule];
@@ -60,8 +47,6 @@ internal sealed class UIBuilderStylePanel
                 doc.RenameRule(_selectedRule, selName.Trim());
 
             gui.TextDisabled("Rule body");
-            // Edit the carrier through a lightweight selection shim: temporarily point a scratch document
-            // view at the carrier. Simpler: directly draw a compact style editor on the carrier here.
             DrawRuleBody(gui, doc, _selectedRule, rule.Carrier);
 
             if (gui.Button("Apply to selection", new Vector2(-1, 0)) && doc.Selection != null)
@@ -76,8 +61,6 @@ internal sealed class UIBuilderStylePanel
         }
     }
 
-    // A compact subset editor for a rule's carrier (the common USS properties). Reuses the same widget
-    // helpers via a minimal inline implementation; on any change re-derive the rule body + re-resolve.
     void DrawRuleBody(IEditorGui gui, UIBuilderDocument doc, int ruleIndex, VisualElement carrier)
     {
         var s = carrier.Style;
@@ -93,8 +76,6 @@ internal sealed class UIBuilderStylePanel
         float op = s.Opacity; if (Row(gui, () => gui.SliderFloat("Opacity", ref op, 0, 1, "%.2f"))) { s.Opacity = op; changed = true; }
         float pad = NzPad(s); if (Row(gui, () => gui.DragFloat("Padding", ref pad, 0.5f, 0, 999))) { s.Padding = pad; changed = true; }
 
-        // Push one undo step when a NEW edit gesture begins on any rule widget (activation), so Ctrl+Z
-        // reverts the whole drag rather than each delta; coalesced via the inspector pattern.
         if (gui.IsAnyItemActive() && !_ruleGesture) { doc.PushUndo(); _ruleGesture = true; }
         if (!gui.IsAnyItemActive()) _ruleGesture = false;
         if (changed) doc.RuleEdited(ruleIndex);

@@ -1,28 +1,9 @@
-using System.Numerics;
-using System.Threading.Tasks;
 using BallisticEngine.AssetPipeline;
 using BallisticEngine.AssetPipeline.Loaders;
 using BallisticEngine.AssetPipeline.Unity;
 
 namespace BallisticEngine.Editor;
 
-// "Import Unity Package" tool (Assets menu). Lets you pull a Unity asset into the project in one
-// action: pick a .unitypackage (or an already-unpacked Unity "Assets" folder), and it
-//   1. extracts the package into Assets/<subfolder> (rebuilding the original path tree),
-//   2. refreshes so the engine imports the meshes/textures (filename-convention material auto-bind
-//      from ModelImporter v7 textures the otherwise-empty Megascans/PBR materials),
-//   3. converts every Unity .unity/.prefab inside into a Ballistic .scene (transform hierarchy +
-//      StaticMeshRenderers, LH->RH coordinate fix), resolving Unity's GUID refs to project assets,
-//   4. refreshes again so the new .scene assets register and you can open them directly.
-//
-// This is the answer to "FBX-only packs have no layout": grab the Unity version of an asset and its
-// dressed scene/prefab comes across as an openable Ballistic scene. The conversion runs on the
-// background import thread; progress shows in the same busy overlay as a normal refresh.
-// Phase-6/8 EditorWindow: the WINDOW is an EditorWindow instance drawn through WindowShell + IEditorGui
-// (zero raw ImGui in the body). The SERVICE half stays static — ImportPackage (remote pipe), the
-// BusyOverlay status fields, and the worker-touched state are shared across threads and not tied to the
-// window instance. A static facade (Open / IsOpen) targets the single shared Instance. The helper classes
-// below (PrefabMeshResolver / UnityMaterialGenerator) and the GuidToProjectRef they call stay as-is.
 internal sealed class UnityImportWindow : EditorWindow {
     public static readonly UnityImportWindow Instance = new();
 
@@ -35,20 +16,16 @@ internal sealed class UnityImportWindow : EditorWindow {
     }
 
     static string lastLog = "";
-    static string sourcePath = "";            // the picked .unitypackage or Unity Assets folder
-    static string subfolder = "Imported";     // Assets/<subfolder> destination for a package
+    static string sourcePath = "";
+    static string subfolder = "Imported";
     static bool running;
 
-    // Progress published from the worker thread, read by the window + BusyOverlay (volatile, no lock).
     static volatile string progressStatus = "";
     static volatile float progressFraction;
 
     public static bool IsOpen => Instance.Open;
-    // Named Show, not Open (EditorWindow.Open is the instance show-state field).
     public static void Show() => Instance.Open = true;
 
-    // Headless/remote entrypoint (the editor command pipe): kick off an import without the GUI dialog.
-    // Returns immediately; progress shows in the BusyOverlay and the result lands in lastLog.
     public static void ImportPackage(string packageOrFolderPath, string destSubfolder = "Imported") {
         if (running)
             return;
@@ -60,8 +37,6 @@ internal sealed class UnityImportWindow : EditorWindow {
 
     public static string LastResult => lastLog;
 
-    // Surfaced so the editor's BusyOverlay can show our long extract/convert phase (the asset Refresh
-    // it already covers). True only while our own worker is busy, before it hands off to the refresh.
     public static bool IsBusy => running;
     public static string BusyStatus => progressStatus;
     public static float BusyFraction => progressFraction;
@@ -87,7 +62,6 @@ internal sealed class UnityImportWindow : EditorWindow {
             if (picked is not null) sourcePath = picked;
         }
         gui.SameLine();
-        // (folder button on its own line below to keep the row from overflowing)
         if (gui.Button("Folder...", new Vector2(-1, 0))) {
             var picked = NativeDialogs.PickFolder("Select Unpacked Unity Assets Folder");
             if (picked is not null) sourcePath = picked;
@@ -131,12 +105,6 @@ internal sealed class UnityImportWindow : EditorWindow {
         var src = sourcePath;
         var sub = Sanitize(subfolder);
 
-        // EVERYTHING heavy (extract a multi-thousand-file package + parse/convert hundreds of Unity
-        // scenes) runs on a worker so the editor doesn't freeze. The BusyOverlay shows progress via
-        // the static status fields below; the only main-thread step is the asset Refresh, requested at
-        // the end through AsyncAssetImport (itself a worker). Two phases:
-        //   1. extract + convert -> writes files (worker)
-        //   2. AsyncAssetImport.Request -> imports meshes/textures + registers the .scenes (worker)
         SetProgress("Extracting Unity package...", 0f);
         Debugging.Log($"Unity import: starting '{Path.GetFileName(src)}' -> Assets/{sub}");
         Task.Run(() => {
@@ -167,7 +135,6 @@ internal sealed class UnityImportWindow : EditorWindow {
                 int converted = ConvertAll(scenes, prefabs, guidToFile, project);
                 summary += $"  Converted {converted} scene(s)/prefab(s).";
 
-                // Hand back to the refresh worker to import meshes/textures and register the .scenes.
                 SetProgress("Importing meshes & registering scenes...", 0.85f);
                 AsyncAssetImport.Request("Importing Unity assets...", onFinished: () =>
                     Finish(summary + " Open the converted scenes from the Asset Browser."));
@@ -179,9 +146,6 @@ internal sealed class UnityImportWindow : EditorWindow {
         });
     }
 
-    // Converts every scene (.unity) and prefab (.prefab). Prefabs pass isPrefab:true so they don't get
-    // a fallback camera/light. A scene's nested-prefab instances resolve their mesh via the source
-    // prefab guid -> that prefab's LOD0 mesh (PrefabMeshResolver, cached).
     static int ConvertAll(List<string> scenes, List<string> prefabs,
         Dictionary<string, string> guidToFile, BallisticProject project) {
         var materialGen = new UnityMaterialGenerator(guidToFile, project);
@@ -189,8 +153,6 @@ internal sealed class UnityImportWindow : EditorWindow {
 
         var resolvers = new UnitySceneConverter.Resolvers {
             MeshGuidToAssetRef = guid => GuidToProjectRef(guid, guidToFile, project),
-            // Unity .mat guid -> a freshly generated engine .mat (real texture bindings parsed from
-            // the Unity material — handles any texture naming, unlike filename convention).
             MaterialGuidToAssetRef = guid => materialGen.Resolve(guid),
             PrefabGuidToMeshRef = guid => prefabMesh.Resolve(guid),
             PrefabGuidToMaterialRef = guid => prefabMesh.ResolveMaterial(guid),
@@ -223,7 +185,6 @@ internal sealed class UnityImportWindow : EditorWindow {
         return count;
     }
 
-    // Unity guid -> project-relative asset ref ("Assets/..."), via the on-disk file the meta names.
     internal static string GuidToProjectRef(string guid, Dictionary<string, string> guidToFile, BallisticProject project) {
         if (guid is null || !guidToFile.TryGetValue(guid, out var absolute))
             return null;
@@ -250,10 +211,6 @@ internal sealed class UnityImportWindow : EditorWindow {
     }
 }
 
-// Resolves a Unity nested-prefab's source-prefab GUID to the engine MESH + MATERIAL refs to render
-// for it. A dressed Quixel scene places ~1000 prefab instances; each references a .prefab whose LOD0
-// MeshFilter names the FBX mesh and whose LOD0 MeshRenderer names the Unity .mat. We open the .prefab
-// once per guid (cached), pull both, and map them to engine refs (the .mat via UnityMaterialGenerator).
 internal sealed class PrefabMeshResolver(
     Dictionary<string, string> guidToFile, BallisticProject project, UnityMaterialGenerator materials) {
     readonly Dictionary<string, string> meshCache = new(StringComparer.OrdinalIgnoreCase);
@@ -279,7 +236,6 @@ internal sealed class PrefabMeshResolver(
     string ResolveMaterialUncached(string prefabGuid) {
         UnityYamlScene prefab = LoadPrefab(prefabGuid);
         if (prefab is null) return null;
-        // The LOD0 renderer's first material; fall back to any renderer's first external material.
         var goName = ToGameObjectName(prefab);
         UnityRef best = default;
         foreach (UnityMeshRenderer mr in prefab.MeshRenderers.Values) {
@@ -325,11 +281,6 @@ internal sealed class PrefabMeshResolver(
     }
 }
 
-// Generates an engine .mat from a Unity .mat (parsed via UnityMaterialParser), mapping the Unity
-// texture slots (any naming — Albedo/BaseColorMap/MainTex, Normal/BumpMap, MaskMap/_DR packed ORM,
-// OcclusionMap) to engine slots and resolving each texture guid to a project ref. Writes
-// "<UnityMat>.bal.mat" beside the source once per guid (cached) and returns its ref. This is the
-// robust path for materials that filename-convention binding misses.
 internal sealed class UnityMaterialGenerator(Dictionary<string, string> guidToFile, BallisticProject project) {
     readonly Dictionary<string, string> cache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -355,19 +306,17 @@ internal sealed class UnityMaterialGenerator(Dictionary<string, string> guidToFi
         BindTexture(def, "AO", unity.OcclusionGuid);
         if (unity.MaskGuid is not null) {
             BindTexture(def, "Metallic", unity.MaskGuid);
-            if (unity.MaskIsPacked) def.PackedOrm = true;   // ORD/ORM packed map, not plain metallic
+            if (unity.MaskIsPacked) def.PackedOrm = true;
         }
 
         if (unity.BaseColor is { Length: >= 3 }) def.BaseColor = unity.BaseColor;
         if (unity.Metallic is { } m) def.Metallic = m;
-        if (unity.Smoothness is { } s) def.Roughness = Math.Clamp(1f - s, 0f, 1f); // Unity smoothness -> roughness
-        if (unity.AlphaCutout) def.Cutout = true; // foliage cards: alpha-clip + double-sided
+        if (unity.Smoothness is { } s) def.Roughness = Math.Clamp(1f - s, 0f, 1f);
+        if (unity.AlphaCutout) def.Cutout = true;
 
-        // Nothing resolved -> let the model's own generated materials handle it (return null).
         if (def.Textures.Count == 0 && def.BaseColor is null)
             return null;
 
-        // Write "<name>.bal.mat" beside the Unity .mat so it imports as a sibling engine material.
         var outPath = Path.ChangeExtension(matPath, null) + ".bal.mat";
         try {
             PipelineJson.Write(outPath, def);
@@ -389,14 +338,10 @@ internal sealed class UnityMaterialGenerator(Dictionary<string, string> guidToFi
         var refPath = UnityImportWindow.GuidToProjectRef(textureGuid, guidToFile, project);
         if (refPath is null) return;
 
-        // CRITICAL: a normal/packed map imported as the default Diffuse type binds to the wrong sampler
-        // and gets sRGB-decoded (normals/ORM must be linear). Set the texture's .meta textureType to
-        // match the slot so the importer treats it correctly — same heal ModelImporter does.
         EnsureTextureType(absolute, slot);
         def.Textures[slot] = refPath;
     }
 
-    // Sets/corrects a texture .meta's textureType to the engine slot name. Creates the meta if absent.
     static void EnsureTextureType(string textureAbsolute, string slot) {
         var metaPath = MetaFile.PathFor(textureAbsolute);
         try {

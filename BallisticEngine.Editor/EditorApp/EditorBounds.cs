@@ -1,11 +1,6 @@
 
 namespace BallisticEngine.Editor;
 
-// Computes the world-space bounds of an entity's renderable geometry for the editor (F-to-frame,
-// and anything else that needs to know how big a selection is on screen). Walks the entity and its
-// transform descendants, unioning each StaticMeshRenderer's local AABB transformed into world space.
-// Returns a bounding sphere (center + radius) since that's all the camera framing needs and it's
-// rotation-invariant. False when the selection has no mesh geometry at all (empty/light/camera).
 internal static class EditorBounds {
     public static bool TryGetWorldBounds(Entity root, out Vector3 center, out float radius) {
         var min = new Vector3(float.MaxValue);
@@ -25,8 +20,6 @@ internal static class EditorBounds {
         return true;
     }
 
-    // Recurse the transform tree; the editor's hierarchy is parent-linked, so children are found by
-    // scanning the scene for transforms whose Parent is this one (same pattern as EntityClone).
     static void Accumulate(Transform node, ref Vector3 min, ref Vector3 max, ref bool any) {
         Entity entity = node.Entity;
 
@@ -38,8 +31,6 @@ internal static class EditorBounds {
                 Accumulate(other.transform, ref min, ref max, ref any);
     }
 
-    // Transform the mesh's local AABB by `world` and union the 8 transformed corners (an oriented box
-    // re-bounded as an axis-aligned box — slightly conservative under rotation, which is fine for framing).
     static void AccumulateMesh(Mesh mesh, Matrix4 world, ref Vector3 min, ref Vector3 max, ref bool any) {
         mesh.GetLocalBounds(out Vector3 lo, out Vector3 hi);
 

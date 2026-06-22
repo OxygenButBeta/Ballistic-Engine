@@ -3,7 +3,6 @@ using System.Text.Json.Serialization;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Single JSON dialect for every pipeline file (.meta, project.json, ArtifactDB.json, .mat, .shader, .cubemap).
 public static class PipelineJson {
     public static readonly JsonSerializerOptions Options = new() {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,

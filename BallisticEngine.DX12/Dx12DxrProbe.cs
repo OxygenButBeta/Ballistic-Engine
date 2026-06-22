@@ -1,4 +1,3 @@
-using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
@@ -8,18 +7,11 @@ using Vortice.Mathematics;
 
 namespace BallisticEngine.DX12;
 
-// Self-test for the DXR ray-tracing foundation (run with BALLISTIC_DX12_DXR_TEST=1): builds a tiny
-// single-triangle BLAS + a one-instance TLAS, an RT pipeline state object (raygen/miss/closesthit DXIL
-// library), a shader binding table, and DispatchRays a ray per pixel of a 32x32 UAV — hit = RED, miss =
-// BLUE. Reads the UAV back and checks BOTH colours appear, proving the whole DXR pipeline (acceleration
-// structures + RT PSO + SBT + DispatchRays + the TLAS SRV binding) works before any RT effect is wired.
-// Mirrors Dx12ComputeProbe / Dx12BindlessProbe. Vortice 3.8.3 API (source-verified).
 public static class Dx12DxrProbe {
     const int W = 32, H = 32;
 
     public static unsafe bool SelfTest(Dx12Device dev) {
         try {
-            // DXR support + the Device5 / CommandList4 interfaces that carry the RT methods.
             var opt5 = dev.Device.CheckFeatureSupport<FeatureDataD3D12Options5>(Vortice.Direct3D12.Feature.Options5);
             if (opt5.RaytracingTier < RaytracingTier.Tier1_0) {
                 Console.WriteLine($"[DxrTest] DXR not supported (tier {opt5.RaytracingTier})"); return false;
@@ -31,13 +23,11 @@ public static class Dx12DxrProbe {
                 dev.Device.CreateCommittedResource(heap, HeapFlags.None,
                     ResourceDescription.Buffer(size, flags), st);
 
-            // --- Triangle vertex buffer (upload heap; the BLAS build reads it) ---
             float[] verts = { -0.6f, -0.6f, 1.0f,   0.6f, -0.6f, 1.0f,   0.0f, 0.7f, 1.0f };
             ID3D12Resource vb = Buf((ulong)(verts.Length * 4), ResourceFlags.None,
                 ResourceStates.GenericRead, HeapProperties.UploadHeapProperties);
             { byte* p = vb.Map<byte>(0); fixed (float* s = verts) Unsafe.CopyBlock(p, s, (uint)(verts.Length * 4)); vb.Unmap(0); }
 
-            // --- BLAS ---
             var geom = new RaytracingGeometryDescription {
                 Type = RaytracingGeometryType.Triangles,
                 Flags = RaytracingGeometryFlags.Opaque,
@@ -58,7 +48,6 @@ public static class Dx12DxrProbe {
             ID3D12Resource blas = Buf(blasPre.ResultDataMaxSizeInBytes, ResourceFlags.AllowUnorderedAccess,
                 ResourceStates.RaytracingAccelerationStructure, HeapProperties.DefaultHeapProperties);
 
-            // --- TLAS instance (identity transform, references the BLAS) ---
             var inst = new RaytracingInstanceDescription {
                 Transform = new Matrix3x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0),
                 InstanceMask = 0xFF, AccelerationStructure = blas.GPUVirtualAddress,
@@ -91,7 +80,6 @@ public static class Dx12DxrProbe {
                 cl.ResourceBarrier(new ResourceBarrier(new ResourceUnorderedAccessViewBarrier(tlas)));
             });
 
-            // --- Output UAV texture (32x32 RGBA8) + a shader-visible heap (TLAS SRV @0, output UAV @1) ---
             var outDesc = ResourceDescription.Texture2D(Format.R8G8B8A8_UNorm, W, H, 1, 1);
             outDesc.Flags = ResourceFlags.AllowUnorderedAccess;
             ID3D12Resource outTex = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties,
@@ -107,14 +95,12 @@ public static class Dx12DxrProbe {
                 Format = Format.R8G8B8A8_UNorm, ViewDimension = UnorderedAccessViewDimension.Texture2D,
             }, heap.Cpu(1));
 
-            // --- Global root sig: one table (SRV t0 = TLAS, UAV u0 = output) ---
             var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, 0);
             var uavRange = new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 1, 0);
             using ID3D12RootSignature globalRS = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
                 new RootSignatureDescription1(RootSignatureFlags.None,
                     new[] { new RootParameter1(new RootDescriptorTable1(srvRange, uavRange), ShaderVisibility.All) })));
 
-            // --- RT PSO ---
             string hlsl = EmbeddedShaderSource.ReadHlsl("DxrProbe.hlsl");
             byte[] dxil = Dx12ShaderCompiler.Compile(DxcShaderStage.Library, hlsl, "", "DxrProbe.hlsl");
             var subs = new[] {
@@ -128,10 +114,9 @@ public static class Dx12DxrProbe {
             using ID3D12StateObject pso = device5.CreateStateObject(
                 new StateObjectDescription(StateObjectType.RaytracingPipeline, subs));
 
-            // --- Shader binding table (3 records, each in a 64-aligned slot; identifier-only, 32 bytes) ---
             using ID3D12StateObjectProperties props = pso.QueryInterface<ID3D12StateObjectProperties>();
-            uint idSize = D3D12.ShaderIdentifierSizeInBytes;   // 32
-            const int slot = 64;                               // table-start alignment
+            uint idSize = D3D12.ShaderIdentifierSizeInBytes;
+            const int slot = 64;
             ID3D12Resource sbt = Buf(slot * 3, ResourceFlags.None, ResourceStates.GenericRead, HeapProperties.UploadHeapProperties);
             {
                 byte* p = sbt.Map<byte>(0);
@@ -141,7 +126,6 @@ public static class Dx12DxrProbe {
                 sbt.Unmap(0);
             }
 
-            // --- DispatchRays ---
             dev.ExecuteSync(cl => {
                 cl.ResourceBarrierTransition(outTex, ResourceStates.Common, ResourceStates.UnorderedAccess);
                 cl.SetDescriptorHeaps(heap.Heap);
@@ -156,7 +140,6 @@ public static class Dx12DxrProbe {
                 });
             });
 
-            // --- Readback + verify both colours appear ---
             var fps = new PlacedSubresourceFootPrint[1]; var rc = new uint[1]; var rs = new ulong[1];
             dev.Device.GetCopyableFootprints(outTex.Description, 0, 1, 0, fps, rc, rs, out ulong total);
             int rowPitch = (int)fps[0].Footprint.RowPitch;

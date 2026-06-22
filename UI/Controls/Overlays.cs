@@ -1,13 +1,5 @@
-using System;
-using System.Collections.Generic;
-
 namespace BallisticEngine.UI;
 
-// Tooltip, ContextMenu, and Modal (P5.8) — all popup-style controls that live on the document's overlay
-// layer so they draw above content. Static helpers + small classes; designed to be one-call from game code.
-
-// A hover tooltip. Attach to any element: Tooltip.Attach(element, "text"). On hover-enter it shows a small
-// label near the pointer; on leave it hides. Uses the overlay layer.
 public static class Tooltip
 {
     public static void Attach(VisualElement target, string text)
@@ -34,8 +26,6 @@ public static class Tooltip
     }
 }
 
-// A right-click / explicit context menu: a vertical list of items at a position, dismissed on item click
-// or click-away. ContextMenu.Show(document, x, y, ("Copy", onCopy), ("Delete", onDelete)).
 public sealed class ContextMenu
 {
     readonly VisualElement _panel;
@@ -74,8 +64,6 @@ public sealed class ContextMenu
     public void Close() => _panel.RemoveFromHierarchy();
 }
 
-// A modal dialog: a full-screen dimmed scrim (blocks input to content) + a centered content panel.
-// Modal.Show(document, contentElement). Returns the Modal so the caller can Close() it.
 public sealed class Modal
 {
     readonly VisualElement _scrim;
@@ -89,7 +77,7 @@ public sealed class Modal
         _scrim.Style.BackgroundColor = Color.Rgba(0, 0, 0, 0.5f);
         _scrim.Style.JustifyContent = Justify.Center;
         _scrim.Style.AlignItems = Align.Center;
-        _scrim.PickingEnabled = true;          // swallow clicks to content behind
+        _scrim.PickingEnabled = true;
 
         var box = new Panel();
         box.AddToClassList("modal-box");

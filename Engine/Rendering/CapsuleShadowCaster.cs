@@ -1,15 +1,6 @@
 
 namespace BallisticEngine;
 
-// Cheap soft sun shadows from a character proxy capsule onto the world (the Unreal "capsule shadow" feature).
-// Each caster contributes ONE world-space capsule; the renderer gathers all active casters into a GPU buffer
-// and a compute pass (Dx12CapsuleShadowPass) analytically computes the soft sun occlusion per screen pixel —
-// no ray tracing. The result multiplies into the deferred sun term alongside the cascade / RT shadow mask.
-//
-// V1 = a SINGLE capsule per caster (Center + Height + Radius, oriented along the entity's local Y, Unity
-// CapsuleCollider parity). FOLLOW-UP: a multi-capsule form (a list of {start,end,radius} bones) for an
-// articulated skeleton — the GPU buffer + shader already loop over a flat capsule array, so multi-capsule
-// is just gathering more than one record per caster.
 [Component("Capsule Shadow Caster", "Rendering")]
 public class CapsuleShadowCaster : Behaviour {
     [Header("Capsule")]
@@ -24,8 +15,6 @@ public class CapsuleShadowCaster : Behaviour {
     [Tooltip("Local-space offset of the capsule centre from the entity origin.")]
     public Vector3 Center { get; set; } = Vector3.Zero;
 
-    // The capsule's two segment endpoints in WORLD space (the cylinder core; the caps add Radius beyond them).
-    // Oriented along the entity's local Y. Height clamps to at least 2*Radius (a sphere).
     public void GetWorldSegment(out Vector3 a, out Vector3 b, out float worldRadius) {
         Vector3 scale = transform.WorldMatrix.ExtractScale();
         worldRadius = Radius * MathF.Max(MathF.Abs(scale.X), MathF.Abs(scale.Z));

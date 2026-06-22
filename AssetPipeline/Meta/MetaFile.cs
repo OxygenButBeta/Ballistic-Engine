@@ -2,8 +2,6 @@ using System.Text.Json.Nodes;
 
 namespace BallisticEngine.AssetPipeline;
 
-// Sidecar file next to every asset under Assets\: "<file>.meta".
-// Holds the asset's stable GUID and its importer configuration.
 public sealed class MetaFile {
     public int Version { get; set; } = 1;
     public Guid Guid { get; set; }

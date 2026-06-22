@@ -2,19 +2,9 @@ using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
 
-// Click-to-select picking for the Scene view (Unity-style). Casts a ray from the cursor and returns
-// the entity whose mesh the ray hits nearest the camera. Picking is triangle-accurate: a broad-phase
-// ray/AABB test rejects most entities for free, then surviving entities run a ray/triangle sweep
-// (Moller-Trumbore) over their mesh — honoring SubMeshIndex so a split-by-nodes child is picked as
-// just its own part. Huge meshes stride their triangle loop to a budget so Bistro-scale geometry
-// doesn't stall the click; the broad phase keeps that rare.
 internal static class ScenePicker {
-    // Triangles tested per mesh before striding kicks in. A million-tri mesh still resolves in a
-    // bounded number of tests; the broad-phase AABB hit means we only pay this for meshes actually
-    // under the cursor.
     const int TriangleBudget = 200_000;
 
-    // Returns the nearest-hit entity for the cursor ray, or null if the ray misses all geometry.
     public static Entity Pick(Matrix4 vp, SysVec2 viewMin, SysVec2 viewSize, SysVec2 mouse) {
         GizmoMath.MouseRay(vp, viewMin, viewSize, mouse, out Vector3 ro, out Vector3 rd);
 
@@ -29,14 +19,11 @@ internal static class ScenePicker {
 
             Matrix4 world = entity.transform.WorldMatrix;
 
-            // Transform the ray into mesh-local space once (cheaper than transforming every triangle,
-            // and AABB/vertex data are already local). The inverse-world maps the world ray to local.
             if (!TryInvert(world, out Matrix4 invWorld))
                 continue;
             Vector3 localO = Vector3.Transform(ro, invWorld);
-            Vector3 localDir = Vector3.TransformNormal(rd, invWorld);   // not normalized: keeps t in world units
+            Vector3 localDir = Vector3.TransformNormal(rd, invWorld);
 
-            // Broad phase: skip the whole mesh if the ray misses its local AABB.
             mesh.GetLocalBounds(out Vector3 lo, out Vector3 hi);
             if (!RayHitsAabb(localO, localDir, lo, hi))
                 continue;
@@ -50,8 +37,6 @@ internal static class ScenePicker {
         return best;
     }
 
-    // Nearest ray/triangle hit within the mesh (or just SubMeshIndex's range if >= 0). `t` is the
-    // distance along `dir` (same units as the world ray, since dir wasn't renormalized after transform).
     static bool NearestTriangle(Mesh mesh, int subMeshIndex, Vector3 origin, Vector3 dir, out float bestT) {
         bestT = float.MaxValue;
         bool hit = false;
@@ -78,8 +63,6 @@ internal static class ScenePicker {
         return hit;
     }
 
-    // The index-buffer range to test: the whole buffer for a merged renderer (SubMeshIndex < 0), or
-    // just the one submesh's range for a split-by-nodes child.
     static (int start, int count) IndexRange(Mesh mesh, int subMeshIndex, int indexCount) {
         if (subMeshIndex >= 0 && subMeshIndex < mesh.SubMeshes.Length) {
             SubMeshData sub = mesh.SubMeshes[subMeshIndex];
@@ -88,8 +71,6 @@ internal static class ScenePicker {
         return (0, indexCount);
     }
 
-    // Moller-Trumbore ray/triangle intersection. Double-sided (picking shouldn't care which way a
-    // face points). Returns the forward (t > 0) hit distance along `dir`.
     static bool RayTriangle(Vector3 o, Vector3 d, Vector3 a, Vector3 b, Vector3 c, out float t) {
         t = 0f;
         Vector3 e1 = b - a;
@@ -114,7 +95,6 @@ internal static class ScenePicker {
         return t > 1e-5f;
     }
 
-    // Slab test: does the ray hit the axis-aligned box [lo, hi]? Used as a cheap broad-phase reject.
     static bool RayHitsAabb(Vector3 o, Vector3 d, Vector3 lo, Vector3 hi) {
         float tmin = 0f;
         float tmax = float.MaxValue;
@@ -125,7 +105,7 @@ internal static class ScenePicker {
             float max = hi[axis];
             if (MathF.Abs(dir) < 1e-9f) {
                 if (origin < min || origin > max)
-                    return false;   // parallel and outside the slab
+                    return false;
             }
             else {
                 float inv = 1f / dir;
