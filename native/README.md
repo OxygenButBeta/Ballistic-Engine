@@ -52,6 +52,24 @@ curl -sLO "$BASE/upscalers/include/ffx_upscale.h"
 curl -sLO "$BASE/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h"
 ```
 
+## NRD (NVIDIA Real-Time Denoiser) — `nrd/bin/NRD.dll`
+
+Aurora GI's temporal denoiser. Unlike DLSS/FSR/XeSS, NVIDIA does NOT ship a prebuilt DLL — build from
+source (needs CMake 3.22+ and MSVC; VS 2022 "Desktop development with C++" workload):
+
+```sh
+git clone --recurse-submodules https://github.com/NVIDIA-RTX/NRD.git
+cd NRD
+cmake -B build -S . -DNRD_EMBEDS_DXIL_SHADERS=ON -DNRD_EMBEDS_DXBC_SHADERS=ON
+cmake --build build --config Release
+cp _Bin/Release/NRD.dll <repo>/native/nrd/bin/
+```
+
+The DXIL shaders are embedded INTO `NRD.dll` (no separate shader files). `Dx12NrdDenoiser` P/Invokes the
+C-ABI core (`NrdApi.cs`); `Nrd/NrdApi.cs` + `Nrd/NrdSettings.cs` are byte-for-byte mirrors of the NRD v4.17
+headers. If `NRD.dll` is absent the integration self-disables and Aurora falls back to its own temporal
+accumulator (`AuroraTemporal.hlsl`).
+
 ## Deployment
 
 The renderer P/Invokes these by name; they must sit next to the exe at runtime (the build copies

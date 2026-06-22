@@ -47,6 +47,16 @@
       </None>
     </ItemGroup>
 
+    <!-- NVIDIA Real-Time Denoiser (NRD.dll). Built from source (NVIDIA-RTX/NRD) via CMake+MSVC, staged here.
+         Dx12NrdDenoiser P/Invokes its C-ABI core (NrdApi.cs). Condition'd so a clean checkout without the
+         gitignored native DLL still builds (NRD self-disables → Aurora's own temporal accumulator runs). -->
+    <ItemGroup Condition="Exists('..\native\nrd\bin\NRD.dll')">
+      <None Include="..\native\nrd\bin\NRD.dll">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <Link>%(Filename)%(Extension)</Link>
+      </None>
+    </ItemGroup>
+
     <!-- NVIDIA DLSS Super Resolution model snippet (nvngx_dlss.dll). The NGX CORE loader (nvngx.dll) is installed
          system-wide by the NVIDIA driver, NOT shipped here; Dx12DlssUpscaler P/Invokes nvngx.dll and the core
          loads this snippet from the exe dir. On a non-NVIDIA box (or no driver) nvngx.dll is absent → the first

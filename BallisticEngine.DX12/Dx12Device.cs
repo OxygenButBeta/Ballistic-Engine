@@ -135,6 +135,9 @@ public sealed class Dx12Device : IDisposable {
         Console.WriteLine(rt ? "[DX12] Hardware ray tracing: AVAILABLE (DXR Tier 1.0+)"
                              : "[DX12] Hardware ray tracing: NOT available — RayTraced GI/reflections/shadows will use screen-space fallbacks.");
 
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_NRD_SELFTEST") == "1")
+            NrdApi.SelfTest();
+
         bool ms = false;
         try {
             var opt7 = Device.CheckFeatureSupport<FeatureDataD3D12Options7>(Vortice.Direct3D12.Feature.Options7);
