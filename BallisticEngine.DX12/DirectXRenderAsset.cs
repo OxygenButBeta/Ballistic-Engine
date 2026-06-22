@@ -41,6 +41,16 @@ public sealed class DirectXRenderAsset : RenderAsset {
             Environment.Exit(pass ? 0 : 1);
         }
 
+        // FAZ -1: render-graph v2 (Dx12RgGraph) compile-pipeline self-test on the real device.
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_RG_SELFTEST") == "1") {
+            string report;
+            try { report = DX12.Dx12RgSelfTest.Run(device); }
+            catch (Exception ex) { report = "FAILED:\n" + ex; }
+            Console.Error.WriteLine("[DX12] Render-graph v2 (Dx12RgGraph) SELF-TEST:\n" + report);
+            string outPath = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RG_SELFTEST_OUT");
+            if (!string.IsNullOrEmpty(outPath)) System.IO.File.WriteAllText(outPath, report);
+        }
+
         if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_SCENEQUERY_TEST") == "1") {
             bool pass = DX12.Dx12SceneQueryProbe.SelfTest(device);
             Environment.Exit(pass ? 0 : 1);
