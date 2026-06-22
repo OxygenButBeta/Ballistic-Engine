@@ -11,7 +11,7 @@ public sealed class ModelImporter : IAssetImporter {
 
     public string Name => "ModelImporter";
 
-    public int Version => 10;
+    public int Version => 11;
     public string ArtifactExtension => ".bmesh";
 
     public bool GeneratesSourceAssets => true;
@@ -29,6 +29,8 @@ public sealed class ModelImporter : IAssetImporter {
         ["lodCount"] = 4,
         ["lodReduction"] = 0.5,
         ["lodMinTris"] = 64,
+        ["generateSdf"] = true,
+        ["sdfResolution"] = 64,
     };
 
     public void Import(AssetImportContext context) {
@@ -39,6 +41,7 @@ public sealed class ModelImporter : IAssetImporter {
 
         if (meshIndex >= 0) {
             MeshData single = AssimpMeshDecoder.Decode(context.SourceAbsolutePath, flipUVs, meshIndex);
+            single = GenerateSdf(context, single);
             MeshArtifact.Write(context.ArtifactAbsolutePath, in single);
             return;
         }
@@ -64,7 +67,49 @@ public sealed class ModelImporter : IAssetImporter {
             context.SourceAbsolutePath, flipUVs, splitByNodes, scaleFactor);
         MeshData data = generateMaterials ? GenerateMaterials(context, model) : model.Mesh;
         data = BuildLods(context, data);
+        data = GenerateSdf(context, data);
         MeshArtifact.Write(context.ArtifactAbsolutePath, in data);
+    }
+
+    /// <summary>
+    /// Generates the offline mesh SDF (Lumen FAZ 1) from the FINAL LOD0 geometry and attaches it.
+    /// Gated by the importer "generateSdf" setting (default true) AND the BALLISTIC_SDF env var
+    /// (set to "0" to disable globally). Skinned meshes are skipped — Lumen uses runtime mesh cards
+    /// for those, not a static SDF.
+    /// </summary>
+    static MeshData GenerateSdf(AssetImportContext context, in MeshData data) {
+        if (Environment.GetEnvironmentVariable("BALLISTIC_SDF") == "0")
+            return data;
+        bool enabled = context.Settings?["generateSdf"]?.GetValue<bool>() ?? true;
+        if (!enabled)
+            return data;
+        if (data.IsSkinned) {
+            Debugging.Log($"[SDF] '{context.AssetPath}': skinned mesh — SDF skipped (runtime cards).");
+            return data;
+        }
+        if (!data.IsValid || data.Indices.Length < 3)
+            return data;
+
+        int maxRes = context.Settings?["sdfResolution"]?.GetValue<int>() ?? 64;
+        maxRes = Math.Clamp(maxRes, 8, 256);
+
+        try {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            MeshSdf sdf = Sdf.MeshSdfBuilder.Generate(in data, maxRes);
+            sw.Stop();
+            if (sdf is null || !sdf.IsValid) {
+                Debugging.LogWarning($"[SDF] '{context.AssetPath}': generation produced no field (degenerate mesh).");
+                return data;
+            }
+            Debugging.Log(
+                $"[SDF] '{context.AssetPath}': {sdf.ResX}x{sdf.ResY}x{sdf.ResZ} grid, " +
+                $"{data.Indices.Length / 3} tris, {sw.ElapsedMilliseconds} ms");
+            return data.WithSdf(sdf);
+        }
+        catch (Exception exception) {
+            Debugging.LogWarning($"[SDF] '{context.AssetPath}': generation failed: {exception.Message}");
+            return data;
+        }
     }
 
     static MeshData BuildLods(AssetImportContext context, in MeshData data) {

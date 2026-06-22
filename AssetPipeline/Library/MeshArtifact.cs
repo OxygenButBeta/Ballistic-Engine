@@ -4,7 +4,7 @@ namespace BallisticEngine.AssetPipeline;
 
 public static class MeshArtifact {
     const uint Magic = 0x48534D42;
-    const uint FormatVersion = 7;
+    const uint FormatVersion = 8;
 
     public static void Write(string path, in MeshData data) {
         using FileStream stream = File.Create(path);
@@ -12,7 +12,10 @@ public static class MeshArtifact {
 
         bool hasLods = false;
         foreach (SubMeshData sm in data.SubMeshes) if (sm.Lods is { Length: > 1 }) { hasLods = true; break; }
-        uint writeVersion = hasLods ? 7u : 6u;
+        bool hasSdf = data.Sdf is { IsValid: true };
+        // v8 = v7 payload + trailing SDF block. We only stamp v8 when an SDF is actually present,
+        // so SDF-less meshes stay at the v6/v7 byte layout (existing readers + diffs unchanged).
+        uint writeVersion = hasSdf ? 8u : hasLods ? 7u : 6u;
 
         writer.Write(Magic);
         writer.Write(writeVersion);
@@ -69,7 +72,30 @@ public static class MeshArtifact {
                     foreach (LodRange lr in lods) { writer.Write(lr.FirstIndex); writer.Write(lr.IndexCount); }
             }
         }
+
+        if (writeVersion >= 8) {
+            MeshSdf sdf = data.Sdf;
+            if (sdf is { IsValid: true }) {
+                writer.Write((byte)1);
+                WriteVector3(writer, sdf.GridOrigin);
+                WriteVector3(writer, sdf.GridExtent);
+                writer.Write(sdf.ResX);
+                writer.Write(sdf.ResY);
+                writer.Write(sdf.ResZ);
+                writer.Write(MemoryMarshal.AsBytes<float>(sdf.Distances));
+            }
+            else {
+                writer.Write((byte)0);
+            }
+        }
     }
+
+    static void WriteVector3(BinaryWriter writer, Vector3 v) {
+        writer.Write(v.X); writer.Write(v.Y); writer.Write(v.Z);
+    }
+
+    static Vector3 ReadVector3(BinaryReader reader) =>
+        new(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
 
     static void WriteMatrix(BinaryWriter writer, Matrix4 matrix) =>
         writer.Write(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref matrix, 1)));
@@ -175,11 +201,23 @@ public static class MeshArtifact {
             }
         }
 
+        MeshSdf sdf = null;
+        if (version >= 8 && reader.ReadByte() == 1) {
+            Vector3 gridOrigin = ReadVector3(reader);
+            Vector3 gridExtent = ReadVector3(reader);
+            int resX = reader.ReadInt32();
+            int resY = reader.ReadInt32();
+            int resZ = reader.ReadInt32();
+            float[] distances = ReadArray<float>(reader, resX * resY * resZ);
+            sdf = new MeshSdf(gridOrigin, gridExtent, resX, resY, resZ, distances);
+        }
+
         if (skinned)
             return new MeshData(vertices, indices, uvs, normals, tangents, subMeshes, nodes,
-                boneIndices, boneWeights, skeleton);
+                boneIndices, boneWeights, skeleton, sdf);
 
-        return new MeshData(vertices, indices, uvs, normals, tangents, subMeshes, nodes);
+        MeshData result = new(vertices, indices, uvs, normals, tangents, subMeshes, nodes);
+        return sdf is null ? result : result.WithSdf(sdf);
     }
 
     static T[] ReadArray<T>(BinaryReader reader, int count) where T : unmanaged {

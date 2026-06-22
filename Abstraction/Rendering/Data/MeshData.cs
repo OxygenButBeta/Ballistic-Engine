@@ -16,6 +16,13 @@ public readonly struct MeshData {
     public readonly Vector4[] BoneWeights;
     public readonly SkeletonData Skeleton;
 
+    /// <summary>
+    /// Optional offline signed distance field (generated at import time for Lumen GI). Null for
+    /// skinned meshes, when SDF generation is disabled, and for v7-and-earlier artifacts. Existing
+    /// code paths are unaffected because every constructor defaults this to null.
+    /// </summary>
+    public readonly MeshSdf Sdf;
+
     public MeshData(Vector3[] vertices, uint[] indices, Vector2[] uvs, Vector3[] normals, Vector4[] tangents)
         : this(vertices, indices, uvs, normals, tangents,
             [new SubMeshData(null, 0, indices?.Length ?? 0, null)]) {
@@ -35,16 +42,23 @@ public readonly struct MeshData {
         BoneIndices = null;
         BoneWeights = null;
         Skeleton = default;
+        Sdf = null;
     }
 
     public MeshData(Vector3[] vertices, uint[] indices, Vector2[] uvs, Vector3[] normals, Vector4[] tangents,
         SubMeshData[] subMeshes, MeshNodeData[] nodes,
-        Vector4i[] boneIndices, Vector4[] boneWeights, SkeletonData skeleton)
+        Vector4i[] boneIndices, Vector4[] boneWeights, SkeletonData skeleton, MeshSdf sdf = null)
         : this(vertices, indices, uvs, normals, tangents, subMeshes, nodes) {
         BoneIndices = boneIndices;
         BoneWeights = boneWeights;
         Skeleton = skeleton;
+        Sdf = sdf;
     }
+
+    /// <summary>Returns a copy carrying the given SDF (all other arrays shared by reference).</summary>
+    public MeshData WithSdf(MeshSdf sdf) =>
+        new(Vertices, Indices, UVs, Normals, Tangents, SubMeshes, Nodes,
+            BoneIndices, BoneWeights, Skeleton, sdf);
 
     public bool IsValid => Vertices is { Length: > 0 } && Indices is { Length: > 0 };
 
