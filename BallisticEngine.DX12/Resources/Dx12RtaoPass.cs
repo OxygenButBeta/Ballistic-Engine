@@ -14,7 +14,7 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
     public Dx12RtaoPass(Dx12Device device, Dx12GtaoPass gtaoPass) { dev = device; gtao = gtaoPass; }
 
     int? envCached;
-    float? intensityCached, rayLenCached, rayCountCached;
+    float? intensityCached, rayLenCached, rayCountCached, skyFloorCached;
     public bool Enabled(Dx12FrameContext ctx) =>
         WillRun(ctx.Doors, ctx.PostFX, ctx.Dxr, ctx.Dev);
 
@@ -32,7 +32,7 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         public Vector2 TexelSize;
         public float RayLength; public float NormalBias;
         public float RayCount; public float Intensity; public float FrameIndex; public float HistoryValid;
-        public Vector3 CameraPos; public float _pad1;
+        public Vector3 CameraPos; public float SkyVisFloor;
     }
 
     readonly Dx12Device dev;
@@ -61,8 +61,14 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
 
         float intensity = intensityCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_INTENSITY"),
             System.Globalization.CultureInfo.InvariantCulture, out float ri) ? Math.Clamp(ri, 0f, 1f) : 1f;
+        // 6 m default (was 10): a long ray counts a distant building across the street as an occluder and over-
+        // darkens open ground; sky-occlusion only needs to catch nearby roofs/arches/ceilings.
         float rayLen = rayLenCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_LENGTH"),
-            System.Globalization.CultureInfo.InvariantCulture, out float rl) ? MathF.Max(rl, 0.1f) : 10f;
+            System.Globalization.CultureInfo.InvariantCulture, out float rl) ? MathF.Max(rl, 0.1f) : 6f;
+        // Floor on the sky-vis gate (default 0.3): a covered passage/arcade still gets bounced + side light, so the
+        // IBL ambient never drops below 30% — no pure-black blotches under arches. 0 = old behaviour (full gate).
+        float skyFloor = skyFloorCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_FLOOR"),
+            System.Globalization.CultureInfo.InvariantCulture, out float sf) ? Math.Clamp(sf, 0f, 1f) : 0.3f;
 
         float rayCount = rayCountCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_RAYS"),
             System.Globalization.CultureInfo.InvariantCulture, out float rc) ? Math.Clamp(rc, 1f, 16f) : 8f;
@@ -78,6 +84,7 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
             FrameIndex = ctx.DeterministicCapture ? 0f : frameCounter,
             HistoryValid = histUsable ? 1f : 0f,
             CameraPos = ctx.CamPos,
+            SkyVisFloor = skyFloor,
         };
 
         var histRead = histWriteB ? histA : histB;

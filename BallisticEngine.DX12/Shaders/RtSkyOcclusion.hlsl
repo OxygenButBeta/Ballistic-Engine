@@ -31,7 +31,8 @@ cbuffer RtaoConstants : register(b0) {
     float  FrameIndex;      // per-pixel rotation seed (frozen under deterministic capture)
     float  HistoryValid;    // 1 = blend with HistIn (temporal denoise); 0 = first frame / det capture
     float3 CameraPos;       // world-space camera position — the history disocclusion key is distance TO THE CAMERA
-    float  _pad1;
+    float  SkyVisFloor;     // minimum sky-visibility the gate can drop to (a fully sealed receiver still keeps this
+                            // much IBL ambient — a half-open passage/arcade gets bounced + side light, never pure black)
 };
 
 float Hash(uint s) {
@@ -131,10 +132,15 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         }
     }
 
-    // Multiply sky-visibility INTO the existing AO (read-modify-write). Intensity lerps from "AO unchanged"
-    // (0) to "full sky-vis gate" (1) so it's a tunable, opt-in dial. A sealed receiver (skyVis~0) drops its
-    // IBL ambient to ~0; an open one (skyVis~1) is untouched.
-    float ao = AoIn[px];
-    AoOut[px] = ao * lerp(1.0, skyVis, saturate(Intensity));
+    // Store the RAW skyVis to history (the EMA must converge on the true geometric estimate, un-floored).
     HistOut[px] = float2(skyVis, curDist);
+
+    // Multiply sky-visibility INTO the existing AO (read-modify-write). Intensity lerps from "AO unchanged" (0)
+    // to "full sky-vis gate" (1). A FLOOR keeps a sealed/half-open receiver from crushing to pure black: a real
+    // arcade, archway or covered passage still receives bounced + side-incident skylight, so dropping its IBL
+    // ambient all the way to 0 reads as a hard black blotch (the open-ground-under-an-arch artefact). Lift skyVis
+    // to at least SkyVisFloor before gating.
+    float gatedVis = max(skyVis, SkyVisFloor);
+    float ao = AoIn[px];
+    AoOut[px] = ao * lerp(1.0, gatedVis, saturate(Intensity));
 }
