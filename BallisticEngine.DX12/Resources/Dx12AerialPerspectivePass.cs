@@ -10,7 +10,22 @@ public sealed class Dx12AerialPerspectivePass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.AerialPerspective;
     public string Name => "AerialPerspective";
 
-    public bool Enabled(Dx12FrameContext ctx) => ctx.Doors.AerialPersp && ProceduralSky.Active is not null;
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives Aerial Perspective
+    // itself; the v1 graph then SKIPS this pass via RgV2OwnsAerialPersp. Door off (and door-on-while-
+    // plumbing) => the flag is false => Enabled unchanged. See Dx12FrameContext.RgV2OwnsAerialPersp.
+    public bool Enabled(Dx12FrameContext ctx) =>
+        ctx.Doors.AerialPersp && ProceduralSky.Active is not null && !ctx.RgV2OwnsAerialPersp;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12TaaPass.RecordV2). v2 imports SceneColor
+    // (ReadWrite) + GBuffer (depth read), declares the access, then calls this to run the SAME record body
+    // (byte-identical to the v1 path). Under v2 the v1 barrier deriver is bypassed (pass skipped in v1) and
+    // v2 emits no barrier for the imports (equal states), so the body MUST own the GBuffer depth -> shader-
+    // read transition. Force it here so Record() never samples the depth in the wrong state regardless of
+    // ctx.BarriersDerived (the body's own guarded `gbuffer.DepthToShaderResource()`).
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.GBuffer.DepthToShaderResource();
+        Record(ctx);
+    }
 
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));

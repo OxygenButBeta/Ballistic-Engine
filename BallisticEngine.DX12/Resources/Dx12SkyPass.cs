@@ -10,7 +10,22 @@ public sealed class Dx12SkyPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.Sky;
     public string Name => "Sky";
 
-    public bool Enabled(Dx12FrameContext ctx) => ctx.Doors.Sky;
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives Sky itself; the v1
+    // graph then SKIPS this pass via RgV2OwnsSky. Door off (and door-on-while-plumbing) => RgV2OwnsSky is
+    // false => Enabled unchanged. See Dx12FrameContext.RgV2OwnsSky for why it stays false for now.
+    public bool Enabled(Dx12FrameContext ctx) => ctx.Doors.Sky && !ctx.RgV2OwnsSky;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12TaaPass.RecordV2). v2 imports SceneColor
+    // (ReadWrite) + GBuffer (depth read), declares the access, then calls this to run the SAME record body
+    // (byte-identical to the v1 path). Under v2 the v1 barrier deriver is bypassed (the pass is skipped in
+    // v1) AND v2 emits no barrier for the imports (equal states by design), so the body MUST own the GBuffer
+    // depth -> read-only transition. Force it here so Record() never reads the depth in the wrong state
+    // regardless of ctx.BarriersDerived. (Sky renders color into SceneColor with the GBuffer depth bound as
+    // external read-only depth — the body's own guarded `gbuffer.DepthToReadOnly()`.)
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.GBuffer.DepthToReadOnly();
+        Record(ctx);
+    }
 
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));

@@ -10,7 +10,22 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.Transparents;
     public string Name => "Transparents";
 
-    public bool Enabled(Dx12FrameContext ctx) => true;
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives Transparents itself;
+    // the v1 graph then SKIPS this pass via RgV2OwnsTransparents. Door off (and door-on-while-plumbing) =>
+    // the flag is false => Enabled unchanged (true). See Dx12FrameContext.RgV2OwnsTransparents.
+    public bool Enabled(Dx12FrameContext ctx) => !ctx.RgV2OwnsTransparents;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12TaaPass.RecordV2). v2 imports SceneColor
+    // (ReadWrite) + GBuffer (depth read) + ShadowMap, declares the access, then calls this to run the SAME
+    // record body (byte-identical to the v1 path). Under v2 the v1 barrier deriver is bypassed (pass skipped
+    // in v1) and v2 emits no barrier for the imports (equal states), so the body MUST own the GBuffer depth
+    // -> read-only transition. Force it here so Record() never binds the depth in the wrong state regardless
+    // of ctx.BarriersDerived (forward transparents render with the G-buffer depth bound read-only as external
+    // depth — the body's own guarded `gbuffer.DepthToReadOnly()`).
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.GBuffer.DepthToReadOnly();
+        Record(ctx);
+    }
 
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));

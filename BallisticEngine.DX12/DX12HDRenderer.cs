@@ -645,6 +645,17 @@ public sealed class DX12HDRenderer : HDRenderer
             Dx12RgHandle ldrH = rg2.ImportTexture("rg2.Ldr", ctx.Ldr.RenderTarget,
                 Vortice.Direct3D12.ResourceStates.RenderTarget);
 
+            // FAZ -1d-FINAL (atmosphere group) — the Sky(350)/AerialPerspective(400)/Transparents(450)/
+            // Fog(550) passes are PLUMBED (RecordV2 + RgV2Owns* ctx flags + v1 Enabled() guards) but NOT
+            // wired in here yet, and on purpose. This block runs at the END of the frame, AFTER v1's whole
+            // graph (graph.ExecuteGraph). The atmosphere passes live in the MIDDLE of the frame, before the
+            // still-v1 GlobalIllumination(500) and Reflections(600). Adding them here would run them AFTER
+            // GI/Reflections -> wrong output (sky behind GI, fog after reflections, etc.). They get PREPENDED
+            // here in event order (Sky -> AerialPerspective -> Transparents -> GI -> Fog -> post chain) ONLY
+            // when v1 is bypassed and the v2 graph owns the WHOLE frame. The RgV2Owns* flags stay false until
+            // then (set in the frame-context build), so nothing changes today. The post chain below is the
+            // literal TAIL of the frame, which is why it is order-safe to append now.
+
             if (ctx.RgV2OwnsFsr)
             {
                 // FSR reads Target (= ctx.SceneColor on entry) + GBuffer and WRITES the FsrOutput handle.

@@ -95,6 +95,23 @@ public sealed class Dx12FrameContext {
     public bool RgV2OwnsDof { get; init; }
     public bool RgV2OwnsFsr { get; init; }
 
+    // FAZ -1d-FINAL (atmosphere group) — when render-graph v2 owns the WHOLE frame (v1 bypassed) it will
+    // drive the atmosphere passes too, in event order: Sky(350) -> AerialPerspective(400) ->
+    // Transparents(450) -> [GI 500] -> Fog(550). The matching v1 pass's Enabled() returns false (skip)
+    // when its flag is set, so the pass runs exactly once. These mirror RgV2OwnsTaa.
+    //
+    // STAY FALSE FOR NOW (plumbing only): the current v2 block (RunRenderGraphV2) runs at the END of the
+    // frame, AFTER v1's whole graph. The atmosphere passes sit in the MIDDLE (350-550, before the still-v1
+    // GI(500) / Reflections(600)), so appending them to the end-of-frame block would REORDER them after GI
+    // and Reflections -> wrong output. They are only enabled once v1 is bypassed and the v2 graph owns the
+    // frame in event order. Default false => door-off byte-identical AND door-on unchanged (no v1 pass skips,
+    // RunRenderGraphV2 does not run them — see the FAZ -1d-FINAL note there). The RecordV2 bodies + the v1
+    // Enabled() `&& !RgV2Owns*` guards are in place, ready for that final wiring.
+    public bool RgV2OwnsSky { get; init; }
+    public bool RgV2OwnsAerialPersp { get; init; }
+    public bool RgV2OwnsTransparents { get; init; }
+    public bool RgV2OwnsFog { get; init; }
+
     public Dx12RenderDoors      Doors    { get; init; }
     public PostProcessSettings  PostFX   { get; init; }
     public RenderStats          Stats    { get; init; }

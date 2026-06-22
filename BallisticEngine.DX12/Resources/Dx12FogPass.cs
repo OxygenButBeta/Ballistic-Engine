@@ -10,8 +10,22 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.Fog;
     public string Name => "Fog";
 
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives Fog itself; the v1
+    // graph then SKIPS this pass via RgV2OwnsFog. Door off (and door-on-while-plumbing) => the flag is false
+    // => Enabled unchanged. See Dx12FrameContext.RgV2OwnsFog.
     public bool Enabled(Dx12FrameContext ctx) =>
-        (!ctx.Doors.Minimal && ctx.PostFX.VolumetricEnabled) || ctx.Doors.Fog;
+        ((!ctx.Doors.Minimal && ctx.PostFX.VolumetricEnabled) || ctx.Doors.Fog) && !ctx.RgV2OwnsFog;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12TaaPass.RecordV2). v2 imports SceneColor
+    // (ReadWrite) + GBuffer (depth read) + ShadowMap, declares the access, then calls this to run the SAME
+    // record body (byte-identical to the v1 path). Under v2 the v1 barrier deriver is bypassed (pass skipped
+    // in v1) and v2 emits no barrier for the imports (equal states), so the body MUST own the GBuffer depth
+    // -> shader-read transition. Force it here so Record() never samples the depth in the wrong state
+    // regardless of ctx.BarriersDerived (the body's own guarded `gbuffer.DepthToShaderResource()`).
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.GBuffer.DepthToShaderResource();
+        Record(ctx);
+    }
 
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));
