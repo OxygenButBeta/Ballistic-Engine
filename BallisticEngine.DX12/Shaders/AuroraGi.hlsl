@@ -500,7 +500,11 @@ float4 PSCombine(VSOut i) : SV_Target {
     float matAo = GMaterial.SampleLevel(LinearClamp, i.Uv, 0).b;
     // GTAO eased by AoStrength (1 = no GTAO darkening; lerp toward the raw GTAO at full strength).
     float gtao = lerp(1.0, GtaoTex.SampleLevel(LinearClamp, i.Uv, 0).r, saturate(AoStrength));
-    float3 diffuseIndirect = E * albedo * matAo * gtao / PI;   // Lambertian: outgoing = E*albedo/PI
+    // ENERGY (FAZ 3a fix — the "dark/weak GI" root cause): the trace accumulates OUTGOING radiance Lo from the
+    // card cache / ShadeHit via COSINE-importance sampling, so E = sum/rays already equals (1/π)∫Lo·cosθ dω. The
+    // Lambertian receiver response is albedo/π · ∫Li·cosθ dω = albedo/π · (π·E) = albedo·E. The cosine-sampling π
+    // CANCELS the BRDF π — dividing by π again (the old code) double-attenuated the indirect ~3.14×, the soluk GI.
+    float3 diffuseIndirect = E * albedo * matAo * gtao;   // Lambertian, cosine-sampled: outgoing = E*albedo (no /π)
     return float4(Sanitize(diffuseIndirect), 1.0);   // additive blend (One/One) adds onto the HDR scene color
 }
 
