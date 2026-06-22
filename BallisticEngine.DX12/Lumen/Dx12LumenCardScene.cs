@@ -95,6 +95,13 @@ public sealed class Dx12LumenCardScene : IDisposable {
         public Format Fmt;
     }
     Atlas albedo, normal, emissive, depthA, directLight, finalLight;
+    // FAZ 3d — SECOND FinalLighting atlas. The multi-bounce reads LAST frame's lit cache (finalLightRead) while
+    // writing THIS frame's (finalLightWrite); they ping-pong via SwapFinalLighting() after each lighting pass.
+    Atlas finalLightB;
+    Atlas finalLightRead, finalLightWrite;   // alias one of {finalLight, finalLightB} each frame
+    // false until the first lit frame — the first frame's multi-bounce reads nothing (black) then accumulates.
+    bool finalValid;
+    public bool FinalValid => finalValid;
 
     // FAZ 3c — capture RTVs. One RTV per CAPTURED attribute atlas (Albedo/Normal/Emissive/Depth — DirectLighting/
     // FinalLighting are written by 3d, no capture RTV). Plus a transient PhysicalPageSize² D32 depth target reused
@@ -142,7 +149,20 @@ public sealed class Dx12LumenCardScene : IDisposable {
     public int NormalSrvBindless => normal?.SrvBindless ?? -1;
     public int EmissiveSrvBindless => emissive?.SrvBindless ?? -1;
     public int DepthSrvBindless => depthA?.SrvBindless ?? -1;
-    public int FinalLightingSrvBindless => finalLight?.SrvBindless ?? -1;
+    public int FinalLightingSrvBindless => finalLightRead?.SrvBindless ?? finalLight?.SrvBindless ?? -1;
+
+    // FAZ 3d — bindless reserved-tail indices the lighting compute reads via ResourceDescriptorHeap[].
+    public int AlbedoSrvIdx => albedo?.SrvBindless ?? -1;
+    public int NormalSrvIdx => normal?.SrvBindless ?? -1;
+    public int EmissiveSrvIdx => emissive?.SrvBindless ?? -1;
+    public int DepthSrvIdx => depthA?.SrvBindless ?? -1;
+    public int DirectUavIdx => directLight?.UavBindless ?? -1;
+    public int FinalReadSrvIdx => finalLightRead?.SrvBindless ?? -1;
+    public int FinalWriteUavIdx => finalLightWrite?.UavBindless ?? -1;
+
+    // FAZ 3d — CPU SRV handles for the debug blit (DirectLighting + the current READ FinalLighting = last lit frame).
+    public CpuDescriptorHandle DirectSrvCpu => directLight?.SrvCpu ?? default;
+    public CpuDescriptorHandle FinalSrvCpu  => finalLightRead?.SrvCpu ?? finalLight?.SrvCpu ?? default;
 
     // FAZ 3c — CPU SRV handles for the captured atlases (debug blit copies these into a shader-visible heap, the way
     // RecordSdfDebug copies the clipmap SRV). Albedo/Normal/Emissive/Depth, by capture-attribute name.
@@ -157,6 +177,31 @@ public sealed class Dx12LumenCardScene : IDisposable {
     bool atlasBuilt;
 
     public bool Valid => CardCount > 0 && cardBuf != null;
+
+    // ====================================================================================================
+    // FAZ 3d — SURFACE-CACHE LIGHTING (compute pipeline + emissive NEE list)
+    // ====================================================================================================
+    ID3D12RootSignature lightRootSig;
+    ID3D12PipelineState lightPso;
+    Dx12FrameCb<LumenLightConstants> lightCb;
+    Dx12EmissiveLights lumenEmissive;   // FAZ 3d: world-space emissive-triangle area lights (NEE), built here
+    bool lightBuilt;
+    bool loggedLight;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct LumenLightConstants {
+        public Vector3 SunDir;   public float SunBias;
+        public Vector3 SunColor; public float LightCount;
+        public uint AtlasSize, PageCount, CardCount, InstanceCount;
+        public float EmissiveCount, NeeIntensity, IndirectRays, IndirectIntensity;
+        public float FinalValid; public uint FrameIndex; public float SkyIntensity, UseSky;
+        public uint AlbedoSrvIdx, NormalSrvIdx, EmissiveSrvIdx, DepthSrvIdx;
+        public uint DirectUavIdx, FinalReadSrvIdx, FinalWriteUavIdx, Pad0;
+    }
+
+    // ---- per-instance card range root SRV (built alongside the card/page buffers) ----
+    ID3D12Resource rangeBuf;   // InstanceCardRange[] (GpuLumenCardScene.InstanceCardRange layout)
+    public ulong RangeBufferGpuAddress => rangeBuf?.GPUVirtualAddress ?? 0;
 
     // ---- dirty tracking (mirrors Dx12LumenScene) ----
     int topologyStamp = -1;
@@ -232,6 +277,15 @@ public sealed class Dx12LumenCardScene : IDisposable {
         dev.DeferredRelease(pageBuf);
         cardBuf = dev.CreateUavBuffer<GpuLumenCard>(cardArr, ResourceStates.GenericRead);
         pageBuf = dev.CreateUavBuffer<GpuLumenPage>(pageArr, ResourceStates.GenericRead);
+        UploadRanges();
+    }
+
+    // FAZ 3d — upload the per-instance card ranges as a GPU StructuredBuffer (root SRV t5) so the lighting compute can
+    // map an indirect-ray hit's instance → its card range (for the hit→card→texel radiosity sample).
+    void UploadRanges() {
+        var arr = instanceRanges.Length > 0 ? instanceRanges : new InstanceCardRange[1];
+        dev.DeferredRelease(rangeBuf);
+        rangeBuf = dev.CreateUavBuffer<InstanceCardRange>(arr, ResourceStates.GenericRead);
     }
 
     // Transform-only refresh: re-derive the world cards (origins/axes/extents follow the instance world matrices) and
@@ -258,6 +312,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
         dev.DeferredRelease(pageBuf);
         cardBuf = dev.CreateUavBuffer<GpuLumenCard>(cardArr, ResourceStates.GenericRead);
         pageBuf = dev.CreateUavBuffer<GpuLumenPage>(pageArr, ResourceStates.GenericRead);
+        UploadRanges();
     }
 
     // Transform each instance's mesh-local cards into WORLD space (Aurora's exact convention) + record per-instance
@@ -567,6 +622,191 @@ public sealed class Dx12LumenCardScene : IDisposable {
         readback.Unmap(0);
     }
 
+    // ====================================================================================================
+    // FAZ 3d — LIGHT THE SURFACE CACHE
+    // ====================================================================================================
+
+    // Light every allocated card page's texels: direct (sun + punctual + emissive NEE, shadow-rayed) + indirect
+    // (radiosity gather of LAST frame's FinalLighting) → write DirectLighting + FinalLighting atlases. Runs EVERY
+    // armed frame (lighting is dynamic: multi-bounce accumulates over frames + lights can move). Ping-pongs the two
+    // FinalLighting atlases so the radiosity reads last frame's lit cache while writing this frame's.
+    public unsafe void LightCards(Dx12FrameContext ctx, Dx12SceneAS sceneAS) {
+        if (sceneAS is null || !sceneAS.Valid || CardCount == 0 || PageCount == 0) return;
+        EnsureLightPipeline();
+
+        // Build/refresh the emissive-triangle area-light list (NEE). Cached by an instance+emissive stamp, so a
+        // static scene builds it once. Pass the SAME renderer set Aurora uses.
+        bool neeOn = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NEE") != "0";
+        if (neeOn) lumenEmissive.Ensure(RuntimeSet<IStaticMeshRenderer>.ReadOnlyCollection);
+        float neeCount = (neeOn && lumenEmissive.Valid) ? lumenEmissive.Count : 0f;
+        float neeIntensity = EnvF("BALLISTIC_DX12_LUMEN_NEE_INTENSITY", 1f);
+
+        // Sun: ctx.LightDir is TO-sun after normalize (~0 = night). Punctual lights from the clustered light buffer.
+        Vector3 sunDir = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.UnitY : Vector3.Normalize(ctx.LightDir);
+        Vector3 sunColor = ctx.LightDir.LengthSquared() < 1e-8f ? Vector3.Zero : ctx.LightColor;
+        var clustered = ctx.ClusteredLights;
+        ulong lightAddr = clustered?.LightBufGpuAddress ?? 0;
+        float lightCount = clustered?.LightCount ?? 0;
+
+        float indirectRays = EnvF("BALLISTIC_DX12_LUMEN_INDIRECT_RAYS", 4f);
+        float indirectIntensity = EnvF("BALLISTIC_DX12_LUMEN_INDIRECT_INTENSITY", 1f);
+
+        lightCb.Write(new LumenLightConstants {
+            SunDir = sunDir, SunBias = 0.03f, SunColor = sunColor, LightCount = lightCount,
+            AtlasSize = (uint)AtlasSize, PageCount = (uint)PageCount, CardCount = (uint)CardCount,
+            InstanceCount = (uint)instanceRanges.Length,
+            EmissiveCount = neeCount, NeeIntensity = neeIntensity,
+            IndirectRays = indirectRays, IndirectIntensity = indirectIntensity,
+            FinalValid = finalValid ? 1f : 0f, FrameIndex = (uint)ctx.FrameCounter,
+            SkyIntensity = 0f, UseSky = 0f,
+            AlbedoSrvIdx = (uint)albedo.SrvBindless, NormalSrvIdx = (uint)normal.SrvBindless,
+            EmissiveSrvIdx = (uint)emissive.SrvBindless, DepthSrvIdx = (uint)depthA.SrvBindless,
+            DirectUavIdx = (uint)directLight.UavBindless,
+            FinalReadSrvIdx = (uint)finalLightRead.SrvBindless, FinalWriteUavIdx = (uint)finalLightWrite.UavBindless,
+        });
+
+        ulong cbAddr = lightCb.Gpu;
+        ulong emissiveAddr = neeCount > 0f ? lumenEmissive.GpuAddress : (lightAddr != 0 ? lightAddr : cardBuf.GPUVirtualAddress);
+        ulong lightsAddr = lightAddr != 0 ? lightAddr : cardBuf.GPUVirtualAddress;   // valid filler when no punctual lights
+        ulong rangeAddr = rangeBuf?.GPUVirtualAddress ?? cardBuf.GPUVirtualAddress;
+        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
+        int groups = (AtlasSize + 7) / 8;
+
+        dev.ExecuteSync(cl => {
+            // READ atlases (Albedo/Normal/Emissive/Depth + last FinalLighting) → NonPixelShaderResource; WRITE atlases
+            // (DirectLighting + this frame's FinalLighting) → UnorderedAccess. Persistent resting state is UAV.
+            cl.ResourceBarrierTransition(albedo.Tex,    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(normal.Tex,    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(emissive.Tex,  ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(depthA.Tex,    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(finalLightRead.Tex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            // directLight + finalLightWrite stay UnorderedAccess (their resting state).
+
+            cl.SetDescriptorHeaps(bindless.Heap);
+            cl.SetComputeRootSignature(lightRootSig);
+            cl.SetPipelineState(lightPso);
+            cl.SetComputeRootConstantBufferView(0, cbAddr);
+            cl.SetComputeRootShaderResourceView(1, sceneAS.TlasAddress);          // t0 TLAS
+            cl.SetComputeRootShaderResourceView(2, cardBuf.GPUVirtualAddress);    // t1 Cards
+            cl.SetComputeRootShaderResourceView(3, pageBuf.GPUVirtualAddress);    // t2 Pages
+            cl.SetComputeRootShaderResourceView(4, lightsAddr);                   // t3 Lights
+            cl.SetComputeRootShaderResourceView(5, emissiveAddr);                 // t4 EmissiveLights
+            cl.SetComputeRootShaderResourceView(6, rangeAddr);                    // t5 InstanceRanges
+            cl.Dispatch((uint)groups, (uint)groups, 1);
+
+            // Read atlases back to UnorderedAccess (the persistent inter-pass state the debug blit + next frame expect).
+            cl.ResourceBarrierTransition(albedo.Tex,    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(normal.Tex,    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(emissive.Tex,  ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(depthA.Tex,    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(finalLightRead.Tex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+        });
+
+        SwapFinalLighting();
+        finalValid = true;
+
+        if (!loggedLight) {
+            loggedLight = true;
+            string line = $"[LumenLight] lit pages={PageCount} cards={CardCount} atlas={AtlasSize} " +
+                          $"sun={(sunColor.LengthSquared() > 0 ? "on" : "off")} lights={lightCount} emissive={neeCount} " +
+                          $"indirectRays={indirectRays} finalValid(was)={(!finalValid)} (FAZ 3d — surface cache lit)";
+            Console.WriteLine(line);
+            Debugging.Log(line);
+        }
+
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_LIGHT_READBACK") == "1" && PageCount > 0)
+            LightReadbackProof();
+    }
+
+    // Ping-pong the two FinalLighting atlases. Called after each lighting pass: this frame's WRITE becomes next
+    // frame's READ (the multi-bounce source), and the now-stale READ becomes the next WRITE target.
+    void SwapFinalLighting() => (finalLightRead, finalLightWrite) = (finalLightWrite, finalLightRead);
+
+    // One-shot CPU readback (ExecuteSyncImmediate per the hard rule) of the just-written FinalLighting (= finalLightRead
+    // after the swap) page centers — PROVES the cache is lit (emissive card bright; walls carry NEE). Debug-gated.
+    unsafe void LightReadbackProof() {
+        Atlas lit = finalLightRead;   // SwapFinalLighting already ran → this is the atlas we just wrote
+        ResourceDescription rd = lit.Tex.Description;
+        var fps = new PlacedSubresourceFootPrint[1]; var rc = new uint[1]; var rs = new ulong[1];
+        dev.Device.GetCopyableFootprints(rd, 0, 1, 0, fps, rc, rs, out ulong total);
+        int rowPitch = (int)fps[0].Footprint.RowPitch;   // R11G11B10_Float → 4 bytes/texel
+        using ID3D12Resource readback = dev.Device.CreateCommittedResource(
+            HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(total), ResourceStates.CopyDest);
+
+        dev.ExecuteSyncImmediate(cl => {
+            cl.ResourceBarrierTransition(lit.Tex, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+            cl.CopyTextureRegion(new TextureCopyLocation(readback, fps[0]), 0, 0, 0,
+                new TextureCopyLocation(lit.Tex, 0), null);
+            cl.ResourceBarrierTransition(lit.Tex, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+        });
+
+        byte* m = readback.Map<byte>(0);
+        int probed = Math.Min(PageCount, 12);
+        int nonZero = 0;
+        for (int p = 0; p < probed; p++) {
+            GpuLumenPage pg = pagesCpu[p];
+            int cx = (int)(pg.AtlasOffsetX + pg.SizeX / 2);
+            int cy = (int)(pg.AtlasOffsetY + pg.SizeY / 2);
+            uint packed = *(uint*)(m + (long)cy * rowPitch + (long)cx * 4);
+            (float r, float g, float b) = UnpackR11G11B10(packed);
+            if (r + g + b > 1e-4f) nonZero++;
+            Console.WriteLine($"[LumenLightReadback] page#{p} card={pg.CardId} center=({cx},{cy}) " +
+                              $"finalRGB=({r:0.###},{g:0.###},{b:0.###})");
+        }
+        Console.WriteLine($"[LumenLightReadback] {nonZero}/{probed} probed page centers are LIT (non-zero)");
+        readback.Unmap(0);
+    }
+
+    // Unpack an R11G11B10_Float texel (DXGI packed unsigned float: R/G 5e6m, B 5e5m, no sign).
+    static (float, float, float) UnpackR11G11B10(uint v) {
+        float Unpack(uint bits, int mbits, int ebits) {
+            uint mask = (1u << (mbits + ebits)) - 1u;
+            uint x = bits & mask;
+            uint e = x >> mbits;
+            uint mant = x & ((1u << mbits) - 1u);
+            if (e == 0u) return mant == 0u ? 0f : (float)(mant / Math.Pow(2, mbits)) * (float)Math.Pow(2, 1 - 15);
+            return (float)((1.0 + mant / Math.Pow(2, mbits)) * Math.Pow(2, (int)e - 15));
+        }
+        float r = Unpack(v & 0x7FFu, 6, 5);
+        float g = Unpack((v >> 11) & 0x7FFu, 6, 5);
+        float b = Unpack((v >> 22) & 0x3FFu, 5, 5);
+        return (r, g, b);
+    }
+
+    unsafe void EnsureLightPipeline() {
+        if (lightBuilt) return;
+        lightBuilt = true;
+
+        // Root sig: CBV b0 + root SRVs t0 TLAS / t1 cards / t2 pages / t3 lights / t4 emissive / t5 ranges + s0 clamp.
+        // HeapDirectlyIndexed so the shader reads the atlas SRV/UAV bindlessly via ResourceDescriptorHeap[] (mirrors
+        // GlobalSdfComposite — the SAME bound bindless heap serves the ResourceDescriptorHeap[] reads).
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var tlas = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var cards = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.All);
+        var pages = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All);
+        var lights = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All);
+        var emiss = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(4, 0), ShaderVisibility.All);
+        var ranges = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(5, 0), ShaderVisibility.All);
+        var clamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never,
+            MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        lightRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(
+                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                new[] { cbv, tlas, cards, pages, lights, emiss, ranges }, new[] { clamp })));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("Lumen/LumenCardLight.hlsl");
+        byte[] cs = Dx12ShaderCompiler.Compile(DxcShaderStage.Compute, hlsl, "CSMain", "LumenCardLight.hlsl");
+        lightPso = dev.Device.CreateComputePipelineState(
+            new ComputePipelineStateDescription { RootSignature = lightRootSig, ComputeShader = cs });
+
+        lightCb = new Dx12FrameCb<LumenLightConstants>(dev);
+        lumenEmissive = new Dx12EmissiveLights(dev);
+    }
+
     void BindCaptureSrv(int slot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback) {
         var dx = (tex as Dx12Texture2D) ?? explicitFallback ?? (DefaultTextures.Neutral(type) as Dx12Texture2D);
         dev.Device.CopyDescriptorsSimple(1, captureSrv.Cpu(slot), dx.SrvCpu,
@@ -636,6 +876,11 @@ public sealed class Dx12LumenCardScene : IDisposable {
         depthA      = CreateAtlas("LumenCardDepth",    Format.R16_Float,      ref slot);
         directLight = CreateAtlas("LumenCardDirect",   Format.R11G11B10_Float, ref slot);
         finalLight  = CreateAtlas("LumenCardFinal",    Format.R11G11B10_Float, ref slot);
+        finalLightB = CreateAtlas("LumenCardFinalB",   Format.R11G11B10_Float, ref slot);   // FAZ 3d multi-bounce ping-pong
+
+        // FAZ 3d — initial ping-pong assignment: write finalLight, read finalLightB (cleared → black) this frame.
+        finalLightWrite = finalLight;
+        finalLightRead  = finalLightB;
 
         ClearAtlases();
         CreateCaptureTargets();
@@ -723,7 +968,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
     // shader-visible heap — a D3D12 rule violation). Every atlas has AllowRenderTarget, so an RTV clear is valid +
     // simple. The atlases are left in UnorderedAccess afterwards (3c's capture rasterize/UAV path transitions them).
     void ClearAtlases() {
-        Atlas[] all = { albedo, normal, emissive, depthA, directLight, finalLight };
+        Atlas[] all = { albedo, normal, emissive, depthA, directLight, finalLight, finalLightB };
         using ID3D12DescriptorHeap rtvHeap = dev.Device.CreateDescriptorHeap(
             new DescriptorHeapDescription(DescriptorHeapType.RenderTargetView, (uint)all.Length));
         CpuDescriptorHandle rtvStart = rtvHeap.GetCPUDescriptorHandleForHeapStart();
@@ -775,9 +1020,16 @@ public sealed class Dx12LumenCardScene : IDisposable {
     public void Dispose() {
         cardBuf?.Dispose(); cardBuf = null;
         pageBuf?.Dispose(); pageBuf = null;
+        rangeBuf?.Dispose(); rangeBuf = null;
         albedo?.Tex?.Dispose(); normal?.Tex?.Dispose(); emissive?.Tex?.Dispose();
         depthA?.Tex?.Dispose(); directLight?.Tex?.Dispose(); finalLight?.Tex?.Dispose();
-        albedo = normal = emissive = depthA = directLight = finalLight = null;
+        finalLightB?.Tex?.Dispose();
+        albedo = normal = emissive = depthA = directLight = finalLight = finalLightB = null;
+        finalLightRead = finalLightWrite = null;
+        lightPso?.Dispose(); lightPso = null;
+        lightRootSig?.Dispose(); lightRootSig = null;
+        lightCb?.Dispose(); lightCb = null;
+        lumenEmissive?.Dispose(); lumenEmissive = null;
         captureRtvHeap?.Dispose(); captureRtvHeap = null;
         captureDsvHeap?.Dispose(); captureDsvHeap = null;
         captureDepth?.Dispose(); captureDepth = null;

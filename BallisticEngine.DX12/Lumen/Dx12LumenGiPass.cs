@@ -106,6 +106,42 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         }
     }
 
+    // FAZ 3d — surface-cache LIGHTING gate. Lit whenever the cards are armed (Lumen GI on OR the card door set), so
+    // a cards-only test run (BALLISTIC_DX12_LUMEN_CARDS=1) still lights the cache. Off only if explicitly disabled.
+    static int lightDoor = -2;   // -2 unread, 0 off, 1 on
+    static bool LightArmed(Dx12FrameContext ctx) {
+        if (lightDoor == -2)
+            lightDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_NOLIGHT") == "1" ? 0 : 1;
+        return lightDoor == 1 && (Armed(ctx) || CardsDoorOn());
+    }
+    static int cardsDoor = -2;
+    static bool CardsDoorOn() {
+        if (cardsDoor == -2)
+            cardsDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_CARDS") == "1" ? 1 : 0;
+        return cardsDoor == 1;
+    }
+
+    // FAZ 3d — lit-cache debug blit (BALLISTIC_DX12_LUMEN_LIGHT_DEBUG=1): blit FinalLighting / DirectLighting to scene
+    // color so the LIT surface cache is visible (selectable via BALLISTIC_DX12_LUMEN_LIGHT_VIEW=final|direct).
+    ID3D12RootSignature litDbgRootSig;
+    ID3D12PipelineState litDbgPso;
+    Dx12FrameCb<CaptureDebugConstants> litDbgCb;
+    Dx12DescriptorHeap litDbgSrv;
+    bool loggedLitDbg;
+    static int litDebugDoor = -2;
+    static bool LightDebug() {
+        if (litDebugDoor == -2)
+            litDebugDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_LIGHT_DEBUG") == "1" ? 1 : 0;
+        return litDebugDoor == 1;
+    }
+    static void LightViewMode(out uint mode, out float scale) {
+        string v = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_LIGHT_VIEW") ?? "final").ToLowerInvariant();
+        switch (v) {
+            case "direct": mode = 1; scale = 1.0f; break;
+            default:       mode = 0; scale = 1.0f; break;   // final
+        }
+    }
+
     static int sdfDoor = -2;       // -2 unread, 0 off, 1 on (build the field)
     static int sdfDebugDoor = -2;  // -2 unread, 0 off, 1 on (sphere-trace debug view)
     static bool SdfArmed(Dx12FrameContext ctx) {
@@ -332,6 +368,84 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         });
     }
 
+    unsafe void EnsureLightDebugPipeline()
+    {
+        if (litDbgPso != null) return;
+        // Fullscreen blit: CBV b0 + 1-SRV table (atlas t0) + point-clamp sampler s0. Opaque replace into HDR.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var pointClamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never,
+            MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        litDbgRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { pointClamp })));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("Lumen/LumenCardLightDebug.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSDebug", "LumenCardLightDebug.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSDebug", "LumenCardLightDebug.hlsl");
+        litDbgPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = litDbgRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+        litDbgCb = new Dx12FrameCb<CaptureDebugConstants>(dev);
+        litDbgSrv = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true,
+            framesInFlight: dev.FramesInFlight);
+    }
+
+    unsafe void RecordLightDebug(Dx12FrameContext ctx)
+    {
+        Dx12LumenCardScene cards = scene.CardScene;
+        if (cards is null || !cards.Valid) {
+            if (!loggedLitDbg) { loggedLitDbg = true;
+                Console.WriteLine($"[LumenLightDebug] SKIP cards={(cards==null?"null":cards.CardCount.ToString())} valid={cards?.Valid}"); }
+            return;
+        }
+        EnsureLightDebugPipeline();
+        LightViewMode(out uint mode, out float scale);
+        scale *= EnvF("BALLISTIC_DX12_LUMEN_LIGHT_GAIN", 1f);
+
+        // The selected lit atlas's CPU SRV (FinalLighting = last lit frame after the swap, or DirectLighting). Both
+        // rest in UnorderedAccess between passes; the SRV reads the same persistent texture directly.
+        CpuDescriptorHandle atlasSrv = mode switch {
+            1 => cards.DirectSrvCpu,
+            _ => cards.FinalSrvCpu,
+        };
+        if (!loggedLitDbg) { loggedLitDbg = true;
+            Console.WriteLine($"[LumenLightDebug] DRAW mode={mode} scale={scale:0.##} finalValid={cards.FinalValid} cards={cards.CardCount}"); }
+
+        litDbgCb.Write(new CaptureDebugConstants { Mode = mode, Scale = scale, Pad = Vector2.Zero });
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        litDbgSrv.Reset();
+        int b = litDbgSrv.AllocateRange(1);
+        dev.Device.CopyDescriptorsSimple(1, litDbgSrv.Cpu(b), atlasSrv, heapType);
+
+        ulong cbAddr = litDbgCb.Gpu;
+        GpuDescriptorHandle srvGpu = litDbgSrv.Gpu(b);
+        ID3D12DescriptorHeap heap = litDbgSrv.Heap;
+        ctx.SceneColor.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(litDbgRootSig);
+            cl.SetPipelineState(litDbgPso);
+            cl.SetDescriptorHeaps(heap);
+            cl.SetGraphicsRootConstantBufferView(0, cbAddr);
+            cl.SetGraphicsRootDescriptorTable(1, srvGpu);
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+    }
+
+    static float EnvF(string name, float fallback) =>
+        float.TryParse(Environment.GetEnvironmentVariable(name), System.Globalization.CultureInfo.InvariantCulture,
+            out float v) ? v : fallback;
+
     // The product door. FAZ 0 is ENV-ONLY (BALLISTIC_DX12_LUMEN=1) — there is no LumenVolume yet.
     // TODO (later phase): add a LumenVolume (mirroring AuroraVolume) and follow it when the env is unset, just like
     // Aurora's Armed() folds in ctx.PostFX.AuroraEnabled. For now: armed iff the env door is "1".
@@ -391,6 +505,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // list. Gated implicitly on the card scene existing (built whenever cards-or-Lumen is armed).
         scene.CardScene?.Capture(ctx, ctx.Dxr.SceneAS);
 
+        // FAZ 3d: LIGHT the surface cache. Per atlas texel: direct (sun + punctual + emissive NEE, shadow-rayed) +
+        // indirect (radiosity gather of last frame's FinalLighting → multi-bounce) → a lit, view-independent
+        // FinalLighting atlas. Runs every armed frame (lighting is dynamic; multi-bounce accumulates over frames).
+        if (LightArmed(ctx))
+            scene.CardScene?.LightCards(ctx, ctx.Dxr.SceneAS);
+
         // FAZ 2: build/refresh the camera-centered GLOBAL DISTANCE FIELD clipmap from the visible meshes' per-mesh
         // SDFs. Armed by BALLISTIC_DX12_GLOBALSDF=1 (independent test) OR whenever Lumen GI is on (the field is part
         // of the Lumen substrate). Builds NOTHING into the scene color by itself — FAZ 5 sphere-marches it for GI.
@@ -418,6 +538,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (CaptureDebug() && ctx.SceneColor != null)
             RecordCaptureDebug(ctx);
 
+        // FAZ 3d verification artifact: blit the LIT surface-cache atlas (FinalLighting by default; DirectLighting via
+        // BALLISTIC_DX12_LUMEN_LIGHT_VIEW=direct) to the HDR scene color so the lit cache is visible. Drawn LAST so the
+        // lit view wins when multiple debug doors are on. Default off → scene color untouched.
+        if (LightDebug() && ctx.SceneColor != null)
+            RecordLightDebug(ctx);
+
         // TODO FAZ 5+: SDF software ray trace (sphere-march this clipmap) → FAZ 3: surface-cache gather → FAZ 6:
         // screen-probe diffuse + additive combine.
     }
@@ -429,5 +555,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         dbgPso?.Dispose(); dbgRootSig?.Dispose(); dbgCb?.Dispose(); dbgSrv?.Dispose();
         cardDbgPso?.Dispose(); cardDbgRootSig?.Dispose(); cardDbgCb?.Dispose();
         capDbgPso?.Dispose(); capDbgRootSig?.Dispose(); capDbgCb?.Dispose(); capDbgSrv?.Dispose();
+        litDbgPso?.Dispose(); litDbgRootSig?.Dispose(); litDbgCb?.Dispose(); litDbgSrv?.Dispose();
     }
 }

@@ -35,14 +35,16 @@ internal static class Dx12BindlessTail
     public const int GlobalSdfUsed = GlobalSdfMaxTextures + 1;
     public const int GlobalSdfTableBase = AuroraScreenProbeTableBase - GlobalSdfReserved;
 
-    // Lumen FAZ 3b SURFACE-CACHE ATLAS — its own reserved tail below the global-SDF tail. Holds the PERSISTENT SRV+UAV
-    // pair for each physical-atlas texture (Albedo/Normal/Emissive/Depth/DirectLighting/FinalLighting = 6 atlases × 2
-    // = 12 slots). Same rule as every block above: these are stamped ONCE (the atlas resources never re-allocate),
-    // so they MUST live OUTSIDE the dynamic Allocate()/Reset() cursor the GPU-driven material table rewinds — else the
-    // re-stamp clobbers them (typed-mismatch descriptor → GPU page fault → device removed). Door-gated; nothing
-    // allocated when Lumen cards are off. Slot order: per atlas, SRV then UAV, in atlas-creation order.
-    const int LumenSurfaceCacheReserved = 16;   // 12 used (6 atlases × SRV+UAV) + slack
-    public const int LumenSurfaceCacheUsed = 12;
+    // Lumen FAZ 3b/3d SURFACE-CACHE ATLAS — its own reserved tail below the global-SDF tail. Holds the PERSISTENT
+    // SRV+UAV pair for each physical-atlas texture. FAZ 3b: Albedo/Normal/Emissive/Depth/DirectLighting/FinalLighting
+    // = 6 atlases × 2 = 12 slots. FAZ 3d adds a SECOND FinalLighting atlas (finalLightB) for the multi-bounce
+    // ping-pong (read last frame's lit cache while writing this frame's) = +2 → 14 slots. Same rule as every block
+    // above: these are stamped ONCE (the atlas resources never re-allocate), so they MUST live OUTSIDE the dynamic
+    // Allocate()/Reset() cursor the GPU-driven material table rewinds — else the re-stamp clobbers them (typed-mismatch
+    // descriptor → GPU page fault → device removed). Door-gated; nothing allocated when Lumen cards are off. Slot
+    // order: per atlas, SRV then UAV, in atlas-creation order.
+    const int LumenSurfaceCacheReserved = 16;   // 14 used (7 atlases × SRV+UAV) + slack
+    public const int LumenSurfaceCacheUsed = 14;
     public const int LumenSurfaceCacheTableBase = GlobalSdfTableBase - LumenSurfaceCacheReserved;
 
     public const int TailStart = LumenSurfaceCacheTableBase;
