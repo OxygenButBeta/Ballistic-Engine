@@ -141,6 +141,7 @@ public sealed class DX12HDRenderer : HDRenderer
     Dx12SkyPass skyPass;
 
     Dx12AuroraGiPass auroraGiPass;
+    Dx12LumenGiPass lumenGiPass;
 
     Dx12ReflectionsPass reflectionsPass;
 
@@ -522,6 +523,11 @@ public sealed class DX12HDRenderer : HDRenderer
         // the screen-trace / HW-RT diffuse pipeline. The single product GI pass.
         auroraGiPass = new Dx12AuroraGiPass(dev, targetW, targetH);
         graph.Add(auroraGiPass);
+        // Lumen GI (FAZ 0 scaffold) — same event (500) as Aurora, MUTUALLY EXCLUSIVE with it. Both register; only
+        // one's Enabled() returns true per frame (Aurora.WouldRun yields to Dx12LumenGiPass.Armed). Door off
+        // (BALLISTIC_DX12_LUMEN unset) → Lumen never runs and Aurora is unchanged. FAZ 0 writes no GI.
+        lumenGiPass = new Dx12LumenGiPass(dev, targetW, targetH);
+        graph.Add(lumenGiPass);
         reflectionsPass = new Dx12ReflectionsPass(dev, targetW, targetH);
         graph.Add(reflectionsPass);
         taaPass = new Dx12TaaPass(dev, targetW, targetH);
@@ -1712,6 +1718,12 @@ public sealed class DX12HDRenderer : HDRenderer
         // deferred pass (event 300) suppresses its IBL diffuse ambient iff the Aurora pass (event 500) will add
         // its own diffuse indirect — the two must agree to avoid double-counting.
         ctx.AuroraActiveThisFrame = Dx12AuroraGiPass.WouldRun(ctx);
+
+        // Lumen GI active this frame (FAZ 0) — same predicate the Lumen pass's Enabled() uses. Mutually exclusive
+        // with Aurora: when BALLISTIC_DX12_LUMEN=1, Aurora.WouldRun yields above so AuroraActive is false here and
+        // LumenActive is true. FAZ 0 writes no GI, so the deferred IBL-diffuse suppression does NOT yet key off
+        // this flag (see the // FAZ 6 marker in Dx12DeferredLightingPass.Record).
+        ctx.LumenActiveThisFrame = Dx12LumenGiPass.WouldRun(ctx);
 
         ctx.GrainFrame = DeterministicCapture ? 0 : frameCounter;
 

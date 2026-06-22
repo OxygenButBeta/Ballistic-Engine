@@ -127,6 +127,11 @@ public sealed class Dx12DeferredLightingPass : IRenderPass, IDisposable {
             SpecClamp = specClampValue,
             SpecAaStrength = specAaValue,
             UseSsao = ctx.Doors.Ssao && ctx.PostFX.SSAOEnabled ? 1f : 0f,
+            // IBL diffuse ambient is suppressed when a GI pass will add its OWN diffuse indirect (no double-count).
+            // Aurora keys off here. Lumen (FAZ 0) does NOT yet — it contributes NO diffuse GI, so keying off
+            // ctx.LumenActiveThisFrame would blacken ambient prematurely (the scene would lose IBL diffuse with
+            // nothing replacing it). FAZ 6 (screen-probe GI = the first Lumen phase that adds diffuse) flips this to
+            // `&& !ctx.AuroraActiveThisFrame && !ctx.LumenActiveThisFrame`.
             UseIBLDiffuse = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_AURORA_FIX") != "0" && !ctx.AuroraActiveThisFrame) ? 1f : 0f,
             UseIBLSpecular = 0f,
             UseCapsuleShadows = ctx.CapsuleShadowsThisFrame ? 1f : 0f,

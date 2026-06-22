@@ -93,6 +93,12 @@ public sealed class Dx12FrameContext {
 
     public bool   AuroraActiveThisFrame { get; set; }
 
+    // Lumen GI active this frame (FAZ 0). Mirrors AuroraActiveThisFrame: set in BeginRender from
+    // Dx12LumenGiPass.WouldRun. FAZ 0 writes no GI, so the deferred pass does NOT yet key its IBL-diffuse
+    // suppression off this flag (that flips in FAZ 6 when screen-probe GI first contributes diffuse — see the
+    // // FAZ 6 marker in Dx12DeferredLightingPass.Record). Set now so later phases need no extra wiring.
+    public bool   LumenActiveThisFrame { get; set; }
+
     public int GrainFrame { get; set; }
 
     public int FrameCounter { get; set; }

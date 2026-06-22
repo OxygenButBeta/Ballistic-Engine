@@ -118,8 +118,13 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
     // The frame-level "Aurora runs" predicate, shared with the orchestrator (which mirrors it into
     // ctx.AuroraActiveThisFrame so the deferred pass suppresses its IBL diffuse ambient before this pass adds
     // its own diffuse indirect). Aurora is HW-RT only — no hidden SSGI fallback (plan gate #6).
+    // MUTUAL EXCLUSION with Lumen (FAZ 0): both passes register at event 500; only one may run per frame. Lumen
+    // takes precedence — when BALLISTIC_DX12_LUMEN=1 (Dx12LumenGiPass.Armed), Aurora YIELDS so the Lumen pass runs
+    // instead. When the Lumen door is unset (default), Armed is false → this term is a no-op and Aurora is byte-
+    // identical to before. This is the single arbitration point: Lumen.WouldRun does NOT inspect Aurora.
     public static bool WouldRun(Dx12FrameContext ctx) =>
-        !ctx.Doors.Minimal && Armed(ctx) && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
+        !ctx.Doors.Minimal && Armed(ctx) && !Dx12LumenGiPass.Armed(ctx)
+        && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
 
     public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx);
 
