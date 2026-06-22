@@ -16,8 +16,15 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     // Door off (and door-on-while-plumbing) => the flag is false => Enabled unchanged. See
     // Dx12FrameContext.RgV2OwnsReflections.
     public bool Enabled(Dx12FrameContext ctx) {
-        if (reflForceEnvUnread) { reflForceEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFLECTIONS"); reflForceEnvUnread = false; }
         if (ctx.RgV2OwnsReflections) return false;
+        return WouldRun(ctx);
+    }
+
+    // FAZ -1d-FINAL — the v1 run condition WITHOUT the RgV2OwnsReflections term, so the frame-context build
+    // can set RgV2OwnsReflections from the SAME predicate (v2 owns this pass IFF v1 would have run it). Keeps
+    // the cached-read side effect of BALLISTIC_DX12_REFLECTIONS identical to the old Enabled() body.
+    public bool WouldRun(Dx12FrameContext ctx) {
+        if (reflForceEnvUnread) { reflForceEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFLECTIONS"); reflForceEnvUnread = false; }
         if (ctx.Doors.Minimal) return false;
         if (reflForceEnv == "1") return true;
         if (reflForceEnv == "0") return false;

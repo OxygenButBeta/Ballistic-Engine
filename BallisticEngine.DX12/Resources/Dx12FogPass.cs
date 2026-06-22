@@ -13,8 +13,12 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
     // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives Fog itself; the v1
     // graph then SKIPS this pass via RgV2OwnsFog. Door off (and door-on-while-plumbing) => the flag is false
     // => Enabled unchanged. See Dx12FrameContext.RgV2OwnsFog.
-    public bool Enabled(Dx12FrameContext ctx) =>
-        ((!ctx.Doors.Minimal && ctx.PostFX.VolumetricEnabled) || ctx.Doors.Fog) && !ctx.RgV2OwnsFog;
+    public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx) && !ctx.RgV2OwnsFog;
+
+    // FAZ -1d-FINAL — the v1 run condition WITHOUT the RgV2OwnsFog term, so the frame-context build can set
+    // RgV2OwnsFog from the SAME predicate (v2 owns this pass IFF v1 would have run it this frame).
+    public static bool WouldRun(Dx12FrameContext ctx) =>
+        (!ctx.Doors.Minimal && ctx.PostFX.VolumetricEnabled) || ctx.Doors.Fog;
 
     // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12TaaPass.RecordV2). v2 imports SceneColor
     // (ReadWrite) + GBuffer (depth read) + ShadowMap, declares the access, then calls this to run the SAME

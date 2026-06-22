@@ -107,10 +107,14 @@ public sealed class Dx12FrameContext {
     // frame in event order. Default false => door-off byte-identical AND door-on unchanged (no v1 pass skips,
     // RunRenderGraphV2 does not run them — see the FAZ -1d-FINAL note there). The RecordV2 bodies + the v1
     // Enabled() `&& !RgV2Owns*` guards are in place, ready for that final wiring.
-    public bool RgV2OwnsSky { get; init; }
-    public bool RgV2OwnsAerialPersp { get; init; }
-    public bool RgV2OwnsTransparents { get; init; }
-    public bool RgV2OwnsFog { get; init; }
+    // NOTE (FAZ -1d-FINAL): these mid-frame owner flags are `set` (not `init`) because their conditions
+    // mirror the v1 passes' Enabled() predicates, several of which need the fully-built ctx (WouldRun/WillRun
+    // take a ctx). They are assigned in DX12HDRenderer's frame-context build immediately AFTER the object
+    // initializer (alongside ctx.AuroraActiveThisFrame), from `rgV2FullFrame && <the v1 run condition>`.
+    public bool RgV2OwnsSky { get; set; }
+    public bool RgV2OwnsAerialPersp { get; set; }
+    public bool RgV2OwnsTransparents { get; set; }
+    public bool RgV2OwnsFog { get; set; }
 
     // FAZ -1d-FINAL (reflections + GI group) — when render-graph v2 owns the WHOLE frame (v1 bypassed) it
     // will drive these too, in event order: [GI 500] (Aurora OR Lumen — mutually exclusive) -> Reflections(600).
@@ -126,9 +130,9 @@ public sealed class Dx12FrameContext {
     // Aurora/Lumen are still mutually exclusive (Aurora.WouldRun has `&& !Dx12LumenGiPass.Armed(ctx)`), so
     // at most one of the two GI flags is ever meaningfully set; both gate only the instance Enabled, not the
     // static WouldRun (which other code reads to mirror ctx.AuroraActiveThisFrame / ctx.LumenActiveThisFrame).
-    public bool RgV2OwnsReflections { get; init; }
-    public bool RgV2OwnsAuroraGi { get; init; }
-    public bool RgV2OwnsLumenGi { get; init; }
+    public bool RgV2OwnsReflections { get; set; }
+    public bool RgV2OwnsAuroraGi { get; set; }
+    public bool RgV2OwnsLumenGi { get; set; }
 
     // FAZ -1d-FINAL (lighting group) — when render-graph v2 owns the WHOLE frame (v1 bypassed) it will drive
     // the lighting/AO passes too, in event order: GTAO(200) -> RTAO(250) / CapsuleShadows(250) ->
@@ -142,10 +146,10 @@ public sealed class Dx12FrameContext {
     // Default false => door-off byte-identical AND door-on unchanged (no v1 pass skips, RunRenderGraphV2 does
     // not run them). The RecordV2 bodies + the v1 Enabled() `&& !RgV2Owns*` guards are in place, ready for
     // that final wiring.
-    public bool RgV2OwnsDeferred { get; init; }
-    public bool RgV2OwnsGtao { get; init; }
-    public bool RgV2OwnsRtao { get; init; }
-    public bool RgV2OwnsCapsuleShadow { get; init; }
+    public bool RgV2OwnsDeferred { get; set; }
+    public bool RgV2OwnsGtao { get; set; }
+    public bool RgV2OwnsRtao { get; set; }
+    public bool RgV2OwnsCapsuleShadow { get; set; }
 
     public Dx12RenderDoors      Doors    { get; init; }
     public PostProcessSettings  PostFX   { get; init; }

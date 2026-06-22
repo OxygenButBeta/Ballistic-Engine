@@ -36,6 +36,10 @@ public sealed class Dx12CapsuleShadowPass : IRenderPass, IDisposable {
         return n;
     }
 
+    // FAZ -1d-FINAL — public mirror of the Enabled() run condition, so the frame-context build can set
+    // RgV2OwnsCapsuleShadow from the SAME predicate (v2 owns this pass IFF v1 would have run it this frame).
+    public static bool WouldRun() => ActiveCasterCount() > 0;
+
     const int MaxCapsules = 64;
 
     [StructLayout(LayoutKind.Sequential)]

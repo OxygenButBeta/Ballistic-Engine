@@ -577,11 +577,19 @@ public sealed class DX12HDRenderer : HDRenderer
         // graph instance is reset+compiled+executed inside each BeginFrame/EndFrame window; Phase B
         // drives the Composite pass through it. Any v2 failure logs + falls back to v1 for that frame.
         rgV2Path = Environment.GetEnvironmentVariable("BALLISTIC_DX12_RG") == "1";
+        // FAZ -1d-FINAL — when the v2 path is armed, the v2 graph owns the WHOLE frame (deferred -> ... ->
+        // composite) by default. BALLISTIC_DX12_RG_FULLFRAME=0 falls back to the post-chain-only v2 (the
+        // FAZ -1c/-1d behaviour: v1 runs the mid-frame, v2 runs only TAA/FSR->MotionBlur->DoF->Composite) for
+        // A/B debugging. Door off (BALLISTIC_DX12_RG unset) => rgV2FullFrame is false => untouched / byte-id.
+        rgV2FullFrame = rgV2Path && Environment.GetEnvironmentVariable("BALLISTIC_DX12_RG_FULLFRAME") != "0";
         if (rgV2Path)
         {
             rg2 = new Dx12RgGraph(dev);
             Console.Error.WriteLine(
                 "[DX12] Render-graph v2 PATH ARMED (BALLISTIC_DX12_RG=1) — experimental, alongside v1.");
+            Console.Error.WriteLine(rgV2FullFrame
+                ? "[DX12] Render-graph v2: FULL-FRAME mode (deferred->...->composite in v2; v1 graph skips every owned pass). BALLISTIC_DX12_RG_FULLFRAME=0 for post-chain-only A/B."
+                : "[DX12] Render-graph v2: POST-CHAIN-ONLY mode (BALLISTIC_DX12_RG_FULLFRAME=0) — v1 runs the mid-frame, v2 owns only the TAA/FSR->MotionBlur->DoF->Composite tail.");
         }
 
         featureBlitter = new Dx12FeatureBlitter(dev, targetW, targetH);
@@ -634,45 +642,216 @@ public sealed class DX12HDRenderer : HDRenderer
         try
         {
             rg2.Reset();
-            // Under FSR the post chain operates on the upscaled FsrOutput (FSR's Record sets
-            // ctx.SceneColor = fsrOutput, and MotionBlur/DoF/Composite read ctx.SceneColor). So the
-            // SHARED "scene color" handle the chain threads through is FsrOutput's resource under FSR,
-            // and ctx.SceneColor's resource (== target) otherwise. Importing it ONCE and sharing the
-            // handle is what gives the DAG its TAA/FSR -> MotionBlur -> DoF -> Composite ordering.
-            Dx12OffscreenTarget chainScene = ctx.RgV2OwnsFsr ? ctx.FsrOutput : ctx.SceneColor;
-            Dx12RgHandle sceneColorH = rg2.ImportTexture("rg2.SceneColor", chainScene.RenderTarget,
+
+            // ── Scene-color handles ──────────────────────────────────────────────────────────────
+            // There are TWO logical scene-color resources across the frame:
+            //   • midScene  = ctx.Target — the HDR scene buffer the MID-FRAME passes write/read
+            //     (Deferred WRITES it; Sky/AP/Transparents/GI/Fog/Reflections ReadWrite it; TAA/FSR then read it).
+            //   • chainScene = the POST-chain scene: ctx.FsrOutput under FSR (FSR upscales midScene into it and
+            //     reassigns ctx.SceneColor = fsrOutput), else ctx.Target — the SAME resource as midScene.
+            // When NOT under FSR, chainScene == midScene == ctx.Target, so they MUST be the SAME imported handle
+            // (importing the same ID3D12Resource twice mints two independent entries and SEVERS the DAG edge
+            // between the mid-frame writers and the post-chain readers). Under FSR they are different resources,
+            // and the FSR pass bridges them (reads midSceneH, writes chainScene). Importing each resource ONCE
+            // and threading the shared handle is what linearizes the whole frame via RAW/WAW edges.
+            Dx12RgHandle midSceneH = rg2.ImportTexture("rg2.SceneColor.Hdr", ctx.Target.RenderTarget,
                 Vortice.Direct3D12.ResourceStates.PixelShaderResource);
+            Dx12OffscreenTarget chainScene = ctx.RgV2OwnsFsr ? ctx.FsrOutput : ctx.Target;
+            Dx12RgHandle sceneColorH = ctx.RgV2OwnsFsr
+                ? rg2.ImportTexture("rg2.SceneColor.Post", chainScene.RenderTarget,
+                    Vortice.Direct3D12.ResourceStates.PixelShaderResource)
+                : midSceneH;
             Dx12RgHandle ldrH = rg2.ImportTexture("rg2.Ldr", ctx.Ldr.RenderTarget,
                 Vortice.Direct3D12.ResourceStates.RenderTarget);
 
-            // FAZ -1d-FINAL (atmosphere group) — the Sky(350)/AerialPerspective(400)/Transparents(450)/
-            // Fog(550) passes are PLUMBED (RecordV2 + RgV2Owns* ctx flags + v1 Enabled() guards) but NOT
-            // wired in here yet, and on purpose. This block runs at the END of the frame, AFTER v1's whole
-            // graph (graph.ExecuteGraph). The atmosphere passes live in the MIDDLE of the frame, before the
-            // still-v1 GlobalIllumination(500) and Reflections(600). Adding them here would run them AFTER
-            // GI/Reflections -> wrong output (sky behind GI, fog after reflections, etc.). They get PREPENDED
-            // here in event order (Sky -> AerialPerspective -> Transparents -> GI -> Fog -> post chain) ONLY
-            // when v1 is bypassed and the v2 graph owns the WHOLE frame. The RgV2Owns* flags stay false until
-            // then (set in the frame-context build), so nothing changes today. The post chain below is the
-            // literal TAIL of the frame, which is why it is order-safe to append now.
+            // ── Mid-frame passes (FAZ -1d-FINAL) ─────────────────────────────────────────────────
+            // When rgV2FullFrame owns the whole frame, prepend the mid-frame passes BEFORE the post chain, in
+            // EVENT ORDER: GTAO(200) -> RTAO(250) -> CapsuleShadow(250) -> Deferred(300) -> Sky(350) ->
+            // AerialPerspective(400) -> Transparents(450) -> [Aurora|Lumen](500) -> Fog(550) -> Reflections(600).
+            // Each is added IFF its RgV2Owns* flag is set (the SAME bool the ctx flag block computed from the
+            // pass's v1 run condition), so a pass is in v2 IFF it would have run in v1 this frame.
+            //
+            // DAG ORDERING:
+            //   • AO chain: GTAO WRITES aoH; RTAO ReadWrites aoH (RAW on GTAO -> orders after it); Deferred
+            //     READS aoH (RAW on the last AO writer) AND WRITES midSceneH. So GTAO -> RTAO -> Deferred is
+            //     enforced purely by the aoH handle (no event numbers needed at execute time).
+            //   • CapsuleShadow produces a mask Deferred samples, but it does not touch the Ao or scene-color
+            //     handles, and plain READS of gbufferH by both create no edge. We force CapsuleShadow ->
+            //     Deferred by declaring CapsuleShadow a (nominal) WRITER of gbufferH at the SAME state it is
+            //     imported in (PixelShaderRead) — that mints a WAW/RAW token edge with no real barrier (equal
+            //     state => deriver emits nothing), so Deferred's gbufferH read RAW-depends on it.
+            //   • SceneColor chain: Deferred is midSceneH's FIRST writer; Sky/AP/Transparents/GI/Fog/Reflections
+            //     each ReadWrite midSceneH -> each RAW-depends on the prior writer and becomes the new last
+            //     writer, linearizing them in declared (== event) order. TAA/FSR then read midSceneH (the last
+            //     mid-frame writer), and the post chain proceeds as before. Composite reads sceneColorH LAST.
+            //
+            // Imported ONCE for DAG edges (the bodies own the real GPU transitions; v2 emits no import barriers):
+            //   aoH        — GTAO writes / RTAO RW / Deferred reads (orders the AO chain into Deferred)
+            //   gbufferH   — read by GTAO/RTAO/CapsuleShadow/Deferred (reads alone don't order; see below)
+            //   capMaskH   — CapsuleShadow writes / Deferred reads (orders CapsuleShadow before Deferred)
+            bool anyMid = ctx.RgV2OwnsGtao || ctx.RgV2OwnsRtao || ctx.RgV2OwnsCapsuleShadow ||
+                          ctx.RgV2OwnsDeferred || ctx.RgV2OwnsSky || ctx.RgV2OwnsAerialPersp ||
+                          ctx.RgV2OwnsTransparents || ctx.RgV2OwnsAuroraGi || ctx.RgV2OwnsLumenGi ||
+                          ctx.RgV2OwnsFog || ctx.RgV2OwnsReflections;
+            if (anyMid)
+            {
+                // The Ao target resource (GTAO's gtaoA) — the handle that orders GTAO -> RTAO -> Deferred.
+                Dx12RgHandle aoH = rg2.ImportTexture("rg2.Ao", gtaoPass.AoTarget.RenderTarget,
+                    Vortice.Direct3D12.ResourceStates.PixelShaderResource);
+                // The G-buffer depth resource — a shared read handle so every mid-frame consumer references the
+                // same imported entry (purely declarative; the bodies own the depth/color SRV transitions).
+                Dx12RgHandle gbufferH = rg2.ImportTexture("rg2.GBuffer", ctx.GBuffer.DepthResource,
+                    Vortice.Direct3D12.ResourceStates.PixelShaderResource);
+                // The capsule-shadow mask resource (if the pass runs) — written by CapsuleShadow, read by
+                // Deferred, so the handle forces CapsuleShadow before Deferred (reads of gbufferH alone would
+                // not order them). The mask resource is self-owned by the pass.
+
+                if (ctx.RgV2OwnsGtao)
+                {
+                    // GTAO writes the Ao target (RT) — first writer of aoH; reads the G-buffer depth.
+                    rg2.AddPass("GTAO", b =>
+                    {
+                        b.Read(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(aoH, Dx12RgResourceState.RenderTarget);
+                    }, ec => gtaoPass.RecordV2(ctx));
+                }
+
+                if (ctx.RgV2OwnsRtao)
+                {
+                    // RTAO reads + writes the Ao target (it dispatches to a UAV then copies into gtaoA) ->
+                    // ReadWrite aoH RAW-depends on GTAO and becomes the Ao chain's new last writer.
+                    rg2.AddPass("RTAO", b =>
+                    {
+                        b.Read(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                        b.ReadWrite(aoH, Dx12RgResourceState.RenderTarget);
+                    }, ec => rtaoPass.RecordV2(ctx));
+                }
+
+                if (ctx.RgV2OwnsCapsuleShadow)
+                {
+                    // CapsuleShadows reads the G-buffer and writes its own (self-owned) mask that Deferred
+                    // samples. It touches neither Ao nor scene color, so to order it BEFORE Deferred we declare
+                    // a nominal gbufferH write at the import state (PixelShaderRead) — a token WAW/RAW edge with
+                    // no real barrier (equal state). Deferred's gbufferH read then RAW-depends on it.
+                    rg2.AddPass("CapsuleShadows", b =>
+                    {
+                        b.Read(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                    }, ec => capsuleShadowPass.RecordV2(ctx));
+                }
+
+                if (ctx.RgV2OwnsDeferred)
+                {
+                    // Deferred READS Ao + G-buffer (+ shadow map + RT mask, owned by its body) and WRITES the
+                    // HDR scene -> first writer of midSceneH. Reading aoH RAW-depends on the AO chain's last
+                    // writer (RTAO if present, else GTAO); reading gbufferH RAW-depends on CapsuleShadows'
+                    // gbufferH write (if present) — so the whole 200/250 group orders before Deferred(300).
+                    rg2.AddPass("Deferred", b =>
+                    {
+                        b.Read(aoH, Dx12RgResourceState.PixelShaderRead);
+                        b.Read(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(midSceneH, Dx12RgResourceState.RenderTarget);
+                    }, ec => deferredPass.RecordV2(ctx));
+                }
+
+                if (ctx.RgV2OwnsSky)
+                {
+                    // Sky ReadWrites the HDR scene (draws sky where depth is far) -> RAW on Deferred, new last writer.
+                    rg2.AddPass("Sky", b =>
+                    {
+                        b.Read(midSceneH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(midSceneH, Dx12RgResourceState.RenderTarget);
+                    }, ec => skyPass.RecordV2(ctx));
+                }
+
+                if (ctx.RgV2OwnsAerialPersp)
+                {
+                    rg2.AddPass("AerialPerspective", b =>
+                    {
+                        b.Read(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                        b.Read(midSceneH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(midSceneH, Dx12RgResourceState.RenderTarget);
+                    }, ec => apPass.RecordV2(ctx));
+                }
+
+                if (ctx.RgV2OwnsTransparents)
+                {
+                    rg2.AddPass("Transparents", b =>
+                    {
+                        b.Read(midSceneH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(midSceneH, Dx12RgResourceState.RenderTarget);
+                    }, ec => transparentsPass.RecordV2(ctx));
+                }
+
+                // GI (event 500) — Aurora and Lumen are MUTUALLY EXCLUSIVE (at most one flag set). It adds its
+                // indirect into the HDR scene (additive) -> ReadWrite midSceneH, ordering after Transparents and
+                // before Fog/Reflections, matching v1 event order.
+                if (ctx.RgV2OwnsAuroraGi)
+                {
+                    rg2.AddPass("AuroraGI", b =>
+                    {
+                        b.Read(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                        b.Read(midSceneH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(midSceneH, Dx12RgResourceState.RenderTarget);
+                    }, ec => auroraGiPass.RecordV2(ctx));
+                }
+                else if (ctx.RgV2OwnsLumenGi)
+                {
+                    rg2.AddPass("LumenGI", b =>
+                    {
+                        b.Read(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                        b.Read(midSceneH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(midSceneH, Dx12RgResourceState.RenderTarget);
+                    }, ec => lumenGiPass.RecordV2(ctx));
+                }
+
+                if (ctx.RgV2OwnsFog)
+                {
+                    rg2.AddPass("Fog", b =>
+                    {
+                        b.Read(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                        b.Read(midSceneH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(midSceneH, Dx12RgResourceState.RenderTarget);
+                    }, ec => fogPass.RecordV2(ctx));
+                }
+
+                if (ctx.RgV2OwnsReflections)
+                {
+                    rg2.AddPass("Reflections", b =>
+                    {
+                        b.Read(gbufferH, Dx12RgResourceState.PixelShaderRead);
+                        b.Read(midSceneH, Dx12RgResourceState.PixelShaderRead);
+                        b.Write(midSceneH, Dx12RgResourceState.RenderTarget);
+                    }, ec => reflectionsPass.RecordV2(ctx));
+                }
+            }
+
+            // ── Post chain (FAZ -1c/-1d) ─────────────────────────────────────────────────────────
+            // TAA/FSR -> MotionBlur -> DoF -> Composite. TAA/FSR read midSceneH (the last mid-frame writer, or
+            // the imported HDR scene when no mid-frame pass ran in post-chain-only mode) and produce the
+            // post-chain scene (sceneColorH); under FSR sceneColorH is a distinct FsrOutput handle, otherwise it
+            // IS midSceneH so the chain keeps threading the same resource.
 
             if (ctx.RgV2OwnsFsr)
             {
-                // FSR reads Target (= ctx.SceneColor on entry) + GBuffer and WRITES the FsrOutput handle.
-                // Declaring sceneColorH (== FsrOutput) as ReadWrite makes FSR the chain's first writer, so
-                // MotionBlur/DoF (also ReadWrite sceneColorH) and Composite (Read) order AFTER it.
+                // FSR reads the HDR scene (midSceneH == ctx.Target, the mid-frame's last writer) + GBuffer and
+                // WRITES the upscaled FsrOutput (sceneColorH, a DISTINCT resource under FSR). Reading midSceneH
+                // RAW-depends on Reflections/Fog/.../Deferred (or, in post-chain-only mode, the imported HDR
+                // scene); writing sceneColorH makes FSR the post-chain's first writer (MotionBlur/DoF/Composite
+                // follow on sceneColorH).
                 rg2.AddPass("FSR", b =>
                 {
-                    b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
+                    b.Read(midSceneH, Dx12RgResourceState.PixelShaderRead);
                     b.Write(sceneColorH, Dx12RgResourceState.RenderTarget);
                 }, ec => fsrPass.RecordV2(ctx));
             }
             else if (ctx.RgV2OwnsTaa)
             {
+                // Non-FSR: sceneColorH IS midSceneH. TAA reads SceneColor as SRV and writes it as RT -> declare
+                // it ReadWrite so the DAG marks TAA as SceneColor's last writer (RAW on the last mid-frame
+                // writer when full-frame, or on the imported HDR scene in post-chain-only mode).
                 rg2.AddPass("TAA", b =>
                 {
-                    // TAA reads SceneColor as SRV and writes it as RT -> declare it ReadWrite so the DAG
-                    // marks TAA as SceneColor's last writer (the next pass's Read/Write then depends on TAA).
                     b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
                     b.Write(sceneColorH, Dx12RgResourceState.RenderTarget);
                 }, ec => taaPass.RecordV2(ctx));
@@ -717,13 +896,32 @@ public sealed class DX12HDRenderer : HDRenderer
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[DX12] Render-graph v2 (post chain) FAILED — falling back to v1 inline this frame: {ex.GetType().Name}: {ex.Message}");
-            // v1 order: TAA/FSR -> MotionBlur -> DoF -> Composite.
-            try { if (ctx.RgV2OwnsFsr) fsrPass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
-            try { if (ctx.RgV2OwnsTaa) taaPass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
-            try { if (ctx.RgV2OwnsMotionBlur) motionBlurPass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
-            try { if (ctx.RgV2OwnsDof) dofPass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
-            try { compositePass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
+            Console.Error.WriteLine($"[DX12] Render-graph v2 FAILED — falling back to v1 inline this frame: {ex.GetType().Name}: {ex.Message}");
+            // Best-effort recovery in v1 EVENT ORDER. Most v2 failures throw in setup/Compile (before any
+            // body runs), so re-running the whole owned chain reconstructs the frame. Each guarded by its
+            // owner flag so we run exactly the passes v2 was meant to drive (matches the v1 Enabled() set),
+            // each in its own try so one failure does not abort the rest. The mid-frame group is only owned
+            // when rgV2FullFrame; in post-chain-only mode those flags are false and we fall through to the
+            // post chain exactly like before.
+            // Mid-frame: GTAO -> RTAO -> CapsuleShadow -> Deferred -> Sky -> AerialPersp -> Transparents ->
+            //            [Aurora|Lumen] -> Fog -> Reflections.
+            try { if (ctx.RgV2OwnsGtao) gtaoPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsRtao) rtaoPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsCapsuleShadow) capsuleShadowPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsDeferred) deferredPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsSky) skyPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsAerialPersp) apPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsTransparents) transparentsPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsAuroraGi) auroraGiPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsLumenGi) lumenGiPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsFog) fogPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsReflections) reflectionsPass.Record(ctx); } catch { /* best-effort */ }
+            // Post chain: TAA/FSR -> MotionBlur -> DoF -> Composite.
+            try { if (ctx.RgV2OwnsFsr) fsrPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsTaa) taaPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsMotionBlur) motionBlurPass.Record(ctx); } catch { /* best-effort */ }
+            try { if (ctx.RgV2OwnsDof) dofPass.Record(ctx); } catch { /* best-effort */ }
+            try { compositePass.Record(ctx); } catch { /* best-effort */ }
         }
     }
 
@@ -781,6 +979,10 @@ public sealed class DX12HDRenderer : HDRenderer
     // v1 graph. Default OFF => v1 owns the whole frame, byte-identical. When armed, v2 drives the
     // Composite pass (Phase B) and the v1 composite pass is skipped (see Dx12FrameContext.RgV2OwnsComposite).
     bool rgV2Path;
+    // FAZ -1d-FINAL — when true (default once the v2 door is on; BALLISTIC_DX12_RG_FULLFRAME=0 disables) the
+    // v2 graph runs the WHOLE frame from Deferred(300) through Composite(700); the v1 graph then skips every
+    // owned pass (each pass's Enabled() returns false via its RgV2Owns* flag). False => post-chain-only v2.
+    bool rgV2FullFrame;
     Dx12RgGraph rg2;
 
     bool skyTlutOn;
@@ -1826,6 +2028,27 @@ public sealed class DX12HDRenderer : HDRenderer
         // LumenActive is true. FAZ 0 writes no GI, so the deferred IBL-diffuse suppression does NOT yet key off
         // this flag (see the // FAZ 6 marker in Dx12DeferredLightingPass.Record).
         ctx.LumenActiveThisFrame = Dx12LumenGiPass.WouldRun(ctx);
+
+        // FAZ -1d-FINAL — full-frame v2 ownership. When rgV2FullFrame is on, the v2 graph (RunRenderGraphV2)
+        // runs the WHOLE frame from Deferred(300) -> ... -> Reflections(600), then the existing post chain. A
+        // pass is owned by v2 IFF it would have run in v1 THIS frame, so each flag is `rgV2FullFrame && <the
+        // SAME run condition the pass's Enabled() uses>` (minus the RgV2Owns* self-term). The v1 graph then
+        // skips every owned pass (its Enabled() returns false), and RunRenderGraphV2 adds exactly the owned
+        // passes — flag and "add to v2" use the identical bool, so a pass can never vanish from the frame.
+        //
+        // rgV2FullFrame == false (door off, or BALLISTIC_DX12_RG_FULLFRAME=0) => all stay false => the
+        // mid-frame passes run in v1 exactly as today (post-chain-only v2, or fully byte-identical v1).
+        ctx.RgV2OwnsGtao           = rgV2FullFrame && doors.Ssao && PostFX.SSAOEnabled;
+        ctx.RgV2OwnsRtao           = rgV2FullFrame && rtaoPass.WillRun(doors, PostFX, dxr, dev);
+        ctx.RgV2OwnsCapsuleShadow  = rgV2FullFrame && Dx12CapsuleShadowPass.WouldRun();
+        ctx.RgV2OwnsDeferred       = rgV2FullFrame;
+        ctx.RgV2OwnsSky            = rgV2FullFrame && doors.Sky;
+        ctx.RgV2OwnsAerialPersp    = rgV2FullFrame && doors.AerialPersp && ProceduralSky.Active is not null;
+        ctx.RgV2OwnsTransparents   = rgV2FullFrame;
+        ctx.RgV2OwnsAuroraGi       = rgV2FullFrame && ctx.AuroraActiveThisFrame;
+        ctx.RgV2OwnsLumenGi        = rgV2FullFrame && ctx.LumenActiveThisFrame;
+        ctx.RgV2OwnsFog            = rgV2FullFrame && Dx12FogPass.WouldRun(ctx);
+        ctx.RgV2OwnsReflections    = rgV2FullFrame && reflectionsPass.WouldRun(ctx);
 
         ctx.GrainFrame = DeterministicCapture ? 0 : frameCounter;
 
