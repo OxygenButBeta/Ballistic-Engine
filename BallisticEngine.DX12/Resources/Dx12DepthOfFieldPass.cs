@@ -10,7 +10,24 @@ public sealed class Dx12DepthOfFieldPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.PostProcess;
     public string Name => "DepthOfField";
 
-    public bool Enabled(Dx12FrameContext ctx) => ctx.PostFX.DofEnabled && !ctx.DeterministicCapture;
+    // FAZ -1d — when render-graph v2 owns Depth of Field (BALLISTIC_DX12_RG=1) the v1 graph SKIPS this
+    // pass; v2 drives Record() itself. Door off (default) => RgV2OwnsDof is false => Enabled unchanged.
+    public bool Enabled(Dx12FrameContext ctx) =>
+        ctx.PostFX.DofEnabled && !ctx.DeterministicCapture && !ctx.RgV2OwnsDof;
+
+    // FAZ -1d — render-graph v2 entry point (mirrors Dx12TaaPass.RecordV2). v2 imports SceneColor
+    // (ReadWrite) + GBuffer (depth read), declares the access, then calls this to run the SAME record body
+    // (byte-identical to the v1 path). The v1 graph normally derives the GBuffer depth and SceneColor ->
+    // shader-read transitions when ctx.BarriersDerived is on (the body then skips its own — see the
+    // `if (!ctx.BarriersDerived)` guard in Record). Under v2 the v1 deriver is bypassed (the pass is skipped
+    // in v1) AND v2 emits no barrier for the imports (by design — equal states), so the body MUST own those
+    // transitions. Force them here so Record() never reads SceneColor or the GBuffer depth in the wrong
+    // state regardless of ctx.BarriersDerived.
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.SceneColor.ColorToShaderResource();
+        ctx.GBuffer.ToShaderResource();
+        Record(ctx);
+    }
 
     public void Declare(Dx12PassBuilder b) {
         b.Read(b.Resource("GBuffer"));

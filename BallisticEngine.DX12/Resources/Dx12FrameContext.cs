@@ -86,6 +86,15 @@ public sealed class Dx12FrameContext {
     // behaviour is byte-identical (v1 owns TAA). Only set when TAA would run at all (!FsrActive).
     public bool RgV2OwnsTaa { get; init; }
 
+    // FAZ -1d — render-graph v2 (BALLISTIC_DX12_RG=1) drives the remaining PostProcess leaf passes this
+    // frame (Motion Blur / Depth of Field / FSR), so the matching v1 pass's Enabled() returns false (skip)
+    // to avoid running them twice. Each mirrors RgV2OwnsTaa: default false → door-off is byte-identical;
+    // set only when that pass would actually run (MotionBlur/DoF gate on PostFX-enabled & !deterministic,
+    // FSR on FsrActive — see where these are assigned in DX12HDRenderer's frame-context build).
+    public bool RgV2OwnsMotionBlur { get; init; }
+    public bool RgV2OwnsDof { get; init; }
+    public bool RgV2OwnsFsr { get; init; }
+
     public Dx12RenderDoors      Doors    { get; init; }
     public PostProcessSettings  PostFX   { get; init; }
     public RenderStats          Stats    { get; init; }

@@ -589,64 +589,110 @@ public sealed class DX12HDRenderer : HDRenderer
         featureBridge = new Dx12RenderFeatureBridge(graph, featureRecorder);
     }
 
-    // FAZ -1c/-1d — render-graph v2 frame orchestration (Phase B: TAA -> Composite).
+    // FAZ -1c/-1d — render-graph v2 frame orchestration (Phase B: the WHOLE PostProcess->Composite chain).
     //
     // Proves the full v2 flow (Reset -> AddPass -> Compile -> Execute) runs INSIDE the open
-    // BeginFrame/EndFrame window. The v2 Composite pass IMPORTS the same SceneColor (read) and Ldr
-    // (write) ID3D12Resources the v1 pass uses and DECLARES the matching access, so the v2 DAG keeps
-    // the pass alive (an imported write is observable) and the import/Compile/Resolve/per-pass-record
-    // plumbing is exercised end-to-end. The execute callbacks run the SAME record bodies, so the output
-    // is byte-identical to v1 (same shaders / inputs / constants).
+    // BeginFrame/EndFrame window. The v2 passes IMPORT the same SceneColor (read/write) + Ldr (write)
+    // ID3D12Resources the v1 passes use and DECLARE the matching access, so the v2 DAG keeps each pass
+    // alive (an imported write is observable) and the import/Compile/Resolve/per-pass-record plumbing is
+    // exercised end-to-end. The execute callbacks run the SAME record bodies, so the output is
+    // byte-identical to v1 (same shaders / inputs / constants).
     //
-    // FAZ -1d — TAA joins the v2 graph BEFORE Composite (TAA's PostProcess event runs earlier than
-    // Composite). SceneColor is IMPORTED ONCE here and the SAME handle is shared by both passes: TAA
-    // ReadWrites it (it resolves TAA into scene color using history), Composite Reads it. Because the
-    // DAG keys edges on the resource HANDLE id (not the import name — ImportTexture does NOT dedup by
-    // name, so importing twice would create two unrelated entries and lose the dependency), sharing the
-    // one handle makes the compiler emit a RAW edge TAA -> Composite and ALWAYS order TAA first. TAA is
-    // only added when ctx.RgV2OwnsTaa (i.e. !FsrActive); under FSR there is no TAA pass and Composite
-    // runs alone, exactly as v1 would skip TAA.
+    // POST-CHAIN ORDER — mirrors the v1 graph, which OrderBy(Event) is STABLE so PostProcess passes run in
+    // registration order (TAA, FSR, MotionBlur, DoF), then Composite (Composite event). v2 reproduces:
+    //   non-FSR:  TAA -> MotionBlur -> DoF -> Composite          (TAA resolves into SceneColor)
+    //   FSR:      FSR -> MotionBlur -> DoF -> Composite          (FSR upscales Target into FsrOutput)
+    // TAA and FSR are MUTUALLY EXCLUSIVE (FsrActive disables TAA, in both v1 and v2): exactly one of
+    // RgV2OwnsTaa / RgV2OwnsFsr is set per frame.
     //
-    // BARRIER SAFETY: the imported states are passed EXACTLY equal to each declared access's D3D12
-    // mapping (SceneColor=PixelShaderResource for PixelShaderRead, Ldr=RenderTarget for RenderTarget),
-    // so EmitBarriers sees CurrentState == want and emits NOTHING — the record bodies retain FULL
-    // ownership of the real resource transitions (via Dx12OffscreenTarget / Dx12GBuffer state tracking,
-    // exactly as in v1). v2 thus adds no GPU work of its own here beyond the record bodies it drives.
-    // (TAA briefly transitions SceneColor RT<->SRV internally; the post-TAA state it leaves is the same
-    // PixelShaderResource Composite's RecordV2 re-asserts, so the shared handle stays consistent.)
+    // DAG EDGE MECHANICS — the compiler keys edges on the resource HANDLE id (not import name; ImportTexture
+    // does NOT dedup by name, so importing twice creates two unrelated entries and loses the dependency).
+    // So SceneColor is IMPORTED ONCE and the captured handle is SHARED:
+    //   * TAA ReadWrites sceneColorH (resolves TAA into scene color using history) -> last writer.
+    //   * MotionBlur ReadWrites sceneColorH -> RAW-depends on TAA, becomes new last writer.
+    //   * DoF ReadWrites sceneColorH -> RAW-depends on MotionBlur, becomes new last writer.
+    //   * Composite Reads sceneColorH -> depends on the last writer (DoF, else MotionBlur, else TAA, else
+    //     the imported state) -> always ordered LAST. Each ReadWrite chains the next, so the topo order is
+    //     forced even though every pass shares the Composite event tie-break.
+    // FSR is the exception: it WRITES a SEPARATE FsrOutput target, not SceneColor. So FSR is imported on its
+    // own handle and Composite reads THAT. To keep MotionBlur/DoF after FSR (they operate on the upscaled
+    // image — FSR's Record reassigns ctx.SceneColor = fsrOutput, so their RecordV2 reads fsrOutput via
+    // ctx.SceneColor), the v2 SceneColor handle imported for them is FsrOutput's resource under FSR, and
+    // Composite reads that same handle. (Under FSR with no MotionBlur/DoF, Composite reads fsrOutputH and
+    // FSR is its sole producer — same as v1 where Composite reads the FSR result.)
     //
-    // FALLBACK: any exception logs and runs the v1 bodies inline so the frame is never lost.
+    // BARRIER SAFETY: the imported states are passed EXACTLY equal to each declared access's D3D12 mapping
+    // (SceneColor/FsrOutput=PixelShaderResource for PixelShaderRead, Ldr=RenderTarget for RenderTarget), so
+    // EmitBarriers sees CurrentState == want and emits NOTHING — the record bodies retain FULL ownership of
+    // the real resource transitions (via Dx12OffscreenTarget / Dx12GBuffer state tracking, exactly as in v1).
+    // v2 thus adds no GPU work of its own here beyond the record bodies it drives. Each RecordV2 re-asserts
+    // the input states its body needs (see each pass's RecordV2), so the shared handle stays consistent.
+    //
+    // FALLBACK: any exception logs and runs the v1 bodies inline (in the v1 order) so the frame is never lost.
     void RunRenderGraphV2(Dx12FrameContext ctx)
     {
         try
         {
             rg2.Reset();
-            // Import the shared resources ONCE, capture the handles, then have both passes Read/Write
-            // the captured handles (the clean shape — avoids double-import and gives the DAG the
-            // TAA->Composite dependency through one SceneColor entry).
-            Dx12RgHandle sceneColorH = rg2.ImportTexture("rg2.SceneColor", ctx.SceneColor.RenderTarget,
+            // Under FSR the post chain operates on the upscaled FsrOutput (FSR's Record sets
+            // ctx.SceneColor = fsrOutput, and MotionBlur/DoF/Composite read ctx.SceneColor). So the
+            // SHARED "scene color" handle the chain threads through is FsrOutput's resource under FSR,
+            // and ctx.SceneColor's resource (== target) otherwise. Importing it ONCE and sharing the
+            // handle is what gives the DAG its TAA/FSR -> MotionBlur -> DoF -> Composite ordering.
+            Dx12OffscreenTarget chainScene = ctx.RgV2OwnsFsr ? ctx.FsrOutput : ctx.SceneColor;
+            Dx12RgHandle sceneColorH = rg2.ImportTexture("rg2.SceneColor", chainScene.RenderTarget,
                 Vortice.Direct3D12.ResourceStates.PixelShaderResource);
             Dx12RgHandle ldrH = rg2.ImportTexture("rg2.Ldr", ctx.Ldr.RenderTarget,
                 Vortice.Direct3D12.ResourceStates.RenderTarget);
 
-            if (ctx.RgV2OwnsTaa)
+            if (ctx.RgV2OwnsFsr)
+            {
+                // FSR reads Target (= ctx.SceneColor on entry) + GBuffer and WRITES the FsrOutput handle.
+                // Declaring sceneColorH (== FsrOutput) as ReadWrite makes FSR the chain's first writer, so
+                // MotionBlur/DoF (also ReadWrite sceneColorH) and Composite (Read) order AFTER it.
+                rg2.AddPass("FSR", b =>
+                {
+                    b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
+                    b.Write(sceneColorH, Dx12RgResourceState.RenderTarget);
+                }, ec => fsrPass.RecordV2(ctx));
+            }
+            else if (ctx.RgV2OwnsTaa)
             {
                 rg2.AddPass("TAA", b =>
                 {
                     // TAA reads SceneColor as SRV and writes it as RT -> declare it ReadWrite so the DAG
-                    // marks TAA as SceneColor's last writer (Composite's Read then depends on TAA).
+                    // marks TAA as SceneColor's last writer (the next pass's Read/Write then depends on TAA).
                     b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
                     b.Write(sceneColorH, Dx12RgResourceState.RenderTarget);
-                }, ec =>
+                }, ec => taaPass.RecordV2(ctx));
+            }
+
+            if (ctx.RgV2OwnsMotionBlur)
+            {
+                // MotionBlur reads SceneColor + GBuffer and writes SceneColor back -> ReadWrite the shared
+                // handle so it RAW-depends on TAA/FSR and becomes the new last writer (DoF/Composite follow).
+                rg2.AddPass("MotionBlur", b =>
                 {
-                    // Run the SAME TAA record body (byte-identical to v1). The body manages its own
-                    // resource states internally, so v2 emitted no barrier for the import.
-                    taaPass.RecordV2(ctx);
-                });
+                    b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
+                    b.Write(sceneColorH, Dx12RgResourceState.RenderTarget);
+                }, ec => motionBlurPass.RecordV2(ctx));
+            }
+
+            if (ctx.RgV2OwnsDof)
+            {
+                // DoF reads SceneColor + GBuffer depth and writes SceneColor back -> ReadWrite the shared
+                // handle so it RAW-depends on the prior writer and becomes the new last writer.
+                rg2.AddPass("DepthOfField", b =>
+                {
+                    b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
+                    b.Write(sceneColorH, Dx12RgResourceState.RenderTarget);
+                }, ec => dofPass.RecordV2(ctx));
             }
 
             rg2.AddPass("Composite", b =>
             {
+                // Reads the shared scene-color handle (SceneColor non-FSR, FsrOutput under FSR) -> depends on
+                // its last writer, so Composite is always ordered LAST.
                 b.Read(sceneColorH, Dx12RgResourceState.PixelShaderRead);
                 b.Write(ldrH, Dx12RgResourceState.RenderTarget);
             }, ec =>
@@ -660,8 +706,12 @@ public sealed class DX12HDRenderer : HDRenderer
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[DX12] Render-graph v2 (TAA/Composite) FAILED — falling back to v1 inline this frame: {ex.GetType().Name}: {ex.Message}");
+            Console.Error.WriteLine($"[DX12] Render-graph v2 (post chain) FAILED — falling back to v1 inline this frame: {ex.GetType().Name}: {ex.Message}");
+            // v1 order: TAA/FSR -> MotionBlur -> DoF -> Composite.
+            try { if (ctx.RgV2OwnsFsr) fsrPass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
             try { if (ctx.RgV2OwnsTaa) taaPass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
+            try { if (ctx.RgV2OwnsMotionBlur) motionBlurPass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
+            try { if (ctx.RgV2OwnsDof) dofPass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
             try { compositePass.Record(ctx); } catch { /* v1 fallback already best-effort */ }
         }
     }
@@ -1735,6 +1785,13 @@ public sealed class DX12HDRenderer : HDRenderer
             // FAZ -1d — v2 also drives TAA, but ONLY when TAA would run at all (TAA never runs under
             // FSR, so v1 keeps ownership there and just skips like today). v1 TAA pass skips itself.
             RgV2OwnsTaa = rgV2Path && rg2 != null && !fsrActive,
+            // FAZ -1d — v2 drives the rest of the PostProcess leaf chain. Each owner flag mirrors the v1
+            // pass's Enabled() predicate so v2 runs the pass IFF v1 would have, then the v1 pass skips
+            // itself (Enabled() && !RgV2Owns*). MotionBlur/DoF gate on PostFX-enabled & !deterministic;
+            // FSR on fsrActive. Door off => all false => v1 owns everything, byte-identical.
+            RgV2OwnsMotionBlur = rgV2Path && rg2 != null && PostFX.MotionBlurEnabled && !DeterministicCapture,
+            RgV2OwnsDof = rgV2Path && rg2 != null && PostFX.DofEnabled && !DeterministicCapture,
+            RgV2OwnsFsr = rgV2Path && rg2 != null && fsrActive,
             DeterministicCapture = DeterministicCapture,
             AoResult = gtaoPass.ResultSrvCpu,
             AoToNonPixelShaderResource = () => gtaoPass.AoTarget.ColorToNonPixelShaderResource(),
