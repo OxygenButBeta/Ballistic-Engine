@@ -123,7 +123,7 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
     // instead. When the Lumen door is unset (default), Armed is false → this term is a no-op and Aurora is byte-
     // identical to before. This is the single arbitration point: Lumen.WouldRun does NOT inspect Aurora.
     public static bool WouldRun(Dx12FrameContext ctx) =>
-        !ctx.Doors.Minimal && Armed(ctx) && !Dx12LumenGiPass.Armed(ctx)
+        !ctx.Doors.Minimal && Armed(ctx) && !Dx12LumenGiPass.ScenePathArmed(ctx)
         && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
 
     // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives Aurora GI itself; the v1

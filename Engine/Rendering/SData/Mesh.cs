@@ -18,6 +18,12 @@ public class Mesh : BObject
     public readonly SkeletonData Skeleton;
     public readonly Vector4i[] BoneIndices;
     public readonly Vector4[] BoneWeights;
+
+    // Per-mesh signed distance field (generated offline at import, FAZ 1; persisted in artifact v8). MESH-LOCAL
+    // space (same space as Vertices). The global distance field (Lumen FAZ 2, Dx12GlobalSdf) uploads this to a
+    // GPU 3D texture per unique mesh and composites it into a camera-centered clipmap. Null for meshes imported
+    // before v8 or with SDF disabled — the global SDF skips those instances gracefully.
+    public readonly MeshSdf Sdf;
     public bool IsSkinned { get; }
     public int BoneCount => Skeleton.BoneCount;
 
@@ -74,6 +80,7 @@ public class Mesh : BObject
         Skeleton = data.Skeleton;
         BoneIndices = data.BoneIndices;
         BoneWeights = data.BoneWeights;
+        Sdf = data.Sdf;
         if (IsSkinned) {
             boneIndexBuffer = GraphicAPI.CreateBoneIndexBuffer(renderContext);
             boneWeightBuffer = GraphicAPI.CreateBoneWeightBuffer(renderContext);
