@@ -3,35 +3,6 @@ using Schedulers;
 
 namespace BallisticEngine;
 
-public interface IJob {
-    void Execute();
-}
-
-public interface IJobParallelFor {
-    void Execute(int index);
-
-    void Finish() { }
-
-    int BatchSize => 64;
-}
-
-public readonly struct JobHandle {
-    readonly Schedulers.JobHandle inner;
-    readonly bool valid;
-
-    internal JobHandle(Schedulers.JobHandle inner) {
-        this.inner = inner;
-        valid = true;
-    }
-
-    internal Schedulers.JobHandle? Inner => valid ? inner : null;
-
-    public void Complete() {
-        if (valid)
-            inner.Complete();
-    }
-}
-
 public static class JobSystem {
     static JobScheduler scheduler;
     static readonly object initLock = new();

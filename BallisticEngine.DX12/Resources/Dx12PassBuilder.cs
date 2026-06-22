@@ -1,13 +1,5 @@
 namespace BallisticEngine.DX12;
 
-public enum Dx12ResourceUsage {
-    None = 0,
-    GBufferShaderRead,
-    GBufferDepthShaderRead,
-    GBufferDepthReadOnly,
-    SceneColorShaderRead,
-}
-
 public sealed class Dx12PassBuilder {
     public Dx12GraphResources Resources { get; }
 
@@ -40,34 +32,4 @@ public sealed class Dx12PassBuilder {
     public void DeriveBarriers() => Current.BarriersDerived = true;
 
     public void Use(Dx12ResourceUsage usage) => Current.Usages.Add(usage);
-}
-
-public sealed class Dx12PassDeclaration {
-    public readonly HashSet<int> Reads = new();
-    public readonly HashSet<int> Writes = new();
-    public readonly HashSet<string> SharedState = new();
-    public bool AllowCulling;
-    public bool Declared;
-
-    public readonly List<Dx12ResourceUsage> Usages = new();
-    public bool BarriersDerived;
-
-    public bool IsOpaque => !Declared;
-}
-
-public sealed class Dx12GraphResources {
-    readonly Dictionary<string, Dx12ResourceHandle> byName = new();
-    readonly List<Dx12ResourceHandle> all = new();
-
-    public Dx12ResourceHandle GetOrAdd(string name, bool imported) {
-        if (byName.TryGetValue(name, out var existing)) return existing;
-        var h = new Dx12ResourceHandle(all.Count, name, imported);
-        byName[name] = h;
-        all.Add(h);
-        return h;
-    }
-
-    public IReadOnlyList<Dx12ResourceHandle> All => all;
-    public int Count => all.Count;
-    public Dx12ResourceHandle ById(int id) => all[id];
 }

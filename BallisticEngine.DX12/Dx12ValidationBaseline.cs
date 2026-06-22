@@ -184,14 +184,3 @@ public static class Dx12ValidationBaseline {
         return s;
     }
 }
-
-public readonly struct DebugMessage {
-    public MessageCategory Category { get; }
-    public MessageSeverity Severity { get; }
-    public MessageId Id { get; }
-    public string Description { get; }
-    public DebugMessage(MessageCategory category, MessageSeverity severity, MessageId id, string description) {
-        Category = category; Severity = severity; Id = id; Description = description;
-    }
-    public bool IsErrorClass => Severity == MessageSeverity.Corruption || Severity == MessageSeverity.Error;
-}

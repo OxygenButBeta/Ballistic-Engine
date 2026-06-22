@@ -32,10 +32,8 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         public Vector2 TexelSize;
         public float RayLength; public float NormalBias;
         public float RayCount; public float Intensity; public float FrameIndex; public float HistoryValid;
+        public Vector3 CameraPos; public float _pad1;
     }
-
-    Matrix4x4 prevViewProj;
-    bool prevViewProjValid;
 
     readonly Dx12Device dev;
     ID3D12RootSignature rootSig;
@@ -69,16 +67,17 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         float rayCount = rayCountCached ??= float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_RTAO_RAYS"),
             System.Globalization.CultureInfo.InvariantCulture, out float rc) ? Math.Clamp(rc, 1f, 16f) : 8f;
         if (ctx.DeterministicCapture) rayCount = 6f;
-        // History is reprojected through last frame's ViewProj; without a valid previous matrix (first frame,
-        // resize) the reproject would alias, so gate HistoryValid on it too.
-        bool histUsable = histValid && prevViewProjValid && !ctx.DeterministicCapture;
+        // History is reprojected through last frame's ViewProj (the engine's own motion-vector matrix); without a
+        // valid previous frame (first frame, resize, scene swap) the reproject would alias, so gate on it too.
+        bool histUsable = histValid && ctx.MotionPrevValid && !ctx.DeterministicCapture;
         *(RtaoConstants*)cbMapped = new RtaoConstants {
             InvViewProj = Matrix4x4.Transpose(invVP),
-            PrevViewProj = Matrix4x4.Transpose(prevViewProjValid ? prevViewProj : ctx.ViewProj),
+            PrevViewProj = Matrix4x4.Transpose(ctx.PrevViewProjUnjittered),
             TexelSize = new Vector2(1f / ao.Width, 1f / ao.Height),
             RayLength = rayLen, NormalBias = 0.05f, RayCount = rayCount, Intensity = intensity,
             FrameIndex = ctx.DeterministicCapture ? 0f : frameCounter,
             HistoryValid = histUsable ? 1f : 0f,
+            CameraPos = ctx.CamPos,
         };
 
         var histRead = histWriteB ? histA : histB;
@@ -126,8 +125,6 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         histStates[histWrite] = ResourceStates.UnorderedAccess;
         histWriteB = !histWriteB;
         histValid = true;
-        prevViewProj = ctx.ViewProj;
-        prevViewProjValid = true;
         frameCounter++;
     }
 
@@ -172,7 +169,7 @@ public sealed class Dx12RtaoPass : IRenderPass, IDisposable {
         hdesc.Flags = ResourceFlags.AllowUnorderedAccess;
         histA = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None, hdesc, ResourceStates.UnorderedAccess);
         histB = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None, hdesc, ResourceStates.UnorderedAccess);
-        histValid = false; histWriteB = false; prevViewProjValid = false;
+        histValid = false; histWriteB = false;
         outW = w; outH = h;
     }
 

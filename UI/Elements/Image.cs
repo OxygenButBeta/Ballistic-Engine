@@ -8,10 +8,3 @@ public class Image : VisualElement
 
     public Color Tint { get; set; } = Color.White;
 }
-
-public enum ScaleMode
-{
-    StretchToFill,
-    ScaleToFit,
-    ScaleAndCrop,
-}

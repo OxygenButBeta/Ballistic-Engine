@@ -4,15 +4,6 @@ using Vortice.Dxc;
 
 namespace BallisticEngine.DX12;
 
-public sealed class Dx12SurfacePso {
-    public ID3D12PipelineState Pso;
-    public bool IsFallback;
-    public string Error;
-    public string SourcePath;
-    public string Source;
-    public BallisticEngine.ShaderProperties Props;
-}
-
 public sealed class Dx12SurfaceShaderCache : IDisposable {
     readonly ID3D12Device dev;
     readonly ID3D12RootSignature rootSig;

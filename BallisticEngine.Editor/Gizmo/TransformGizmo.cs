@@ -3,11 +3,6 @@ using SysVec2 = System.Numerics.Vector2;
 
 namespace BallisticEngine.Editor;
 
-internal enum GizmoMode { Translate, Rotate, Scale }
-internal enum GizmoSpace { World, Local }
-
-internal enum GizmoPivot { Pivot, Center }
-
 internal sealed class TransformGizmo {
     public GizmoMode Mode = GizmoMode.Translate;
     public GizmoSpace Space = GizmoSpace.World;

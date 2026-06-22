@@ -1,58 +1,5 @@
 namespace BallisticEngine;
 
-public readonly struct KeyChord<TKey> : IEquatable<KeyChord<TKey>> where TKey : struct {
-    public KeyChord(TKey key, bool ctrl = false, bool shift = false, bool alt = false) {
-        Key = key;
-        Ctrl = ctrl;
-        Shift = shift;
-        Alt = alt;
-    }
-
-    public TKey Key { get; }
-    public bool Ctrl { get; }
-    public bool Shift { get; }
-    public bool Alt { get; }
-
-    public bool Equals(KeyChord<TKey> other) =>
-        EqualityComparer<TKey>.Default.Equals(Key, other.Key) &&
-        Ctrl == other.Ctrl && Shift == other.Shift && Alt == other.Alt;
-
-    public override bool Equals(object obj) => obj is KeyChord<TKey> o && Equals(o);
-    public override int GetHashCode() => HashCode.Combine(Key, Ctrl, Shift, Alt);
-
-    public override string ToString() {
-        string m = (Ctrl ? "Ctrl+" : "") + (Shift ? "Shift+" : "") + (Alt ? "Alt+" : "");
-        return m + Key;
-    }
-}
-
-public sealed class InputAction<TKey> where TKey : struct {
-    public InputAction(string id, KeyChord<TKey> chord, int context, int priority, Action invoke) {
-        Id = id ?? throw new ArgumentNullException(nameof(id));
-        Chord = chord;
-        Context = context;
-        Priority = priority;
-        Invoke = invoke ?? throw new ArgumentNullException(nameof(invoke));
-    }
-
-    public string Id { get; }
-    public KeyChord<TKey> Chord { get; }
-    public int Context { get; }
-    public int Priority { get; }
-    public Action Invoke { get; }
-}
-
-public readonly struct InputConflict {
-    public InputConflict(string idA, string idB, string chord, int context) {
-        IdA = idA; IdB = idB; Chord = chord; Context = context;
-    }
-    public string IdA { get; }
-    public string IdB { get; }
-    public string Chord { get; }
-    public int Context { get; }
-    public override string ToString() => $"{Chord} in ctx {Context}: '{IdA}' vs '{IdB}'";
-}
-
 public sealed class InputActionChain<TKey> where TKey : struct {
     readonly List<InputAction<TKey>> actions = new();
     InputAction<TKey>[] ordered = Array.Empty<InputAction<TKey>>();

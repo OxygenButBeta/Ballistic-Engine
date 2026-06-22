@@ -6,5 +6,3 @@ internal interface ICommand {
     string Usage { get; }
     int Run(string[] args);
 }
-
-internal sealed class CliUsageException(string message) : Exception(message);

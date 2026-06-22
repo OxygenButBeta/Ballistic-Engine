@@ -3,25 +3,6 @@ using System.Text.RegularExpressions;
 
 namespace BallisticEngine.AssetPipeline;
 
-public sealed class FalcorSceneData {
-    public FalcorCamera Camera { get; set; }
-    public List<FalcorLight> Lights { get; } = new();
-    public List<string> ModelPaths { get; } = new();
-    public string EnvMapPath { get; set; }
-}
-
-public sealed class FalcorCamera {
-    public Vector3 Position = new(0, 1, -5);
-    public Vector3 Target = Vector3.Zero;
-    public float FovYDegrees = 45f;
-}
-
-public sealed class FalcorLight {
-    public Vector3 Direction = new(0, -1, 0);
-    public Vector3 Color = Vector3.One;
-    public float Intensity = 1f;
-}
-
 public static class FalcorSceneParser {
     public static FalcorSceneData Parse(string source) {
         var data = new FalcorSceneData();

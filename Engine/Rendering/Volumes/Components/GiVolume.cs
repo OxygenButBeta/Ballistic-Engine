@@ -1,9 +1,5 @@
 namespace BallisticEngine;
 
-public enum GiQuality { High, Balanced, Performance, Custom }
-
-public enum GiBoundsMode { SceneAuto, Volume }
-
 public sealed class GiVolume : VolumeComponent {
     [Tooltip("Master switch for DDGI global illumination. Off → direct lighting + IBL + AO + shadows only. " +
              "Requires hardware ray tracing; without it GI is unavailable regardless of this toggle.")]

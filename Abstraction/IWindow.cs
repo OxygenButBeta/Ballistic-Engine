@@ -1,11 +1,4 @@
-﻿namespace BallisticEngine;
-
-public enum CursorMode
-{
-    Normal,
-    Hidden,
-    Locked,
-}
+namespace BallisticEngine;
 
 /// <summary>
 /// This interface defines the methods and properties required for a window in the Ballistic Engine.

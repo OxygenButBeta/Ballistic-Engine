@@ -1,8 +1,6 @@
 
 namespace BallisticEngine.Editor;
 
-internal enum PrimitiveKind { Cube, Sphere, Plane }
-
 internal static class Primitives {
     public const string DefaultMaterialPath = "Assets/Default/Materials/Default.mat";
     public const string MeshAssetFolder = "Assets/Default/Meshes";

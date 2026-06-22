@@ -20,8 +20,3 @@ public interface IGizmos {
 
     void DrawIcon(Vector3 center, GizmoIcon icon);
 }
-
-public enum GizmoIcon {
-    Light,
-    Camera,
-}
