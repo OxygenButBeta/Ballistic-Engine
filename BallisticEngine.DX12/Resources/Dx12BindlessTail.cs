@@ -35,14 +35,25 @@ internal static class Dx12BindlessTail
     public const int GlobalSdfUsed = GlobalSdfMaxTextures + 1;
     public const int GlobalSdfTableBase = AuroraScreenProbeTableBase - GlobalSdfReserved;
 
-    public const int TailStart = GlobalSdfTableBase;
+    // Lumen FAZ 3b SURFACE-CACHE ATLAS — its own reserved tail below the global-SDF tail. Holds the PERSISTENT SRV+UAV
+    // pair for each physical-atlas texture (Albedo/Normal/Emissive/Depth/DirectLighting/FinalLighting = 6 atlases × 2
+    // = 12 slots). Same rule as every block above: these are stamped ONCE (the atlas resources never re-allocate),
+    // so they MUST live OUTSIDE the dynamic Allocate()/Reset() cursor the GPU-driven material table rewinds — else the
+    // re-stamp clobbers them (typed-mismatch descriptor → GPU page fault → device removed). Door-gated; nothing
+    // allocated when Lumen cards are off. Slot order: per atlas, SRV then UAV, in atlas-creation order.
+    const int LumenSurfaceCacheReserved = 16;   // 12 used (6 atlases × SRV+UAV) + slack
+    public const int LumenSurfaceCacheUsed = 12;
+    public const int LumenSurfaceCacheTableBase = GlobalSdfTableBase - LumenSurfaceCacheReserved;
+
+    public const int TailStart = LumenSurfaceCacheTableBase;
 
     const int A_RtReflFits = 1 / (RtReflUsed <= RtReflReserved ? 1 : 0);
     const int A_AuroraFits = 1 / (AuroraUsed <= AuroraReserved ? 1 : 0);
     const int A_AuroraCardFits = 1 / (AuroraCardUsed <= AuroraCardReserved ? 1 : 0);
     const int A_AuroraScreenProbeFits = 1 / (AuroraScreenProbeUsed <= AuroraScreenProbeReserved ? 1 : 0);
     const int A_GlobalSdfFits = 1 / (GlobalSdfUsed <= GlobalSdfReserved ? 1 : 0);
+    const int A_LumenSurfaceCacheFits = 1 / (LumenSurfaceCacheUsed <= LumenSurfaceCacheReserved ? 1 : 0);
     const int A_TailStartPositive = 1 / (TailStart > 0 ? 1 : 0);
 
-    static Dx12BindlessTail() => _ = A_RtReflFits + A_AuroraFits + A_AuroraCardFits + A_AuroraScreenProbeFits + A_GlobalSdfFits + A_TailStartPositive;
+    static Dx12BindlessTail() => _ = A_RtReflFits + A_AuroraFits + A_AuroraCardFits + A_AuroraScreenProbeFits + A_GlobalSdfFits + A_LumenSurfaceCacheFits + A_TailStartPositive;
 }

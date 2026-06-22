@@ -37,7 +37,9 @@ public sealed class Dx12LumenScene : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     struct LumenInstanceMeta
     {
-        public uint TriOffset; public uint TriCount; public uint Pad0; public uint Pad1;
+        // FAZ 3b: the two former Pad fields now carry the instance's CARD range into the world-space card list
+        // (Dx12LumenCardScene). CardOffset = first card index for this instance, CardCount = its card count.
+        public uint TriOffset; public uint TriCount; public uint CardOffset; public uint CardCount;
         public Matrix4x4 World;   // object→world, transposed on upload (HLSL column-major)
     }
 
@@ -45,6 +47,20 @@ public sealed class Dx12LumenScene : IDisposable
     public ulong InstanceMetaGpuAddress => instanceMeta?.GPUVirtualAddress ?? 0;
     public int InstanceCount { get; private set; }
     public int TotalTriangles { get; private set; }
+
+    // FAZ 3b: the runtime CARD SCENE + SURFACE-CACHE ATLAS (world-space card list + physical atlas + page table).
+    // OWNED here so the per-instance card ranges can be folded straight into the meta. Built in Ensure (after the
+    // SceneAS is up) whenever armed; exposed read-only for the capture/lighting/debug phases. Lazily constructed.
+    Dx12LumenCardScene cardScene;
+    public Dx12LumenCardScene CardScene => cardScene;
+
+    static int cardDoor = -2;   // -2 unread, 0 off, 1 on (build the card scene)
+    static bool CardsArmed()
+    {
+        if (cardDoor == -2)
+            cardDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_CARDS") == "1" ? 1 : 0;
+        return cardDoor == 1;
+    }
 
     // ---- dirty tracking ----
     // TOPOLOGY stamp: object count + per-instance triangle counts. A change means the meta layout is stale →
@@ -75,6 +91,17 @@ public sealed class Dx12LumenScene : IDisposable
 
         int objects = sceneAS.InstanceCount;
         int s = ComputeTopologyStamp(sceneAS, objects);
+
+        // FAZ 3b: build/refresh the card scene FIRST (when armed) so the per-instance card ranges are available to
+        // fold into the meta below. The card scene runs whenever its own door is set OR Lumen GI is on (Ensure is
+        // only reached on a Lumen-armed frame, so `cardsThisFrame` is effectively "cards-or-Lumen"). Lazily built.
+        bool cardsThisFrame = CardsArmed() || lumenArmed;
+        if (cardsThisFrame)
+        {
+            cardScene ??= new Dx12LumenCardScene(dev);
+            cardScene.Build(ctx, sceneAS, topologyDirty: s != topologyStamp || instanceMeta == null);
+        }
+
         if (s != topologyStamp || instanceMeta == null)
         {
             topologyStamp = s;
@@ -95,14 +122,20 @@ public sealed class Dx12LumenScene : IDisposable
         if (!loggedThisStamp)
         {
             loggedThisStamp = true;
-            string line = $"[Lumen] scene: objects={InstanceCount} tris={TotalTriangles} (FAZ 0 substrate — " +
-                          "TLAS shared, instance meta built; SDF/cards/surface-cache come in FAZ 1-3)";
+            int cardCount = cardScene?.CardCount ?? 0;
+            string line = $"[Lumen] scene: objects={InstanceCount} tris={TotalTriangles} cards={cardCount} " +
+                          "(FAZ 3b substrate — TLAS shared, instance meta built, card scene + surface-cache atlas)";
             Console.WriteLine(line);
             Debugging.Log(line);
         }
 
         return Valid;
     }
+
+    // FAZ 3b: whether the OWNING Lumen GI pass is armed this frame (so the card scene builds even when its own door is
+    // unset). Set by the pass before Ensure. Default false → card scene gated purely on BALLISTIC_DX12_LUMEN_CARDS.
+    bool lumenArmed;
+    public void SetLumenArmed(bool armed) => lumenArmed = armed;
 
     // Build the per-instance meta (prefix sum of tri counts + world matrix). FAZ 1-3 append bindless geo indices,
     // SDF refs, and mesh-card record offsets here.
@@ -139,9 +172,13 @@ public sealed class Dx12LumenScene : IDisposable
         for (int i = 0; i < n; i++)
         {
             int tris = sceneAS.InstanceTriangleCount(i);
+            // FAZ 3b: fold the instance's card range (from the owned card scene) into the meta. Zero range when the
+            // card scene isn't built (cards-off frame) — the meta then matches the FAZ-0 layout with empty card refs.
+            Dx12LumenCardScene.InstanceCardRange cr = cardScene?.RangeFor(i) ?? default;
             meta[i] = new LumenInstanceMeta
             {
                 TriOffset = (uint)offset, TriCount = (uint)tris,
+                CardOffset = cr.Offset, CardCount = cr.Count,
                 World = Matrix4x4.Transpose(sceneAS.InstanceWorld(i)),
             };
             offset += tris;
@@ -157,7 +194,10 @@ public sealed class Dx12LumenScene : IDisposable
         var h = new HashCode();
         h.Add(objects);
         for (int i = 0; i < sceneAS.InstanceCount; i++)
+        {
             h.Add(sceneAS.InstanceTriangleCount(i));
+            h.Add(sceneAS.InstanceMesh(i)?.Cards?.Count ?? 0);   // FAZ 3b: card counts are part of the meta layout
+        }
         return h.ToHashCode();
     }
 
@@ -180,5 +220,6 @@ public sealed class Dx12LumenScene : IDisposable
     public void Dispose()
     {
         instanceMeta?.Dispose(); instanceMeta = null;
+        cardScene?.Dispose(); cardScene = null;
     }
 }

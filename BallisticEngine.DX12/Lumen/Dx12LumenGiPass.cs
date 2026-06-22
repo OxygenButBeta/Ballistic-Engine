@@ -54,6 +54,29 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         public Vector3 KeyLightDir;   public float HitEpsilon;
     }
 
+    // FAZ 3b debug view (BALLISTIC_DX12_LUMEN_CARDS_DEBUG=1): a fullscreen ray-test of the world-space card OBBs,
+    // opaque-replace into the HDR scene color, each hit shaded by its DirectionIndex color so the card PLACEMENT +
+    // ORIENTATION is VISIBLE. Mirrors the SDF debug pipeline exactly (CBV b0 + root SRV t0 cards; reconstruct the
+    // view ray from InvViewProj). Lazily built on the first debug frame.
+    ID3D12RootSignature cardDbgRootSig;
+    ID3D12PipelineState cardDbgPso;
+    Dx12FrameCb<CardDebugConstants> cardDbgCb;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CardDebugConstants {
+        public Matrix4x4 InvViewProj;   // clip → world (transposed on upload)
+        public Vector3 CamPos;          public uint CardCount;
+        public float MaxTraceDist;      public Vector3 CardDbgPad;
+    }
+
+    bool loggedCardDbg;
+    static int cardDebugDoor = -2;  // -2 unread, 0 off, 1 on (card OBB debug view)
+    static bool CardDebug() {
+        if (cardDebugDoor == -2)
+            cardDebugDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_CARDS_DEBUG") == "1" ? 1 : 0;
+        return cardDebugDoor == 1;
+    }
+
     static int sdfDoor = -2;       // -2 unread, 0 off, 1 on (build the field)
     static int sdfDebugDoor = -2;  // -2 unread, 0 off, 1 on (sphere-trace debug view)
     static bool SdfArmed(Dx12FrameContext ctx) {
@@ -150,6 +173,61 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         });
     }
 
+    unsafe void EnsureCardDebugPipeline()
+    {
+        if (cardDbgPso != null) return;
+        // Fullscreen card-OBB ray-test: CBV b0 + root SRV t0 (GpuLumenCard[]). Opaque replace into HDR. No sampler
+        // (the card test is analytic — no texture reads). Mirrors the SDF debug root sig minus the SRV table/sampler.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var cardSrv = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.Pixel);
+        cardDbgRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, cardSrv }, Array.Empty<StaticSamplerDescription>())));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("Lumen/LumenCardDebug.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSDebug", "LumenCardDebug.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSDebug", "LumenCardDebug.hlsl");
+        cardDbgPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = cardDbgRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+        cardDbgCb = new Dx12FrameCb<CardDebugConstants>(dev);
+    }
+
+    unsafe void RecordCardDebug(Dx12FrameContext ctx)
+    {
+        Dx12LumenCardScene cards = scene.CardScene;
+        if (cards is null || !cards.Valid || cards.CardBufferGpuAddress == 0) {
+            if (!loggedCardDbg) { loggedCardDbg = true;
+                Console.WriteLine($"[LumenCardsDebug] SKIP cards={(cards==null?"null":cards.CardCount.ToString())} valid={cards?.Valid} addr={cards?.CardBufferGpuAddress}"); }
+            return;
+        }
+        if (!loggedCardDbg) { loggedCardDbg = true;
+            Console.WriteLine($"[LumenCardsDebug] DRAW cards={cards.CardCount} camPos={ctx.CamPos}"); }
+        EnsureCardDebugPipeline();
+
+        Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
+        cardDbgCb.Write(new CardDebugConstants {
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            CamPos = ctx.CamPos, CardCount = (uint)cards.CardCount,
+            MaxTraceDist = 1e5f,
+        });
+
+        ulong cbAddr = cardDbgCb.Gpu;
+        ulong cardAddr = cards.CardBufferGpuAddress;
+        ctx.SceneColor.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(cardDbgRootSig);
+            cl.SetPipelineState(cardDbgPso);
+            cl.SetGraphicsRootConstantBufferView(0, cbAddr);
+            cl.SetGraphicsRootShaderResourceView(1, cardAddr);
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+    }
+
     // The product door. FAZ 0 is ENV-ONLY (BALLISTIC_DX12_LUMEN=1) — there is no LumenVolume yet.
     // TODO (later phase): add a LumenVolume (mirroring AuroraVolume) and follow it when the env is unset, just like
     // Aurora's Armed() folds in ctx.PostFX.AuroraEnabled. For now: armed iff the env door is "1".
@@ -196,6 +274,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // FAZ 0: build/refresh the scene substrate ONLY. No GI is traced or combined → scene color is untouched,
         // GI stays black. The first armed frame logs the substrate counts (Dx12LumenScene.Ensure logs once per
         // stamp). Later phases trace SDF/screen probes here and additively combine indirect into the HDR color.
+        // FAZ 3b: arm the card scene when Lumen GI is on (the card scene is part of the Lumen substrate). When only
+        // the card door (BALLISTIC_DX12_LUMEN_CARDS=1) is set, Dx12LumenScene builds it from its own door instead.
+        scene.SetLumenArmed(Armed(ctx));
+
         if (!scene.Ensure(ctx))
             return;   // no valid scene AS → nothing to build (Lumen is HW-RT only in FAZ 0; no software fallback)
 
@@ -214,6 +296,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 RecordSdfDebug(ctx);
         }
 
+        // FAZ 3b verification artifact: ray-test the world-space card OBBs per screen pixel into the HDR scene color,
+        // each hit shaded by its DirectionIndex color, so the card placement/orientation appears where geometry is.
+        // Default off → scene color untouched. Drawn AFTER the SDF debug so the card view wins when both doors are on.
+        if (CardDebug() && ctx.SceneColor != null)
+            RecordCardDebug(ctx);
+
         // TODO FAZ 5+: SDF software ray trace (sphere-march this clipmap) → FAZ 3: surface-cache gather → FAZ 6:
         // screen-probe diffuse + additive combine.
     }
@@ -223,5 +311,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         scene?.Dispose();
         globalSdf?.Dispose();
         dbgPso?.Dispose(); dbgRootSig?.Dispose(); dbgCb?.Dispose(); dbgSrv?.Dispose();
+        cardDbgPso?.Dispose(); cardDbgRootSig?.Dispose(); cardDbgCb?.Dispose();
     }
 }
