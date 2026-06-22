@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D12;
+using Vortice.Dxc;               // DxcShaderStage
+using PrimitiveTopology = Vortice.Direct3D.PrimitiveTopology;
 using Vortice.DXGI;
-using BallisticEngine;          // Mesh, MeshCard, MeshCards
+using BallisticEngine;          // Mesh, MeshCard, MeshCards, Material, MaterialSemantic, IStaticMeshRenderer
 
 namespace BallisticEngine.DX12;
 
@@ -93,6 +95,42 @@ public sealed class Dx12LumenCardScene : IDisposable {
         public Format Fmt;
     }
     Atlas albedo, normal, emissive, depthA, directLight, finalLight;
+
+    // FAZ 3c — capture RTVs. One RTV per CAPTURED attribute atlas (Albedo/Normal/Emissive/Depth — DirectLighting/
+    // FinalLighting are written by 3d, no capture RTV). Plus a transient PhysicalPageSize² D32 depth target reused
+    // per card for the ortho-rasterize z-test. CPU, non-shader-visible heaps (RTV/DSV descriptors). Built in EnsureAtlas.
+    ID3D12DescriptorHeap captureRtvHeap;   // 4 RTVs: albedo, normal, emissive, depth (this fixed order)
+    uint captureRtvInc;
+    ID3D12Resource captureDepth;           // full-atlas D32 (shares the RTV coord space; cleared per-page rect)
+    ID3D12DescriptorHeap captureDsvHeap;
+    CpuDescriptorHandle captureDsvHandle;
+
+    // FAZ 3c — capture PSO (CBV b0 + 6-SRV material table t0-t5 + static sampler s0) + a per-draw CB ring + a
+    // shader-visible material SRV heap. Built once (lazily) on the first capture.
+    ID3D12RootSignature captureRootSig;
+    ID3D12PipelineState capturePso;
+    InputLayoutDescription captureLayout;
+    ID3D12Resource captureCbRing;          // per-draw LumenCaptureConstants, upload heap (mapped)
+    unsafe byte* captureCbMapped;
+    int captureCbSlotSize, captureCbSlotCount;
+    Dx12DescriptorHeap captureSrv;         // shader-visible material SRV table (6 per draw)
+    bool captureBuilt;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct LumenCaptureConstants {
+        public Matrix4x4 Mvp;
+        public Matrix4x4 Model;
+        public Vector3 CardAxisX; public float Pad0;
+        public Vector3 CardAxisY; public float Pad1;
+        public Vector3 CardAxisZ; public float CardExtentZ;
+        public Vector3 CardOrigin; public float Pad2;
+        public Vector4 BaseColorFactor;
+        public Vector3 EmissiveFactor; public float HasEmissive;
+        public float Metallic, Roughness, NormalStrength, NormalFlipY;
+        public float HasMetallicMap, HasRoughnessMap, PackedOrm, Cutout;
+    }
+    const int CaptureMaterialSrvCount = 6;
+
     public ID3D12Resource AlbedoAtlas => albedo?.Tex;
     public ID3D12Resource NormalAtlas => normal?.Tex;
     public ID3D12Resource EmissiveAtlas => emissive?.Tex;
@@ -101,7 +139,21 @@ public sealed class Dx12LumenCardScene : IDisposable {
     public ID3D12Resource FinalLightingAtlas => finalLight?.Tex;
     public int AlbedoSrvBindless => albedo?.SrvBindless ?? -1;
     public int AlbedoUavBindless => albedo?.UavBindless ?? -1;
+    public int NormalSrvBindless => normal?.SrvBindless ?? -1;
+    public int EmissiveSrvBindless => emissive?.SrvBindless ?? -1;
+    public int DepthSrvBindless => depthA?.SrvBindless ?? -1;
     public int FinalLightingSrvBindless => finalLight?.SrvBindless ?? -1;
+
+    // FAZ 3c — CPU SRV handles for the captured atlases (debug blit copies these into a shader-visible heap, the way
+    // RecordSdfDebug copies the clipmap SRV). Albedo/Normal/Emissive/Depth, by capture-attribute name.
+    public CpuDescriptorHandle AlbedoSrvCpu   => albedo?.SrvCpu   ?? default;
+    public CpuDescriptorHandle NormalSrvCpu   => normal?.SrvCpu   ?? default;
+    public CpuDescriptorHandle EmissiveSrvCpu => emissive?.SrvCpu ?? default;
+    public CpuDescriptorHandle DepthSrvCpu    => depthA?.SrvCpu   ?? default;
+
+    // FAZ 3c — true on a frame the capture pass actually ran (cards (re)built since the last capture). The debug blit
+    // reads it only to log; the atlas content persists across frames regardless.
+    public bool Captured { get; private set; }
     bool atlasBuilt;
 
     public bool Valid => CardCount > 0 && cardBuf != null;
@@ -110,6 +162,12 @@ public sealed class Dx12LumenCardScene : IDisposable {
     int topologyStamp = -1;
     int transformStamp = -1;
     bool loggedThisStamp;
+
+    // FAZ 3c — CPU-side card + page lists retained from the last (re)build so the capture pass can read each card's
+    // page rect + its world ortho frame. (3b discarded them after upload; capture needs them on the CPU.)
+    GpuLumenCard[] cardsCpu = Array.Empty<GpuLumenCard>();
+    GpuLumenPage[] pagesCpu = Array.Empty<GpuLumenPage>();
+    int captureStamp = -1;   // last (rebuild) build stamp the capture ran for; -1 = never captured
 
     public Dx12LumenCardScene(Dx12Device device) {
         dev = device;
@@ -168,6 +226,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
 
         var cardArr = cards.Count > 0 ? cards.ToArray() : new GpuLumenCard[1];
         var pageArr = pages.Count > 0 ? pages.ToArray() : new GpuLumenPage[1];
+        cardsCpu = cardArr; pagesCpu = pageArr;   // FAZ 3c: retained for the capture pass (page rects + ortho frames)
 
         dev.DeferredRelease(cardBuf);
         dev.DeferredRelease(pageBuf);
@@ -194,6 +253,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
 
         var cardArr = cards.Count > 0 ? cards.ToArray() : new GpuLumenCard[1];
         var pageArr = pages.Count > 0 ? pages.ToArray() : new GpuLumenPage[1];
+        cardsCpu = cardArr; pagesCpu = pageArr;   // FAZ 3c
         dev.DeferredRelease(cardBuf);
         dev.DeferredRelease(pageBuf);
         cardBuf = dev.CreateUavBuffer<GpuLumenCard>(cardArr, ResourceStates.GenericRead);
@@ -290,6 +350,278 @@ public sealed class Dx12LumenCardScene : IDisposable {
         return Math.Clamp(res, MinResLevel, CapResLevel);
     }
 
+    // ====================================================================================================
+    // FAZ 3c — CARD CAPTURE
+    // ====================================================================================================
+
+    // Capture each card's mesh material attributes into its atlas page. Runs ONCE per (re)build (capturedStamp gate);
+    // a static scene captures on the first armed frame and never again. Recorded into the OPEN frame list (ExecuteSync
+    // folds onto the frame thread). NO lighting — albedo/card-normal/emissive/card-depth only (3d lights the cache).
+    public unsafe void Capture(Dx12FrameContext ctx, Dx12SceneAS sceneAS) {
+        if (sceneAS is null || !sceneAS.Valid || CardCount == 0 || PageCount == 0) return;
+        Captured = false;
+        if (captureStamp == topologyStamp) return;   // already captured this topology — nothing changed
+        EnsureCapturePipeline();
+
+        // Map each card id → its page rect (only allocated cards have a page; dropped cards have PageId=0xFFFFFFFF).
+        // pagesCpu is indexed by PageId; pagesCpu[p].CardId is the card it belongs to. Build a card→page lookup.
+        var cardToPage = new int[CardCount];
+        for (int i = 0; i < cardToPage.Length; i++) cardToPage[i] = -1;
+        for (int p = 0; p < pagesCpu.Length && p < PageCount; p++) {
+            uint cid = pagesCpu[p].CardId;
+            if (cid < (uint)CardCount) cardToPage[cid] = p;
+        }
+
+        // Resolve, per card, its owning instance (so we know the mesh + renderer). instanceRanges[i] gives the card
+        // index range for instance i (in SceneAS instance order).
+        int[] cardInstance = new int[CardCount];
+        for (int i = 0; i < cardInstance.Length; i++) cardInstance[i] = -1;
+        for (int inst = 0; inst < instanceRanges.Length; inst++) {
+            var r = instanceRanges[inst];
+            for (uint k = 0; k < r.Count; k++) {
+                uint ci = r.Offset + k;
+                if (ci < (uint)CardCount) cardInstance[ci] = inst;
+            }
+        }
+
+        var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
+        int frameSlot = dev.FrameSlot;
+        long cbFrameBase = (long)frameSlot * captureCbSlotCount * captureCbSlotSize;
+        int cbSlot = 0;
+        int capturedCards = 0, capturedDraws = 0, skippedNoMesh = 0;
+
+        captureSrv.Reset();
+
+        dev.ExecuteSync(cl => {
+            // All atlases UAV → RenderTarget (the persistent atlas state is UnorderedAccess between passes).
+            cl.ResourceBarrierTransition(albedo.Tex,   ResourceStates.UnorderedAccess, ResourceStates.RenderTarget);
+            cl.ResourceBarrierTransition(normal.Tex,   ResourceStates.UnorderedAccess, ResourceStates.RenderTarget);
+            cl.ResourceBarrierTransition(emissive.Tex, ResourceStates.UnorderedAccess, ResourceStates.RenderTarget);
+            cl.ResourceBarrierTransition(depthA.Tex,   ResourceStates.UnorderedAccess, ResourceStates.RenderTarget);
+
+            Span<CpuDescriptorHandle> rtvs = stackalloc CpuDescriptorHandle[4];
+            rtvs[0] = CaptureRtv(0); rtvs[1] = CaptureRtv(1); rtvs[2] = CaptureRtv(2); rtvs[3] = CaptureRtv(3);
+            cl.OMSetRenderTargets(rtvs, captureDsvHandle);
+
+            cl.SetGraphicsRootSignature(captureRootSig);
+            cl.SetPipelineState(capturePso);
+            cl.SetDescriptorHeaps(captureSrv.Heap);
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+
+            for (int c = 0; c < CardCount; c++) {
+                int page = cardToPage[c];
+                if (page < 0) continue;                       // dropped/unallocated card
+                int inst = cardInstance[c];
+                if (inst < 0) continue;
+                Mesh mesh = sceneAS.InstanceMesh(inst);
+                IStaticMeshRenderer renderer = sceneAS.InstanceRenderer(inst);
+                if (mesh is null) { skippedNoMesh++; continue; }
+
+                var vb = mesh.VertexBuffer as Dx12Buffer<Vector3>;
+                var ib = mesh.IndexBuffer as Dx12IndexBuffer;
+                var nb = mesh.NormalBuffer as Dx12Buffer<Vector3>;
+                var ub = mesh.UvBuffer as Dx12Buffer<Vector2>;
+                var tb = mesh.TangentBuffer as Dx12Buffer<Vector4>;
+                if (vb?.Resource is null || ib?.Resource is null ||
+                    nb?.Resource is null || ub?.Resource is null || tb?.Resource is null) { skippedNoMesh++; continue; }
+
+                GpuLumenCard card = cardsCpu[c];
+                GpuLumenPage pg = pagesCpu[page];
+
+                // Card ortho view-proj (world → card clip). Eye just outside the front face, looking inward (-AxisZ),
+                // up = AxisY. RH lookAt + standard ortho (0..1 depth, near<far) — matches the engine camera convention.
+                Vector3 eye = card.Origin + card.AxisZ * card.ExtentZ;
+                Vector3 target = card.Origin - card.AxisZ * card.ExtentZ;
+                Matrix4x4 view = Matrix4x4.CreateLookAt(eye, target, card.AxisY);
+                Matrix4x4 proj = Matrix4x4.CreateOrthographic(
+                    2f * MathF.Max(card.ExtentX, 1e-4f), 2f * MathF.Max(card.ExtentY, 1e-4f),
+                    0f, 2f * MathF.Max(card.ExtentZ, 1e-4f));
+                Matrix4x4 viewProj = view * proj;
+
+                // Viewport + scissor = this card's page rect in the atlas (raster is clipped to the page).
+                var pageRect = new Vortice.RawRect(
+                    (int)pg.AtlasOffsetX, (int)pg.AtlasOffsetY,
+                    (int)(pg.AtlasOffsetX + pg.SizeX), (int)(pg.AtlasOffsetY + pg.SizeY));
+                cl.RSSetViewport(pg.AtlasOffsetX, pg.AtlasOffsetY, pg.SizeX, pg.SizeY);
+                cl.RSSetScissorRect(pageRect);
+
+                // Clear only THIS page rect in each atlas RTV (other cards' pages keep their captures). Depth target is
+                // page-sized (PhysicalPageSize²), shared by every card — but the viewport sits at the page's ATLAS
+                // offset while the DSV is at 0,0; so the depth target must be at least as large as the largest page +
+                // its offset. Since pages can sit anywhere up to AtlasSize, the page-sized depth alone can't cover an
+                // offset page. We therefore make the DSV the FULL atlas size (see CreateCaptureTargets) and clear its
+                // page rect too.
+                for (int rt = 0; rt < 4; rt++)
+                    cl.ClearRenderTargetView(rtvs[rt], new Vortice.Mathematics.Color4(0, 0, 0, 0), 1, new[] { pageRect });
+                cl.ClearDepthStencilView(captureDsvHandle, ClearFlags.Depth, 1.0f, 0, new[] { pageRect });
+
+                Material mat0 = renderer?.MaterialFor(0);
+                int only = renderer?.SubMeshIndex ?? -1;
+                int first = only >= 0 ? only : 0;
+                int last  = only >= 0 ? only : mesh.SubMeshes.Length - 1;
+
+                Span<VertexBufferView> vbViews = stackalloc VertexBufferView[4];
+                vbViews[0] = new VertexBufferView(vb.GpuAddress, (uint)vb.ByteSize, (uint)vb.Stride);
+                vbViews[1] = new VertexBufferView(nb.GpuAddress, (uint)nb.ByteSize, (uint)nb.Stride);
+                vbViews[2] = new VertexBufferView(ub.GpuAddress, (uint)ub.ByteSize, (uint)ub.Stride);
+                vbViews[3] = new VertexBufferView(tb.GpuAddress, (uint)tb.ByteSize, (uint)tb.Stride);
+                cl.IASetVertexBuffers(0, vbViews);
+                cl.IASetIndexBuffer(new IndexBufferView(ib.GpuAddress, (uint)ib.ByteSize, Format.R32_UInt));
+
+                Matrix4x4 model = renderer?.Transform.RenderMatrix ?? sceneAS.InstanceWorld(inst);
+                bool drewAny = false;
+
+                for (int s = first; s <= last; s++) {
+                    if ((uint)s >= (uint)mesh.SubMeshes.Length) break;
+                    if (cbSlot >= captureCbSlotCount) break;
+                    SubMeshData sub = mesh.SubMeshes[s];
+                    if (sub.IndexCount <= 0) continue;
+                    Material mat = renderer?.MaterialFor(s) ?? mat0;
+                    if (mat is null) continue;
+
+                    bool hasMetal = mat.Metallic is not null;
+                    bool hasRough = mat.Roughness is not null;
+                    bool emissiveOn = mat.IsEmissive;
+                    Vector4 ec = mat.GetVector(MaterialSemantic.EmissiveColor);
+                    var cc = new LumenCaptureConstants {
+                        Mvp = Matrix4x4.Transpose(model * viewProj),
+                        Model = Matrix4x4.Transpose(model),
+                        CardAxisX = card.AxisX, CardAxisY = card.AxisY,
+                        CardAxisZ = card.AxisZ, CardExtentZ = card.ExtentZ,
+                        CardOrigin = card.Origin,
+                        BaseColorFactor = mat.GetVector(MaterialSemantic.BaseColorFactor),
+                        EmissiveFactor = new Vector3(ec.X, ec.Y, ec.Z) * mat.GetFloat(MaterialSemantic.EmissiveIntensity),
+                        HasEmissive = emissiveOn ? 1f : 0f,
+                        Metallic = mat.GetFloat(MaterialSemantic.MetallicFactor),
+                        Roughness = mat.GetFloat(MaterialSemantic.RoughnessFactor),
+                        NormalStrength = mat.GetFloat(MaterialSemantic.NormalStrength),
+                        NormalFlipY = mat.GetFloat(MaterialSemantic.NormalFlipY),
+                        HasMetallicMap = hasMetal ? 1f : 0f, HasRoughnessMap = hasRough ? 1f : 0f,
+                        PackedOrm = mat.GetFloat(MaterialSemantic.PackedOrm), Cutout = mat.GetFloat(MaterialSemantic.Cutout),
+                    };
+                    long cbOff = cbFrameBase + (long)cbSlot * captureCbSlotSize;
+                    *(LumenCaptureConstants*)(captureCbMapped + cbOff) = cc;
+                    cl.SetGraphicsRootConstantBufferView(0, captureCbRing.GPUVirtualAddress + (ulong)cbOff);
+
+                    int tableStart = captureSrv.AllocateRange(CaptureMaterialSrvCount);
+                    BindCaptureSrv(tableStart + 0, mat.GetTexture(MaterialSemantic.DiffuseMap),   TextureType.Diffuse, fallbackDiffuse);
+                    BindCaptureSrv(tableStart + 1, mat.GetTexture(MaterialSemantic.NormalMap),    TextureType.Normal, null);
+                    BindCaptureSrv(tableStart + 2, mat.GetTexture(MaterialSemantic.MetallicMap),  TextureType.Metallic, null);
+                    BindCaptureSrv(tableStart + 3, mat.GetTexture(MaterialSemantic.RoughnessMap), TextureType.Roughness, null);
+                    BindCaptureSrv(tableStart + 4, mat.GetTexture(MaterialSemantic.AOMap),        TextureType.AO, null);
+                    BindCaptureSrv(tableStart + 5, mat.GetTexture(MaterialSemantic.EmissiveMap),  TextureType.Emissive, null);
+                    cl.SetGraphicsRootDescriptorTable(1, captureSrv.Gpu(tableStart));
+
+                    cl.DrawIndexedInstanced((uint)sub.IndexCount, 1, (uint)sub.IndexStart, 0, 0);
+                    cbSlot++; capturedDraws++; drewAny = true;
+                }
+                if (drewAny) capturedCards++;
+            }
+
+            // Atlases back to UnorderedAccess (the persistent inter-pass state 3d/trace/debug expect).
+            cl.ResourceBarrierTransition(albedo.Tex,   ResourceStates.RenderTarget, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(normal.Tex,   ResourceStates.RenderTarget, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(emissive.Tex, ResourceStates.RenderTarget, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(depthA.Tex,   ResourceStates.RenderTarget, ResourceStates.UnorderedAccess);
+        });
+
+        captureStamp = topologyStamp;
+        Captured = true;
+        string line = $"[LumenCapture] captured cards={capturedCards}/{CardCount} draws={capturedDraws} " +
+                      $"skippedNoMesh={skippedNoMesh} (FAZ 3c — material attributes rasterized into atlas pages)";
+        Console.WriteLine(line);
+        Debugging.Log(line);
+
+        if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_CAPTURE_READBACK") == "1" && PageCount > 0)
+            ReadbackProof();
+    }
+
+    // One-shot CPU readback (ExecuteSyncImmediate, NOT ExecuteSync+Flush per the hard rule) of the ALBEDO atlas page
+    // centers — proves the capture wrote non-zero material data into the pages. Gated by an env door (debug only).
+    unsafe void ReadbackProof() {
+        ResourceDescription rd = albedo.Tex.Description;
+        var fps = new PlacedSubresourceFootPrint[1]; var rc = new uint[1]; var rs = new ulong[1];
+        dev.Device.GetCopyableFootprints(rd, 0, 1, 0, fps, rc, rs, out ulong total);
+        int rowPitch = (int)fps[0].Footprint.RowPitch;   // R8G8B8A8 → 4 bytes/texel
+        using ID3D12Resource readback = dev.Device.CreateCommittedResource(
+            HeapProperties.ReadbackHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer(total), ResourceStates.CopyDest);
+
+        dev.ExecuteSyncImmediate(cl => {
+            cl.ResourceBarrierTransition(albedo.Tex, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+            cl.CopyTextureRegion(new TextureCopyLocation(readback, fps[0]), 0, 0, 0,
+                new TextureCopyLocation(albedo.Tex, 0), null);
+            cl.ResourceBarrierTransition(albedo.Tex, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+        });
+
+        byte* m = readback.Map<byte>(0);
+        int probed = Math.Min(PageCount, 12);
+        for (int p = 0; p < probed; p++) {
+            GpuLumenPage pg = pagesCpu[p];
+            int cx = (int)(pg.AtlasOffsetX + pg.SizeX / 2);
+            int cy = (int)(pg.AtlasOffsetY + pg.SizeY / 2);
+            byte* px = m + (long)cy * rowPitch + (long)cx * 4;
+            Console.WriteLine($"[LumenCaptureReadback] page#{p} card={pg.CardId} rect=({pg.AtlasOffsetX},{pg.AtlasOffsetY},{pg.SizeX}x{pg.SizeY}) " +
+                              $"center=({cx},{cy}) albedoRGBA=({px[0]},{px[1]},{px[2]},{px[3]})");
+        }
+        readback.Unmap(0);
+    }
+
+    void BindCaptureSrv(int slot, Texture2D tex, TextureType type, Dx12Texture2D explicitFallback) {
+        var dx = (tex as Dx12Texture2D) ?? explicitFallback ?? (DefaultTextures.Neutral(type) as Dx12Texture2D);
+        dev.Device.CopyDescriptorsSimple(1, captureSrv.Cpu(slot), dx.SrvCpu,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView);
+    }
+
+    unsafe void EnsureCapturePipeline() {
+        if (captureBuilt) return;
+        captureBuilt = true;
+
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, CaptureMaterialSrvCount, baseShaderRegister: 0);
+        var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
+        var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap, AddressV = TextureAddressMode.Wrap,
+            AddressW = TextureAddressMode.Wrap, MaxAnisotropy = 16, ComparisonFunction = ComparisonFunction.Never,
+            MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        captureRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.AllowInputAssemblerInputLayout,
+                new[] { cbv, matTable }, new[] { wrap })));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("Lumen/LumenCardCapture.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "LumenCardCapture.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMain", "LumenCardCapture.hlsl");
+        captureLayout = new InputLayoutDescription(
+            new InputElementDescription("POSITION", 0, Format.R32G32B32_Float, 0, 0),
+            new InputElementDescription("NORMAL", 0, Format.R32G32B32_Float, 0, 1),
+            new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 0, 2),
+            new InputElementDescription("TANGENT", 0, Format.R32G32B32A32_Float, 0, 3));
+        capturePso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = captureRootSig, VertexShader = vs, PixelShader = ps, InputLayout = captureLayout,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            // CullNone: cards are one-sided interior surfaces and we want whichever mesh face the ortho view sees.
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.Default,
+            RenderTargetFormats = new[] {
+                Format.R8G8B8A8_UNorm, Format.R8G8_UNorm, Format.R11G11B10_Float, Format.R16_Float,
+            },
+            DepthStencilFormat = Format.D32_Float, SampleDescription = new SampleDescription(1, 0),
+        });
+
+        // Per-draw CB ring (FramesInFlight copies, indexed by FrameSlot like the main cbRing).
+        captureCbSlotSize = (Marshal.SizeOf<LumenCaptureConstants>() + 255) & ~255;
+        captureCbSlotCount = 4096;
+        long stride = (long)captureCbSlotSize * captureCbSlotCount;
+        captureCbRing = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
+            ResourceDescription.Buffer((ulong)(stride * dev.FramesInFlight)), ResourceStates.GenericRead);
+        captureCbMapped = captureCbRing.Map<byte>(0);
+
+        captureSrv = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+            captureCbSlotCount * CaptureMaterialSrvCount, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+    }
+
     // Allocate the physical atlas textures + their persistent SRV/UAV in the reserved Lumen surface-cache tail. Built
     // once (cross-frame cache, NOT pooled). Cleared to 0 so the debug/capture passes never read uninitialized texels.
     void EnsureAtlas() {
@@ -306,6 +638,49 @@ public sealed class Dx12LumenCardScene : IDisposable {
         finalLight  = CreateAtlas("LumenCardFinal",    Format.R11G11B10_Float, ref slot);
 
         ClearAtlases();
+        CreateCaptureTargets();
+    }
+
+    // FAZ 3c — build the capture RTVs (Albedo/Normal/Emissive/Depth, fixed order) + the transient page-sized depth.
+    // RTV/DSV CPU descriptors live in their OWN non-shader-visible heaps (NOT the bindless heap) — a render target /
+    // depth view can't be created in a CBV/SRV/UAV heap. Built once with the atlas (persistent).
+    void CreateCaptureTargets() {
+        Atlas[] captured = { albedo, normal, emissive, depthA };
+        captureRtvHeap = dev.Device.CreateDescriptorHeap(
+            new DescriptorHeapDescription(DescriptorHeapType.RenderTargetView, (uint)captured.Length));
+        captureRtvInc = dev.Device.GetDescriptorHandleIncrementSize(DescriptorHeapType.RenderTargetView);
+        CpuDescriptorHandle rtvStart = captureRtvHeap.GetCPUDescriptorHandleForHeapStart();
+        for (int k = 0; k < captured.Length; k++) {
+            var h = rtvStart; h.Ptr += (nuint)(k * (int)captureRtvInc);
+            dev.Device.CreateRenderTargetView(captured[k].Tex, new RenderTargetViewDescription {
+                Format = captured[k].Fmt, ViewDimension = RenderTargetViewDimension.Texture2D,
+            }, h);
+        }
+
+        // FULL-atlas-size depth: a page's viewport sits at its ATLAS offset, and the DSV shares that coordinate space
+        // with the RTVs, so the depth target must span the whole atlas (a page at offset (256,384) writes depth there).
+        // Cleared per-page (a RawRect clear) so the cost is the page area, not the full atlas.
+        var dDesc = new ResourceDescription {
+            Dimension = ResourceDimension.Texture2D,
+            Width = (ulong)AtlasSize, Height = (uint)AtlasSize, DepthOrArraySize = 1, MipLevels = 1,
+            Format = Format.D32_Float, SampleDescription = new SampleDescription(1, 0),
+            Layout = TextureLayout.Unknown, Flags = ResourceFlags.AllowDepthStencil,
+        };
+        captureDepth = dev.Device.CreateCommittedResource(HeapProperties.DefaultHeapProperties, HeapFlags.None,
+            dDesc, ResourceStates.DepthWrite, new ClearValue(Format.D32_Float, 1.0f, 0));
+        captureDepth.Name = "LumenCardCaptureDepth";
+        captureDsvHeap = dev.Device.CreateDescriptorHeap(
+            new DescriptorHeapDescription(DescriptorHeapType.DepthStencilView, 1));
+        captureDsvHandle = captureDsvHeap.GetCPUDescriptorHandleForHeapStart();
+        dev.Device.CreateDepthStencilView(captureDepth, new DepthStencilViewDescription {
+            Format = Format.D32_Float, ViewDimension = DepthStencilViewDimension.Texture2D,
+        }, captureDsvHandle);
+    }
+
+    CpuDescriptorHandle CaptureRtv(int i) {
+        var h = captureRtvHeap.GetCPUDescriptorHandleForHeapStart();
+        h.Ptr += (nuint)(i * (int)captureRtvInc);
+        return h;
     }
 
     Atlas CreateAtlas(string name, Format fmt, ref int slot) {
@@ -403,5 +778,12 @@ public sealed class Dx12LumenCardScene : IDisposable {
         albedo?.Tex?.Dispose(); normal?.Tex?.Dispose(); emissive?.Tex?.Dispose();
         depthA?.Tex?.Dispose(); directLight?.Tex?.Dispose(); finalLight?.Tex?.Dispose();
         albedo = normal = emissive = depthA = directLight = finalLight = null;
+        captureRtvHeap?.Dispose(); captureRtvHeap = null;
+        captureDsvHeap?.Dispose(); captureDsvHeap = null;
+        captureDepth?.Dispose(); captureDepth = null;
+        capturePso?.Dispose(); capturePso = null;
+        captureRootSig?.Dispose(); captureRootSig = null;
+        captureCbRing?.Dispose(); captureCbRing = null;
+        captureSrv?.Dispose(); captureSrv = null;
     }
 }

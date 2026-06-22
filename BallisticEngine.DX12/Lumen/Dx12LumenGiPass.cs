@@ -77,6 +77,35 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         return cardDebugDoor == 1;
     }
 
+    // FAZ 3c — capture debug blit (BALLISTIC_DX12_LUMEN_CAPTURE_DEBUG=1): blit one surface-cache atlas to scene color
+    // so the captured attributes are visible. The atlas is selected by BALLISTIC_DX12_LUMEN_CAPTURE_VIEW.
+    ID3D12RootSignature capDbgRootSig;
+    ID3D12PipelineState capDbgPso;
+    Dx12FrameCb<CaptureDebugConstants> capDbgCb;
+    Dx12DescriptorHeap capDbgSrv;
+    bool loggedCapDbg;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CaptureDebugConstants { public uint Mode; public float Scale; public Vector2 Pad; }
+
+    static int capDebugDoor = -2;  // -2 unread, 0 off, 1 on (capture atlas blit)
+    static bool CaptureDebug() {
+        if (capDebugDoor == -2)
+            capDebugDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_CAPTURE_DEBUG") == "1" ? 1 : 0;
+        return capDebugDoor == 1;
+    }
+    // Which atlas to blit + a per-view visualization gain. Albedo ~1.5, normal/depth pushed brighter (Scale) so they
+    // survive the post tonemap; emissive shown at low gain (it's already HDR).
+    static void CaptureViewMode(out uint mode, out float scale) {
+        string v = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_CAPTURE_VIEW") ?? "albedo").ToLowerInvariant();
+        switch (v) {
+            case "normal":   mode = 1; scale = 1.0f; break;
+            case "emissive": mode = 2; scale = 1.0f; break;
+            case "depth":    mode = 3; scale = 1.0f; break;
+            default:         mode = 0; scale = 1.5f; break;   // albedo
+        }
+    }
+
     static int sdfDoor = -2;       // -2 unread, 0 off, 1 on (build the field)
     static int sdfDebugDoor = -2;  // -2 unread, 0 off, 1 on (sphere-trace debug view)
     static bool SdfArmed(Dx12FrameContext ctx) {
@@ -228,6 +257,81 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         });
     }
 
+    unsafe void EnsureCaptureDebugPipeline()
+    {
+        if (capDbgPso != null) return;
+        // Fullscreen blit: CBV b0 + 1-SRV table (atlas t0) + point-clamp sampler s0. Opaque replace into HDR.
+        var cbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var srvRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 1, baseShaderRegister: 0);
+        var srvTable = new RootParameter1(new RootDescriptorTable1(srvRange), ShaderVisibility.Pixel);
+        var pointClamp = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
+            Filter = Filter.MinMagMipPoint, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never,
+            MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        capDbgRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv, srvTable }, new[] { pointClamp })));
+
+        string hlsl = EmbeddedShaderSource.ReadHlsl("Lumen/LumenCardCaptureDebug.hlsl");
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSDebug", "LumenCardCaptureDebug.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSDebug", "LumenCardCaptureDebug.hlsl");
+        capDbgPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = capDbgRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+        capDbgCb = new Dx12FrameCb<CaptureDebugConstants>(dev);
+        capDbgSrv = new Dx12DescriptorHeap(dev,
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 1, shaderVisible: true,
+            framesInFlight: dev.FramesInFlight);
+    }
+
+    unsafe void RecordCaptureDebug(Dx12FrameContext ctx)
+    {
+        Dx12LumenCardScene cards = scene.CardScene;
+        if (cards is null || !cards.Valid) {
+            if (!loggedCapDbg) { loggedCapDbg = true;
+                Console.WriteLine($"[LumenCaptureDebug] SKIP cards={(cards==null?"null":cards.CardCount.ToString())} valid={cards?.Valid}"); }
+            return;
+        }
+        EnsureCaptureDebugPipeline();
+        CaptureViewMode(out uint mode, out float scale);
+
+        // Pick the selected atlas's CPU SRV (the atlas is in UnorderedAccess between passes; the SRV reads it directly
+        // — UAV/SRV co-readable on the same persistent texture, the surface cache's steady state).
+        CpuDescriptorHandle atlasSrv = mode switch {
+            1 => cards.NormalSrvCpu,
+            2 => cards.EmissiveSrvCpu,
+            3 => cards.DepthSrvCpu,
+            _ => cards.AlbedoSrvCpu,
+        };
+        if (!loggedCapDbg) { loggedCapDbg = true;
+            Console.WriteLine($"[LumenCaptureDebug] DRAW mode={mode} scale={scale} captured={cards.Captured} cards={cards.CardCount}"); }
+
+        capDbgCb.Write(new CaptureDebugConstants { Mode = mode, Scale = scale, Pad = Vector2.Zero });
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        capDbgSrv.Reset();
+        int b = capDbgSrv.AllocateRange(1);
+        dev.Device.CopyDescriptorsSimple(1, capDbgSrv.Cpu(b), atlasSrv, heapType);
+
+        ulong cbAddr = capDbgCb.Gpu;
+        GpuDescriptorHandle srvGpu = capDbgSrv.Gpu(b);
+        ID3D12DescriptorHeap heap = capDbgSrv.Heap;
+        ctx.SceneColor.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(capDbgRootSig);
+            cl.SetPipelineState(capDbgPso);
+            cl.SetDescriptorHeaps(heap);
+            cl.SetGraphicsRootConstantBufferView(0, cbAddr);
+            cl.SetGraphicsRootDescriptorTable(1, srvGpu);
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+    }
+
     // The product door. FAZ 0 is ENV-ONLY (BALLISTIC_DX12_LUMEN=1) — there is no LumenVolume yet.
     // TODO (later phase): add a LumenVolume (mirroring AuroraVolume) and follow it when the env is unset, just like
     // Aurora's Armed() folds in ctx.PostFX.AuroraEnabled. For now: armed iff the env door is "1".
@@ -281,6 +385,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (!scene.Ensure(ctx))
             return;   // no valid scene AS → nothing to build (Lumen is HW-RT only in FAZ 0; no software fallback)
 
+        // FAZ 3c: CAPTURE the placed cards' material attributes (albedo / card-normal / emissive / card-depth) into
+        // their atlas pages. Runs ONCE per (re)build (the card scene's own capturedStamp gate); a static scene captures
+        // on the first armed frame and never again. No lighting — 3d lights the cache. Recorded into the open frame
+        // list. Gated implicitly on the card scene existing (built whenever cards-or-Lumen is armed).
+        scene.CardScene?.Capture(ctx, ctx.Dxr.SceneAS);
+
         // FAZ 2: build/refresh the camera-centered GLOBAL DISTANCE FIELD clipmap from the visible meshes' per-mesh
         // SDFs. Armed by BALLISTIC_DX12_GLOBALSDF=1 (independent test) OR whenever Lumen GI is on (the field is part
         // of the Lumen substrate). Builds NOTHING into the scene color by itself — FAZ 5 sphere-marches it for GI.
@@ -302,6 +412,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (CardDebug() && ctx.SceneColor != null)
             RecordCardDebug(ctx);
 
+        // FAZ 3c verification artifact: blit the captured surface-cache atlas (albedo by default; selectable via
+        // BALLISTIC_DX12_LUMEN_CAPTURE_VIEW) to the HDR scene color so the captured material attributes are visible.
+        // Default off → scene color untouched. Drawn LAST so the capture view wins when multiple debug doors are on.
+        if (CaptureDebug() && ctx.SceneColor != null)
+            RecordCaptureDebug(ctx);
+
         // TODO FAZ 5+: SDF software ray trace (sphere-march this clipmap) → FAZ 3: surface-cache gather → FAZ 6:
         // screen-probe diffuse + additive combine.
     }
@@ -312,5 +428,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         globalSdf?.Dispose();
         dbgPso?.Dispose(); dbgRootSig?.Dispose(); dbgCb?.Dispose(); dbgSrv?.Dispose();
         cardDbgPso?.Dispose(); cardDbgRootSig?.Dispose(); cardDbgCb?.Dispose();
+        capDbgPso?.Dispose(); capDbgRootSig?.Dispose(); capDbgCb?.Dispose(); capDbgSrv?.Dispose();
     }
 }

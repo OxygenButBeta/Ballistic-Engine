@@ -24,12 +24,16 @@ public sealed class Dx12SceneAS : IDisposable {
 
     public Mesh InstanceMesh(int i) => instances[i].mesh;
 
+    // FAZ 3c: the renderer behind each instance (same order as InstanceMesh/InstanceWorld). The Lumen card capture
+    // needs it to resolve per-submesh materials (MaterialFor), which the bare Mesh doesn't carry. Null-safe.
+    public IStaticMeshRenderer InstanceRenderer(int i) => instances[i].renderer;
+
     public Dx12SceneAS(Dx12Device device) {
         dev = device;
         device5 = dev.Device.QueryInterface<ID3D12Device5>();
     }
 
-    readonly List<(Mesh mesh, Matrix4x4 world)> instances = new();
+    readonly List<(Mesh mesh, Matrix4x4 world, IStaticMeshRenderer renderer)> instances = new();
 
     public void Ensure(IEnumerable<IStaticMeshRenderer> renderers) {
         instances.Clear();
@@ -40,7 +44,7 @@ public sealed class Dx12SceneAS : IDisposable {
             if (mesh?.VertexBuffer is not Dx12Buffer<GLVector3> vb || vb.Resource is null) continue;
             if (mesh.IndexBuffer is not Dx12IndexBuffer ib || ib.Resource is null) continue;
             Matrix4x4 world = ToNum(r.Transform.WorldMatrix);
-            instances.Add((mesh, world));
+            instances.Add((mesh, world, r));
             h.Add(mesh.GetHashCode());
             AddMatrix(ref h, world);
         }
@@ -54,7 +58,7 @@ public sealed class Dx12SceneAS : IDisposable {
         if (instances.Count == 0) { tlas?.Dispose(); tlas = null; return; }
 
         var toBuild = new List<(Mesh mesh, BuildRaytracingAccelerationStructureInputs inputs, ID3D12Resource result, ID3D12Resource scratch)>();
-        foreach (var (mesh, _) in instances) {
+        foreach (var (mesh, _, _) in instances) {
             if (blasByMesh.ContainsKey(mesh)) continue;
             var vb = (Dx12Buffer<GLVector3>)mesh.VertexBuffer;
             var ib = (Dx12IndexBuffer)mesh.IndexBuffer;
@@ -110,7 +114,7 @@ public sealed class Dx12SceneAS : IDisposable {
             HeapFlags.None, ResourceDescription.Buffer((ulong)((long)instSize * instances.Count)), ResourceStates.GenericRead);
         byte* ip = instBuf.Map<byte>(0);
         for (int i = 0; i < instances.Count; i++) {
-            var (mesh, world) = instances[i];
+            var (mesh, world, _) = instances[i];
             var inst = new RaytracingInstanceDescription {
                 Transform = ToDxrTransform(world), InstanceMask = 0xFF,
                 AccelerationStructure = blasByMesh[mesh].GPUVirtualAddress,
