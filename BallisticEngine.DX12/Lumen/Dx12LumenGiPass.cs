@@ -60,7 +60,18 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     public static bool WouldRun(Dx12FrameContext ctx) =>
         !ctx.Doors.Minimal && Armed(ctx) && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
 
-    public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx);
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives the GI slot itself; the v1
+    // graph then SKIPS this pass via RgV2OwnsLumenGi. Gate ONLY the instance Enabled, NOT the static WouldRun (read
+    // elsewhere to mirror ctx.LumenActiveThisFrame), exactly like Aurora. Door off (and door-on-while-plumbing) =>
+    // the flag is false => Enabled == WouldRun, unchanged. See Dx12FrameContext.RgV2OwnsLumenGi.
+    public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx) && !ctx.RgV2OwnsLumenGi;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point. FAZ 0 Record only builds/refreshes the Lumen scene substrate and
+    // writes NO GI (scene color is untouched), so RecordV2 needs NO input-state forcing — there is nothing it reads
+    // that the v2 import barriers must satisfy. Just run the same body. When FAZ 6 adds real screen-probe GI output
+    // (reading G-buffer depth/normal + writing scene color), force those entry states here, mirroring
+    // Dx12AuroraGiPass.RecordV2.
+    public void RecordV2(Dx12FrameContext ctx) => Record(ctx);
 
     public void Record(Dx12FrameContext ctx)
     {

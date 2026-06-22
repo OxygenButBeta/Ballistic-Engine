@@ -10,13 +10,34 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     public Dx12RenderPassEvent Event => Dx12RenderPassEvent.Reflections;
     public string Name => "Reflections";
 
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives Reflections itself; the
+    // v1 graph then SKIPS this pass via RgV2OwnsReflections. Gated FIRST so it overrides every env/volume term
+    // (the BALLISTIC_DX12_REFLECTIONS env is still read first to keep the cached-read side effect identical).
+    // Door off (and door-on-while-plumbing) => the flag is false => Enabled unchanged. See
+    // Dx12FrameContext.RgV2OwnsReflections.
     public bool Enabled(Dx12FrameContext ctx) {
         if (reflForceEnvUnread) { reflForceEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFLECTIONS"); reflForceEnvUnread = false; }
+        if (ctx.RgV2OwnsReflections) return false;
         if (ctx.Doors.Minimal) return false;
         if (reflForceEnv == "1") return true;
         if (reflForceEnv == "0") return false;
         if (ctx.PostFX.SsrIntensity <= 0f) return false;
         return ctx.PostFX.SsrEnabled;
+    }
+
+    // FAZ -1d-FINAL — render-graph v2 entry point (mirrors Dx12FogPass.RecordV2). v2 imports SceneColor
+    // (ReadWrite) + GBuffer (depth read), declares the access, then calls this to run the SAME record body
+    // (byte-identical to the v1 path). Under v2 the v1 barrier deriver is bypassed (pass skipped in v1) AND v2
+    // emits no barrier for the imports (equal states by design), so the body MUST own its input transitions.
+    // Record dispatches to DrawSsr or DrawRtReflections; the SSR path guards its own `target.ColorToShaderResource()`
+    // + `gbuffer.DepthToShaderResource()` behind `!ctx.BarriersDerived`, and the RT path forces those states
+    // unconditionally. Force the SSR entry states here so DrawSsr reads SceneColor + the G-buffer depth in the
+    // right state regardless of ctx.BarriersDerived (matches what the Declare()/Record() body assumes:
+    // SceneColorShaderRead + GBufferDepthShaderRead).
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.SceneColor.ColorToShaderResource();
+        ctx.GBuffer.DepthToShaderResource();
+        Record(ctx);
     }
 
     float ForcedIntensity(Dx12FrameContext ctx) =>

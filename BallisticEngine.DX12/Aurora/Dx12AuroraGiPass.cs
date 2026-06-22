@@ -126,7 +126,26 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
         !ctx.Doors.Minimal && Armed(ctx) && !Dx12LumenGiPass.Armed(ctx)
         && ctx.Dev.HasHardwareRayTracing && ctx.Dxr?.SceneAS != null;
 
-    public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx);
+    // FAZ -1d-FINAL — when render-graph v2 owns the whole frame (v1 bypassed) it drives Aurora GI itself; the v1
+    // graph then SKIPS this pass via RgV2OwnsAuroraGi. Gate ONLY the instance Enabled, NOT the static WouldRun:
+    // WouldRun is read elsewhere (the orchestrator mirrors it into ctx.AuroraActiveThisFrame so the deferred pass
+    // suppresses its IBL diffuse ambient, and the reflections pass gates its card sampling on it) and must stay
+    // semantically "would Aurora contribute GI this frame" regardless of which graph records it. Door off (and
+    // door-on-while-plumbing) => the flag is false => Enabled == WouldRun, unchanged. See
+    // Dx12FrameContext.RgV2OwnsAuroraGi.
+    public bool Enabled(Dx12FrameContext ctx) => WouldRun(ctx) && !ctx.RgV2OwnsAuroraGi;
+
+    // FAZ -1d-FINAL — render-graph v2 entry point. Aurora's Record is a big multi-dispatch compute chain that
+    // self-manages ALL its internal barriers (it has no `!ctx.BarriersDerived` guards — it unconditionally calls
+    // gbuffer.ToShaderResource() / target.ColorToShaderResource() / the UAV transitions itself in the pre-trace
+    // setup). So the chain owns every state from its known entry: G-buffer depth/normal/material as shader-read
+    // and scene color readable. Force exactly that entry state here (idempotent with what Record does first) then
+    // call Record — byte-identical to the v1 path, and robust even though v2 emits no import barriers.
+    public void RecordV2(Dx12FrameContext ctx) {
+        ctx.GBuffer.ToShaderResource();
+        ctx.SceneColor.ColorToShaderResource();
+        Record(ctx);
+    }
 
     // ---- trace (inline RayQuery compute) ----
     ID3D12RootSignature traceRootSig;   // HeapDirectlyIndexed; CBV b0/b1 + table{t0-t6, u0} + root SRV t7/t8/t9 + s0/s1

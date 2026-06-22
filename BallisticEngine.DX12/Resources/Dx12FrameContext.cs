@@ -112,6 +112,24 @@ public sealed class Dx12FrameContext {
     public bool RgV2OwnsTransparents { get; init; }
     public bool RgV2OwnsFog { get; init; }
 
+    // FAZ -1d-FINAL (reflections + GI group) — when render-graph v2 owns the WHOLE frame (v1 bypassed) it
+    // will drive these too, in event order: [GI 500] (Aurora OR Lumen — mutually exclusive) -> Reflections(600).
+    // The matching v1 pass's Enabled() returns false (skip) when its flag is set, so the pass runs exactly
+    // once. These mirror RgV2OwnsSky/Fog.
+    //
+    // STAY FALSE FOR NOW (plumbing only): the current v2 block (RunRenderGraphV2) runs at the END of the
+    // frame, AFTER v1's whole graph. GI(500) / Reflections(600) sit MID-frame; appending them to the
+    // end-of-frame block would REORDER them relative to still-v1 passes -> wrong output. They are only
+    // enabled once v1 is bypassed and the v2 graph owns the frame in event order. Default false => door-off
+    // byte-identical AND door-on unchanged (no v1 pass skips, RunRenderGraphV2 does not run them). The
+    // RecordV2 bodies + the v1 Enabled() `&& !RgV2Owns*` guards are in place, ready for that final wiring.
+    // Aurora/Lumen are still mutually exclusive (Aurora.WouldRun has `&& !Dx12LumenGiPass.Armed(ctx)`), so
+    // at most one of the two GI flags is ever meaningfully set; both gate only the instance Enabled, not the
+    // static WouldRun (which other code reads to mirror ctx.AuroraActiveThisFrame / ctx.LumenActiveThisFrame).
+    public bool RgV2OwnsReflections { get; init; }
+    public bool RgV2OwnsAuroraGi { get; init; }
+    public bool RgV2OwnsLumenGi { get; init; }
+
     public Dx12RenderDoors      Doors    { get; init; }
     public PostProcessSettings  PostFX   { get; init; }
     public RenderStats          Stats    { get; init; }
