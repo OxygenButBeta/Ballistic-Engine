@@ -365,6 +365,58 @@ public sealed class Dx12GlobalSdf : IDisposable {
             cl.ResourceBarrierTransition(clipmap, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
             clipmapState = ResourceStates.NonPixelShaderResource;
         });
+
+        if (!statsDone && Environment.GetEnvironmentVariable("BALLISTIC_DX12_GLOBALSDF_STATS") == "1")
+            DumpClipmapStats();
+    }
+
+    // DEBUG: read the composited clipmap back to the CPU and report voxel statistics (min/max distance, how many
+    // voxels are negative=inside / near-zero=surface band / saturated=empty). Answers "is the COMPOSITE correct"
+    // independently of the sphere-trace debug view. Gated by BALLISTIC_DX12_GLOBALSDF_STATS=1, runs once.
+    bool statsDone;
+    unsafe void DumpClipmapStats() {
+        statsDone = true;
+        int n = ClipRes * ClipRes * ClipRes;
+        // R32_Float clipmap → 4 bytes/voxel. GetCopyableFootprints gives the aligned row pitch.
+        var desc = clipmap.Description;
+        var fps = new PlacedSubresourceFootPrint[1]; var rc = new uint[1]; var rs = new ulong[1];
+        dev.Device.GetCopyableFootprints(desc, 0, 1, 0, fps, rc, rs, out ulong total);
+        using ID3D12Resource readback = dev.Device.CreateCommittedResource(HeapProperties.ReadbackHeapProperties,
+            HeapFlags.None, ResourceDescription.Buffer(total), ResourceStates.CopyDest);
+        // ExecuteSyncImmediate (NOT ExecuteSync): we are called mid-frame, right after the composite dispatch was
+        // RECORDED onto the still-open frame list (ExecuteSync just appends to it, nothing has run on the GPU yet).
+        // A plain ExecuteSync here would append the copy after the dispatch but ALSO never submit it; dev.Flush then
+        // waits on the wrong (already-signalled) fence → we Map the still-cleared (all-zero) readback and, worse,
+        // the half-built frame list can fault → DEVICE_REMOVED. ExecuteSyncImmediate closes+submits+waits the open
+        // frame (so the dispatch actually executes), runs the copy synchronously, then reopens the frame.
+        dev.ExecuteSyncImmediate(cl => {
+            var before = clipmapState;
+            if (before != ResourceStates.CopySource) cl.ResourceBarrierTransition(clipmap, before, ResourceStates.CopySource);
+            var d = new TextureCopyLocation(readback, fps[0]);
+            var s = new TextureCopyLocation(clipmap, 0);
+            cl.CopyTextureRegion(d, 0, 0, 0, s, null);
+            if (before != ResourceStates.CopySource) cl.ResourceBarrierTransition(clipmap, ResourceStates.CopySource, before);
+        });
+        PlacedSubresourceFootPrint fp = fps[0];
+        long rowPitch = fp.Footprint.RowPitch, slicePitch = rowPitch * ClipRes;
+        byte* p = readback.Map<byte>(0);
+        float mn = float.MaxValue, mx = float.MinValue; long neg = 0, band = 0, far = 0;
+        float bandEps = VoxelSize;
+        for (int z = 0; z < ClipRes; z++)
+            for (int y = 0; y < ClipRes; y++) {
+                var row = (float*)(p + (long)fp.Offset + z * slicePitch + y * rowPitch);
+                for (int x = 0; x < ClipRes; x++) {
+                    float v = row[x];
+                    mn = MathF.Min(mn, v); mx = MathF.Max(mx, v);
+                    if (v < -bandEps) neg++; else if (v < bandEps) band++; else if (v >= ClipHalfExtent - 1e-3f) far++;
+                }
+            }
+        readback.Unmap(0);
+        string line = $"[GlobalSdf STATS] {n} voxels: min={mn:0.###} max={mx:0.###} inside(<-{bandEps:0.##})={neg} " +
+                      $"surfaceBand(|d|<{bandEps:0.##})={band} far(>={ClipHalfExtent:0.#})={far} " +
+                      $"({100.0 * band / n:0.##}% band, {100.0 * neg / n:0.##}% inside)";
+        Console.WriteLine(line);
+        Debugging.Log(line);
     }
 
     // Transition the clipmap to a pixel-shader-readable state (the debug fullscreen pass reads it as a PS SRV).

@@ -52,20 +52,28 @@ RWTexture3D<float>            Clipmap    : register(u0);
 // Mirrors MeshSdf.Sample on the CPU: voxel-center space, clamp to [0,res-1], linear filter via a clamp sampler.
 SamplerState LinearClamp : register(s0);
 
-float SampleMeshSdf(uint texIndex, float3 gridOrigin, float3 gridExtent, float3 localP, float maxDist) {
-    // Out-of-grid → return the grid's max distance (this mesh contributes nothing closer than its band edge).
-    float3 rel = localP - gridOrigin;
-    if (any(rel < -1e-4) || any(rel > gridExtent + 1e-4))
-        return maxDist;
-
+float SampleMeshSdfRaw(uint texIndex, float3 gridOrigin, float3 gridExtent, float3 localP) {
     // Normalized [0,1] grid coordinate. The per-mesh SDF stores voxel CENTERS; a clamp-sampled 3D texture maps
     // texel centers to (i+0.5)/res, which matches MeshSdf's voxel-center convention, so a straight normalized
     // sample is the trilinear voxel-center interpolation (clamped at the borders, like MeshSdf.Sample).
+    float3 rel = localP - gridOrigin;
     float3 denom = max(gridExtent, float3(1e-6, 1e-6, 1e-6));
     float3 uvw = saturate(rel / denom);
-
     Texture3D<float> tex = ResourceDescriptorHeap[texIndex];
     return tex.SampleLevel(LinearClamp, uvw, 0);
+}
+
+// Signed distance from `p` to the axis-aligned box [bmin,bmax] (exact outside, conservative inside as the
+// negative inset). Used as the per-instance distance when the voxel is OUTSIDE that instance's mesh-SDF grid —
+// the surface lives inside this box, so this is a guaranteed lower bound on the true distance, hence sphere-
+// trace-safe (it can never overshoot the geometry the way a saturated "far" value would).
+float BoxSignedDistance(float3 p, float3 bmin, float3 bmax) {
+    float3 c = 0.5 * (bmin + bmax);
+    float3 h = 0.5 * (bmax - bmin);
+    float3 q = abs(p - c) - h;
+    float outside = length(max(q, 0.0));
+    float inside  = min(max(q.x, max(q.y, q.z)), 0.0);
+    return outside + inside;
 }
 
 [numthreads(4, 4, 4)]
@@ -75,22 +83,38 @@ void CSComposite(uint3 id : SV_DispatchThreadID) {
     // World-space center of this clipmap voxel.
     float3 worldP = ClipOrigin + (float3(id) + 0.5) * VoxelSize;
 
-    // Union of all overlapping mesh SDFs = MIN signed distance. Start at the clip "far" value so empty cells read
-    // a large positive distance (definitely-empty), which the sphere-trace treats as a big safe step.
+    // Union of all overlapping mesh SDFs = MIN signed distance. Start at the clip "far" value (the band clamp).
+    // CRITICAL for sphere tracing: a voxel OUTSIDE every mesh grid must NOT store ClipHalfExtent (that would let
+    // the trace leap a whole clip-extent and skip small geometry — the FAZ 2 fidelity bug). Instead each instance
+    // contributes a VALID conservative distance everywhere: its world-AABB exterior distance is a guaranteed lower
+    // bound on the true surface distance (the surface is inside the AABB), so the min over instances is a true,
+    // monotone, sphere-trace-safe global SDF. Inside an instance's grid we upgrade to the exact mesh-SDF sample.
     float best = ClipHalfExtent;
 
     for (uint i = 0; i < InstanceCount; ++i) {
         SdfInstance inst = Instances[i];
         if (inst.SdfTexIndex == 0xFFFFFFFFu) continue;   // mesh has no SDF → skip
 
-        // Cheap world-AABB reject: if the voxel center is well outside this instance's SDF band, it can't be the
-        // nearest surface for this cell (the band has only a few voxels of slack around the surface).
-        float3 lo = inst.WorldMin - VoxelSize;
-        float3 hi = inst.WorldMax + VoxelSize;
-        if (any(worldP < lo) || any(worldP > hi)) continue;
+        // Conservative distance to this instance from its world AABB (valid for ALL voxels, near and far).
+        float boxD = BoxSignedDistance(worldP, inst.WorldMin, inst.WorldMax);
+        // Coarse cull: if even the AABB exterior distance can't beat the running best, the exact in-grid sample
+        // can only be larger (the surface is inside the box) → this instance can't win. Cheap + correct.
+        if (boxD >= best) continue;
 
+        float d = boxD;
+
+        // Inside the mesh grid → use the EXACT trilinear mesh-SDF distance. The per-mesh SDF stores the true signed
+        // distance to the surface throughout its (padded) grid — negative inside the solid, POSITIVE in hollow
+        // interiors (e.g. the empty space inside a Cornell box reads +distance-to-nearest-wall). We must take this
+        // value VERBATIM, NOT min(meshD, boxD): boxD is the distance to the object's AABB, which is NEGATIVE
+        // anywhere inside the bounding box — min()-ing it in would mark the entire hollow interior as solid (the
+        // FAZ 2 "flat blob" bug: the trace then hits the AABB shell and the real walls vanish). boxD is only valid
+        // OUTSIDE the grid, where the mesh SDF has no data.
         float3 localP = mul(float4(worldP, 1.0), inst.WorldToLocal).xyz;
-        float d = SampleMeshSdf(inst.SdfTexIndex, inst.GridOrigin, inst.GridExtent, localP, inst.MaxLocalDist);
+        float3 rel = localP - inst.GridOrigin;
+        if (all(rel >= 0.0) && all(rel <= inst.GridExtent)) {
+            d = SampleMeshSdfRaw(inst.SdfTexIndex, inst.GridOrigin, inst.GridExtent, localP);
+        }
 
         // NOTE (v1 limitation): the mesh SDF is in MESH-LOCAL units. A non-uniformly scaled instance would need
         // the distance rescaled by the world scale; v1 assumes ~uniform scale (true for the GI test scenes). A
@@ -98,7 +122,7 @@ void CSComposite(uint3 id : SV_DispatchThreadID) {
         best = min(best, d);
     }
 
-    // Clamp to the representable band so the texture (R16F) never stores ±Inf and the trace reads bounded steps.
+    // Clamp to the representable band so the texture never stores ±Inf and the trace reads bounded steps.
     Clipmap[id] = clamp(best, -ClipHalfExtent, ClipHalfExtent);
 }
 
