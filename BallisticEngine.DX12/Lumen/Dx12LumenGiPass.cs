@@ -442,6 +442,165 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         });
     }
 
+    // FAZ 5 — TRACE DEBUG view (BALLISTIC_DX12_LUMEN_TRACE_DEBUG=1): per camera pixel, gather N cosine hemisphere rays
+    // through the shared LumenTrace abstraction (HW TLAS or SW global-SDF) → sample the lit surface cache → write the
+    // mean indirect irradiance E into the HDR scene color. The keystone proof + the FAZ 6 screen-probe preview. Mirrors
+    // the SDF/card debug pipelines (CBV b0 + root SRVs t0-t3 + 2-SRV G-buffer table t4/t5 + HeapDirectlyIndexed bindless
+    // for the clipmap/FinalLighting reads + clamp sampler s0). Lazily built on the first debug frame.
+    ID3D12RootSignature traceDbgRootSig;
+    ID3D12PipelineState traceDbgPso;
+    Dx12FrameCb<TraceDebugConstants> traceDbgCb;
+    bool loggedTraceDbg;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct TraceDebugConstants {
+        // --- the LumenTrace parameter block (MUST be first; the include reads these by name) ---
+        public Vector3 LtClipOrigin;   public float LtVoxelSize;
+        public Vector3 LtCamPosUnused; public float LtClipHalfExtent;
+        public uint LtClipResX, LtClipResY, LtClipResZ; public float LtMaxTraceDist;
+        public uint LtAtlasSize, LtCardCount, LtInstanceCount, LtFinalReadIdx;
+        public uint LtClipmapIdx, LtFinalValid, LtHasTlas, LtSkyIdx;
+        public float LtSkyIntensity, LtUseSky, LtSurfBias, LtPad0;
+        // --- debug-view-only fields ---
+        public Matrix4x4 InvViewProj;
+        public Vector3 CamPos;     public uint RayCount;
+        public uint PreferSW;      public uint FrameIndex;
+        public uint DebugMode;     public float Intensity;
+        public Vector2 DbgPad;
+    }
+
+    static int traceDebugDoor = -2;
+    static bool TraceDebug() {
+        if (traceDebugDoor == -2)
+            traceDebugDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TRACE_DEBUG") == "1" ? 1 : 0;
+        return traceDebugDoor == 1;
+    }
+
+    unsafe void EnsureTraceDebugPipeline()
+    {
+        if (traceDbgPso != null) return;
+        // CBV b0 | root SRVs t0 TLAS / t1 cards / t2 pages / t3 ranges | 2-SRV G-buffer table (t4 depth, t5 normal) |
+        // clamp sampler s0. HeapDirectlyIndexed so the include's clipmap + FinalLighting (+ optional sky) resolve from
+        // ResourceDescriptorHeap[] (the SAME bound bindless heap serves the table AND the bindless reads).
+        var cbv    = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var tlas   = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(0, 0), ShaderVisibility.All);
+        var cards  = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(1, 0), ShaderVisibility.All);
+        var pages  = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(2, 0), ShaderVisibility.All);
+        var ranges = new RootParameter1(RootParameterType.ShaderResourceView, new RootDescriptor1(3, 0), ShaderVisibility.All);
+        var gbRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 2, baseShaderRegister: 4);   // t4,t5
+        var gbTable = new RootParameter1(new RootDescriptorTable1(gbRange), ShaderVisibility.Pixel);
+        var clamp = new StaticSamplerDescription(ShaderVisibility.All, 0, 0) {
+            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Clamp, AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1, ComparisonFunction = ComparisonFunction.Never,
+            MinLOD = 0, MaxLOD = float.MaxValue,
+        };
+        traceDbgRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
+            new RootSignatureDescription1(
+                RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                new[] { cbv, tlas, cards, pages, ranges, gbTable }, new[] { clamp })));
+
+        // The debug shader #includes "Lumen/LumenTrace.hlsl"; there is NO DXC include handler (shaders are embedded
+        // strings), so prepend the include source + strip the #include line — the established pattern (see Dx12NrdDenoiser).
+        string inc  = EmbeddedShaderSource.ReadHlsl("Lumen/LumenTrace.hlsl");
+        string body = EmbeddedShaderSource.ReadHlsl("Lumen/LumenTraceDebug.hlsl");
+        body = System.Text.RegularExpressions.Regex.Replace(
+            body, "(?m)^\\s*#include\\s+\"Lumen/LumenTrace\\.hlsl\".*$", inc);
+
+        byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, body, "VSDebug", "LumenTraceDebug.hlsl");
+        byte[] ps = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, body, "PSDebug", "LumenTraceDebug.hlsl");
+        traceDbgPso = dev.Device.CreateGraphicsPipelineState(new GraphicsPipelineStateDescription {
+            RootSignature = traceDbgRootSig, VertexShader = vs, PixelShader = ps, InputLayout = null,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle, SampleMask = uint.MaxValue,
+            RasterizerState = RasterizerDescription.CullNone, BlendState = BlendDescription.Opaque,
+            DepthStencilState = DepthStencilDescription.None,
+            RenderTargetFormats = new[] { Dx12OffscreenTarget.HdrFormat },
+            DepthStencilFormat = Format.Unknown, SampleDescription = new SampleDescription(1, 0),
+        });
+        traceDbgCb = new Dx12FrameCb<TraceDebugConstants>(dev);
+    }
+
+    unsafe void RecordTraceDebug(Dx12FrameContext ctx)
+    {
+        Dx12LumenCardScene cards = scene.CardScene;
+        Dx12SceneAS sceneAS = ctx.Dxr?.SceneAS;
+        bool hasTlas = sceneAS != null && sceneAS.Valid;
+        // Backend: SW if forced or no TLAS; else HW. SW needs a built clipmap; if neither backend is usable, skip.
+        bool forceSW = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TRACE_SW") == "1";
+        bool preferSW = forceSW || !hasTlas;
+        bool sdfReady = globalSdf != null && globalSdf.Valid && globalSdf.ClipmapSrvBindless >= 0;
+
+        if (cards is null || !cards.Valid || cards.CardCount == 0 || ctx.GBuffer == null ||
+            (preferSW && !sdfReady) || (!preferSW && !hasTlas)) {
+            if (!loggedTraceDbg) { loggedTraceDbg = true;
+                Console.WriteLine($"[LumenTraceDebug] SKIP cards={(cards==null?"null":cards.CardCount.ToString())} " +
+                    $"valid={cards?.Valid} hasTlas={hasTlas} preferSW={preferSW} sdfReady={sdfReady} finalValid={cards?.FinalValid}"); }
+            return;
+        }
+        EnsureTraceDebugPipeline();
+        globalSdf?.ToPixelShaderResource();   // SW march reads the clipmap as a (bindless) SRV — make it readable.
+
+        Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
+        uint rays = (uint)Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_TRACE_RAYS", 8f), 1, 64);
+        uint mode = (uint)Math.Clamp((int)EnvF("BALLISTIC_DX12_LUMEN_TRACE_MODE", 0f), 0, 2);
+        float intensity = EnvF("BALLISTIC_DX12_LUMEN_TRACE_INTENSITY", 1f);
+        float maxDist = EnvF("BALLISTIC_DX12_LUMEN_TRACE_MAXDIST",
+            globalSdf != null ? globalSdf.ClipWorldExtent * 1.8f : 1e4f);
+        int clipIdx = globalSdf?.ClipmapSrvBindless ?? -1;
+
+        traceDbgCb.Write(new TraceDebugConstants {
+            LtClipOrigin = globalSdf?.ClipOrigin ?? Vector3.Zero,
+            LtVoxelSize = globalSdf?.ClipVoxelSize ?? 1f,
+            LtClipHalfExtent = globalSdf?.ClipHalf ?? 1f,
+            LtClipResX = (uint)(globalSdf?.ClipRes ?? 1), LtClipResY = (uint)(globalSdf?.ClipRes ?? 1),
+            LtClipResZ = (uint)(globalSdf?.ClipRes ?? 1), LtMaxTraceDist = maxDist,
+            LtAtlasSize = (uint)cards.AtlasSize, LtCardCount = (uint)cards.CardCount,
+            LtInstanceCount = (uint)cards.InstanceCount, LtFinalReadIdx = (uint)Math.Max(cards.FinalReadSrvIdx, 0),
+            LtClipmapIdx = (uint)Math.Max(clipIdx, 0), LtFinalValid = cards.FinalValid ? 1u : 0u,
+            LtHasTlas = hasTlas ? 1u : 0u, LtSkyIdx = 0u,
+            LtSkyIntensity = 0f, LtUseSky = 0f, LtSurfBias = 0.03f, LtPad0 = 0f,
+            InvViewProj = Matrix4x4.Transpose(invVP),
+            CamPos = ctx.CamPos, RayCount = rays,
+            PreferSW = preferSW ? 1u : 0u, FrameIndex = (uint)ctx.FrameCounter,
+            DebugMode = mode, Intensity = intensity, DbgPad = Vector2.Zero,
+        });
+
+        if (!loggedTraceDbg) { loggedTraceDbg = true;
+            Console.WriteLine($"[LumenTraceDebug] DRAW backend={(preferSW?"SW":"HW")} rays={rays} mode={mode} " +
+                $"cards={cards.CardCount} inst={cards.InstanceCount} finalReadIdx={cards.FinalReadSrvIdx} " +
+                $"clipIdx={clipIdx} finalValid={cards.FinalValid} maxDist={maxDist:0.#}"); }
+
+        var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
+        ulong cbAddr = traceDbgCb.Gpu;
+        ulong cardAddr = cards.CardBufferGpuAddress;
+        ulong pageAddr = cards.PageBufferGpuAddress;
+        ulong rangeAddr = cards.RangeBufferGpuAddress != 0 ? cards.RangeBufferGpuAddress : cardAddr;
+        ulong tlasAddr = hasTlas ? sceneAS.TlasAddress : 0;
+        Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
+
+        // The trace reads the clipmap + FinalLighting via ResourceDescriptorHeap[] → the SINGLE bound CBV/SRV/UAV heap
+        // MUST be the bindless heap (where those reserved-tail descriptors live). So the G-buffer t4/t5 table is COPIED
+        // into a dynamic bindless-heap range here (NOT a persistent reserved slot — re-stamped every frame, used
+        // immediately within this same recorded draw, AFTER all GPU-driven work for the frame, so no Reset() clobbers it).
+        int gbBase = bindless.AllocateRange(2);
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(gbBase + 0), ctx.GBuffer.DepthSrvCpu, heapType);     // t4 depth
+        dev.Device.CopyDescriptorsSimple(1, bindless.Cpu(gbBase + 1), ctx.GBuffer.ColorSrvCpu(1), heapType);  // t5 normal (RT1)
+        GpuDescriptorHandle gbBindlessGpu = bindless.Gpu(gbBase);
+
+        ctx.SceneColor.RenderColorOnly(cl => {
+            cl.SetGraphicsRootSignature(traceDbgRootSig);
+            cl.SetPipelineState(traceDbgPso);
+            cl.SetDescriptorHeaps(bindless.Heap);
+            cl.SetGraphicsRootConstantBufferView(0, cbAddr);
+            if (tlasAddr != 0) cl.SetGraphicsRootShaderResourceView(1, tlasAddr);
+            cl.SetGraphicsRootShaderResourceView(2, cardAddr);
+            cl.SetGraphicsRootShaderResourceView(3, pageAddr);
+            cl.SetGraphicsRootShaderResourceView(4, rangeAddr);
+            cl.SetGraphicsRootDescriptorTable(5, gbBindlessGpu);
+            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            cl.DrawInstanced(3, 1, 0, 0);
+        });
+    }
+
     static float EnvF(string name, float fallback) =>
         float.TryParse(Environment.GetEnvironmentVariable(name), System.Globalization.CultureInfo.InvariantCulture,
             out float v) ? v : fallback;
@@ -544,6 +703,14 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (LightDebug() && ctx.SceneColor != null)
             RecordLightDebug(ctx);
 
+        // FAZ 5 verification artifact (the KEYSTONE): per camera pixel, gather N cosine hemisphere rays through the
+        // shared LumenTrace abstraction (HW TLAS or SW global-SDF) → sample the LIT surface cache at each hit → write
+        // the mean indirect irradiance E into the HDR scene color. Drawn LAST (after LightCards lit the cache THIS
+        // frame, so the trace samples this frame's lit cache — see the ordering note below) and after the SDF build so
+        // the SW backend has a clipmap. Default off → scene color untouched. The preview of FAZ 6 (screen probes).
+        if (TraceDebug() && ctx.SceneColor != null)
+            RecordTraceDebug(ctx);
+
         // TODO FAZ 5+: SDF software ray trace (sphere-march this clipmap) → FAZ 3: surface-cache gather → FAZ 6:
         // screen-probe diffuse + additive combine.
     }
@@ -556,5 +723,6 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         cardDbgPso?.Dispose(); cardDbgRootSig?.Dispose(); cardDbgCb?.Dispose();
         capDbgPso?.Dispose(); capDbgRootSig?.Dispose(); capDbgCb?.Dispose(); capDbgSrv?.Dispose();
         litDbgPso?.Dispose(); litDbgRootSig?.Dispose(); litDbgCb?.Dispose(); litDbgSrv?.Dispose();
+        traceDbgPso?.Dispose(); traceDbgRootSig?.Dispose(); traceDbgCb?.Dispose();
     }
 }

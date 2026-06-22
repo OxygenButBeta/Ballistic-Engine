@@ -31,8 +31,8 @@ internal static class Dx12BindlessTail
     // (typed-mismatch UAV/SRV → GPU page fault → device removed). Slot layout: +0 = clipmap UAV (u0 table),
     // +1..+GlobalSdfMaxTextures = per-mesh SDF SRVs (ResourceDescriptorHeap[]). Door-gated; nothing allocated when off.
     public const int GlobalSdfMaxTextures = 254;                          // unique mesh SDFs (CornellBox/GI scenes: a handful)
-    const int GlobalSdfReserved = GlobalSdfMaxTextures + 2;               // +1 clipmap UAV, +1 slack
-    public const int GlobalSdfUsed = GlobalSdfMaxTextures + 1;
+    const int GlobalSdfReserved = GlobalSdfMaxTextures + 2;               // +1 clipmap UAV, +1 clipmap SRV (FAZ 5 trace)
+    public const int GlobalSdfUsed = GlobalSdfMaxTextures + 2;            // +0 UAV, +1..+Max SDF SRVs, +1+Max clipmap SRV
     public const int GlobalSdfTableBase = AuroraScreenProbeTableBase - GlobalSdfReserved;
 
     // Lumen FAZ 3b/3d SURFACE-CACHE ATLAS — its own reserved tail below the global-SDF tail. Holds the PERSISTENT

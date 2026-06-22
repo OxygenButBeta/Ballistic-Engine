@@ -58,6 +58,11 @@ public sealed class Dx12GlobalSdf : IDisposable {
     // an RWTexture3D / Texture3D) → GPU page fault → DXGI_ERROR_DEVICE_REMOVED. The reserved tail is never touched by
     // the cursor, exactly like RtReflTableBase / AuroraTableBase.
     int clipUavBindless = -1;                // = GlobalSdfTableBase + 0 (the composite's u0 UAV table slot)
+    // FAZ 5 — a PERSISTENT bindless Texture3D SRV for the clipmap, so the shared Lumen trace include can sphere-march it
+    // via ResourceDescriptorHeap[ClipmapSrvBindless]. Stamped ONCE into the reserved GlobalSdf tail slack slot (NOT the
+    // dynamic Allocate() cursor — same device-removed rule as clipUavBindless). -1 until EnsureClipmap runs.
+    int clipSrvBindless = -1;
+    public int ClipmapSrvBindless => clipSrvBindless;
     int nextSdfSlot;                         // running count of unique-mesh SDF SRV slots handed out from the tail
     public CpuDescriptorHandle ClipmapSrvCpu => Dx12Backend.SrvStore.Cpu(clipSrvIndex);
     public ID3D12Resource ClipmapResource => clipmap;
@@ -173,6 +178,15 @@ public sealed class Dx12GlobalSdf : IDisposable {
             Format = Format.R32_Float, ViewDimension = UnorderedAccessViewDimension.Texture3D,
             Texture3D = new Texture3DUnorderedAccessView { FirstWSlice = 0, WSize = (uint)ClipRes, MipSlice = 0 },
         }, Dx12Backend.BindlessHeap.Cpu(clipUavBindless));
+
+        // FAZ 5 — the PERSISTENT clipmap Texture3D SRV in the reserved tail's slack slot (just past the per-mesh SDF
+        // SRVs: +0 UAV, +1..+MaxTextures SDFs, +1+MaxTextures = this slack). The trace include reads it bindlessly.
+        clipSrvBindless = Dx12BindlessTail.GlobalSdfTableBase + 1 + Dx12BindlessTail.GlobalSdfMaxTextures;
+        dev.Device.CreateShaderResourceView(clipmap, new ShaderResourceViewDescription {
+            Format = Format.R32_Float, ViewDimension = ShaderResourceViewDimension.Texture3D,
+            Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Texture3D = new Texture3DShaderResourceView { MipLevels = 1, MostDetailedMip = 0 },
+        }, Dx12Backend.BindlessHeap.Cpu(clipSrvBindless));
     }
 
     // Get (or upload + cache) the per-mesh SDF GPU texture for `mesh`. Returns null when the mesh has no SDF.

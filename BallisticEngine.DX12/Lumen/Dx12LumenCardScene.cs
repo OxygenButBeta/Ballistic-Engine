@@ -77,6 +77,9 @@ public sealed class Dx12LumenCardScene : IDisposable {
     public int CardCount { get; private set; }
     public int PageCount { get; private set; }
     public int DroppedCards { get; private set; }
+    // FAZ 5 — the trace's SampleSurfaceCache_Instance maps an instance id → its card range; the count = the range table
+    // length (one entry per SceneAS instance). Exposed so the trace CB carries the same InstanceCount LumenCardLight uses.
+    public int InstanceCount => instanceRanges.Length;
 
     // Per-instance card range (offset into the card list + count) — Dx12LumenScene writes these into its meta.
     public struct InstanceCardRange { public uint Offset; public uint Count; }
