@@ -128,7 +128,8 @@ internal sealed class Dx12LumenScreenProbe : IDisposable
         gbuffer.ToShaderResource();
 
         Matrix4x4.Invert(ctx.ViewProj, out Matrix4x4 invVP);
-        float intensity = EnvF("BALLISTIC_DX12_LUMEN_INTENSITY", 1f);
+        // env OVERRIDES the LumenVolume intensity (env wins for A/B; else the artist's volume value).
+        float intensity = EnvF("BALLISTIC_DX12_LUMEN_INTENSITY", ctx.PostFX?.LumenIntensity ?? 1f);
         float maxDist = EnvF("BALLISTIC_DX12_LUMEN_PROBE_MAXDIST",
             globalSdf != null ? globalSdf.ClipWorldExtent * 1.8f : 1e4f);
         int clipIdx = globalSdf?.ClipmapSrvBindless ?? -1;

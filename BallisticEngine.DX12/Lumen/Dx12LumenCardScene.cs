@@ -199,12 +199,12 @@ public sealed class Dx12LumenCardScene : IDisposable {
     // is page-indexed (group.z = page) so there is NO scan at all. Door: BALLISTIC_DX12_LUMEN_LIGHT_UPDATEFACTOR
     // (default 16; 1 = relight all pages every frame = old behaviour, for A/B).
     int lightPageCursor;
-    static int lightUpdateFactor = -1;
-    static int LightUpdateFactor() {
-        if (lightUpdateFactor < 0)
-            lightUpdateFactor = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_LIGHT_UPDATEFACTOR"),
-                out int v) && v >= 1 ? v : 16;
-        return lightUpdateFactor;
+    // FAZ 10 — env OVERRIDES the LumenVolume value: if BALLISTIC_DX12_LUMEN_LIGHT_UPDATEFACTOR is set it wins (headless
+    // A/B / determinism), else the artist's volume value (fxValue) drives it. Read per-call (the volume can change).
+    static int LightUpdateFactor(int fxValue) {
+        if (int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_LIGHT_UPDATEFACTOR"), out int v) && v >= 1)
+            return v;
+        return fxValue >= 1 ? fxValue : 16;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -274,6 +274,8 @@ public sealed class Dx12LumenCardScene : IDisposable {
         // FAZ 10 — track the camera for residency prioritization. Under a deterministic capture we DON'T move-trigger
         // re-residency (the camera is fixed anyway, and a stable allocation keeps the golden reproducible).
         cameraPos = ctx.CamPos; cameraValid = true;
+        // Capture the LumenVolume resolution scale for the allocator (env still overrides inside ResScale()).
+        fxResScale = ctx.PostFX?.LumenResolutionScale ?? 1f;
 
         int s = ComputeTopologyStamp(sceneAS);
         if (topologyDirty || s != topologyStamp || cardBuf == null) {
@@ -514,10 +516,13 @@ public sealed class Dx12LumenCardScene : IDisposable {
     // cards still get up to CapResLevel; distant cards collapse to 8-32px, so thousands fit. Without a camera (headless
     // pre-camera build) we fall back to the world-size rule (so a no-camera build stays well-defined). Door
     // BALLISTIC_DX12_LUMEN_RES_SCALE tunes the global density.
-    static float resScale = -1f;
-    static float ResScale() {
-        if (resScale < 0f) resScale = EnvF("BALLISTIC_DX12_LUMEN_RES_SCALE", 1f);
-        return resScale;
+    // FAZ 10 — env OVERRIDES the LumenVolume value (env wins; else the artist's resolutionScale). Captured per-build in
+    // `fxResScale` from ctx.PostFX (PickResLevel runs deep in the allocator without ctx); env still highest priority.
+    float fxResScale = 1f;
+    float ResScale() {
+        if (float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_RES_SCALE"),
+            System.Globalization.CultureInfo.InvariantCulture, out float v)) return v;
+        return fxResScale > 0f ? fxResScale : 1f;
     }
     int PickResLevel(in GpuLumenCard card) {
         float maxExtent = MathF.Max(card.ExtentX, card.ExtentY) * 2f;   // full in-plane world size
@@ -783,7 +788,8 @@ public sealed class Dx12LumenCardScene : IDisposable {
         ulong lightAddr = clustered?.LightBufGpuAddress ?? 0;
         float lightCount = clustered?.LightCount ?? 0;
 
-        float indirectRays = EnvF("BALLISTIC_DX12_LUMEN_INDIRECT_RAYS", 4f);
+        // env OVERRIDES the LumenVolume value (env wins; else the artist's indirectRays). Same pattern for updateFactor.
+        float indirectRays = EnvF("BALLISTIC_DX12_LUMEN_INDIRECT_RAYS", ctx.PostFX?.LumenIndirectRays ?? 4);
         float indirectIntensity = EnvF("BALLISTIC_DX12_LUMEN_INDIRECT_INTENSITY", 1f);
 
         // FAZ 10 — pick this frame's page-update WINDOW (round-robin). updateFactor=N → ceil(PageCount/N) pages/frame,
@@ -791,7 +797,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
         // is covered, then repeats). updateFactor=1 → the whole atlas every frame (old behaviour). Under a deterministic
         // capture we relight ALL pages every frame (window = full) so a fixed golden frame is independent of the cursor
         // phase — amortization is a perf optimization, not a correctness one, and the golden must stay reproducible.
-        int updateFactor = ctx.DeterministicCapture ? 1 : LightUpdateFactor();
+        int updateFactor = ctx.DeterministicCapture ? 1 : LightUpdateFactor(ctx.PostFX?.LumenLightingUpdateFactor ?? 16);
         // Small scenes (CornellBox = 12 pages) must NOT amortize: a 1-page/frame window on a tiny set both stalls
         // convergence and is pointless (relighting all 12 pages is already free). Relight the WHOLE atlas in one frame
         // whenever the resident set is small (≤ AmortizeMinPages); amortization only kicks in for the Bistro-scale

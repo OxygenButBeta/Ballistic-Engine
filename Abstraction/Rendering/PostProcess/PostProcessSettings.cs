@@ -141,4 +141,18 @@ public sealed class PostProcessSettings {
     public bool AuroraReflections { get; set; } = true;       // feed RT reflections from the radiance cache
     public float AuroraAoStrength { get; set; } = 0f;         // GTAO darkening of the GI contact term (0 = none)
     public bool AuroraDebugRawIndirect { get; set; } = false; // debug: show raw indirect irradiance E
+
+    // Lumen GI (UE5-style: mesh-card surface cache → SW/HW trace → screen-probe gather → world radiance cache →
+    // reflections). The DEFAULT GI. Driven by LumenVolume (artist-facing); the BALLISTIC_DX12_LUMEN_* env vars
+    // OVERRIDE these per-field (env wins) so headless A/B + determinism are unaffected. Defaults mirror the renderer's
+    // env defaults so a no-volume scene renders identically to before LumenVolume existed.
+    public bool LumenEnabled { get; set; } = true;            // master switch (within the GI=lumen selector)
+    public float LumenIntensity { get; set; } = 1f;           // diffuse GI combine gain
+    public float LumenSkyIntensity { get; set; } = 1f;        // skylight on a trace miss
+    public int LumenIndirectRays { get; set; } = 4;           // radiosity/multi-bounce rays per surface-cache texel
+    public int LumenLightingUpdateFactor { get; set; } = 16;  // pages relit/frame = PageCount/this (amortization)
+    public float LumenResolutionScale { get; set; } = 1f;     // surface-cache page resolution multiplier
+    public bool LumenReflections { get; set; } = true;        // Lumen reflections vs legacy SSR/RT
+    public bool LumenVolumetricGi { get; set; } = true;       // fog in-scatters the radiance cache
+    public bool LumenDebugRawIndirect { get; set; } = false;  // debug: show raw indirect irradiance E
 }

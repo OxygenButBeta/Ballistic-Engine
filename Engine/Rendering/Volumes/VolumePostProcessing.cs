@@ -130,6 +130,29 @@ public static class VolumePostProcessing {
             }
         }
 
+        if (stack.GetComponent<LumenVolume>() is { } lumen) {
+            fx.LumenEnabled = lumen.enabled.Value;
+            fx.LumenIntensity = lumen.intensity.Value;
+            fx.LumenSkyIntensity = lumen.skyIntensity.Value;
+            fx.LumenReflections = lumen.reflections.Value;
+            fx.LumenVolumetricGi = lumen.volumetricGi.Value;
+            fx.LumenDebugRawIndirect = lumen.debugRawIndirect.Value;
+
+            switch (lumen.quality.Value) {
+                case LumenQuality.High:
+                    fx.LumenIndirectRays = 6; fx.LumenLightingUpdateFactor = 8;  fx.LumenResolutionScale = 1.5f; break;
+                case LumenQuality.Balanced:
+                    fx.LumenIndirectRays = 4; fx.LumenLightingUpdateFactor = 16; fx.LumenResolutionScale = 1f;   break;
+                case LumenQuality.Performance:
+                    fx.LumenIndirectRays = 2; fx.LumenLightingUpdateFactor = 32; fx.LumenResolutionScale = 0.75f; break;
+                default:
+                    fx.LumenIndirectRays = lumen.indirectRays.Value;
+                    fx.LumenLightingUpdateFactor = lumen.lightingUpdateFactor.Value;
+                    fx.LumenResolutionScale = lumen.resolutionScale.Value;
+                    break;
+            }
+        }
+
         if (stack.GetComponent<Reflections>() is { } refl) {
             fx.ReflectionMode = refl.mode.Value;
             fx.SsrEnabled = refl.mode.Value != ReflectionMode.Off;

@@ -207,8 +207,10 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
         // FAZ 10 — VOLUMETRIC GI: when the Lumen radiance cache is published this frame, fill RC_PARAMS so the march
         // in-scatters real indirect radiance. Off (Valid=false / door) → RcEnabled=0 → the march keeps its constant
         // SkyAmbient (byte-identical). The march's SRVs then ride a dynamic bindless range (see the march draw below).
-        bool fogGi = ctx.LumenRc.Valid
-                     && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_VOLGI") != "0";
+        // env OVERRIDES the LumenVolume volumetricGi toggle: explicit env (0/1) wins; else the artist's volume value.
+        string volGiEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_VOLGI");
+        bool volGiWanted = volGiEnv == "1" || (volGiEnv != "0" && (ctx.PostFX?.LumenVolumetricGi ?? true));
+        bool fogGi = ctx.LumenRc.Valid && volGiWanted;
         if (fogGi) {
             var rc = ctx.LumenRc;
             fc.RcOrigin = rc.Origin; fc.RcProbeSpacing = rc.ProbeSpacing;
