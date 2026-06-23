@@ -26,6 +26,11 @@ public sealed class Dx12ReflectionsPass : IRenderPass, IDisposable {
     public bool WouldRun(Dx12FrameContext ctx) {
         if (reflForceEnvUnread) { reflForceEnv = Environment.GetEnvironmentVariable("BALLISTIC_DX12_REFLECTIONS"); reflForceEnvUnread = false; }
         if (ctx.Doors.Minimal) return false;
+        // FAZ 8 — yield to Lumen reflections (mutual exclusion: never two reflection composites). When Lumen GI owns
+        // the frame AND the REFL door is on, Dx12LumenGiPass runs the reflection trace through the surface cache; this
+        // pass MUST NOT also run (it would re-composite specular reflections into scene color). Lumen-off / REFL-door-off
+        // => ReflectionsActive is false => byte-identical to the pre-FAZ-8 behaviour.
+        if (Dx12LumenGiPass.ReflectionsActive(ctx)) return false;
         if (reflForceEnv == "1") return true;
         if (reflForceEnv == "0") return false;
         if (ctx.PostFX.SsrIntensity <= 0f) return false;

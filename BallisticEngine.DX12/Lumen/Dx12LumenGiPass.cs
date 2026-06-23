@@ -58,6 +58,26 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         return rcDoor == 1;
     }
 
+    // FAZ 8: LUMEN REFLECTIONS — the specular reflection ray resolved through the SAME LumenTrace abstraction the
+    // diffuse screen-probe gather uses (HW TLAS / SW SDF → the LIT surface cache FinalLighting), so a reflective
+    // surface mirrors the lit walls with the cache's GI color bleed (no re-shading). Runs at event 600 timing (after
+    // the GI combine at 500). Gated on the REFL door (BALLISTIC_DX12_LUMEN_REFL, default ON when Lumen on; =0 →
+    // the existing Dx12ReflectionsPass runs instead). When ON, that existing pass yields (its WouldRun checks
+    // !ReflectionsActive) so reflections are never double-composited.
+    Dx12LumenReflections reflections;
+    static int reflDoor = -2;   // -2 unread, 0 off, 1 on
+    static bool ReflArmed() {
+        if (reflDoor == -2)
+            reflDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_REFL") == "0" ? 0 : 1;
+        return reflDoor == 1;
+    }
+
+    // The frame-level "Lumen reflections own the specular reflection this frame" predicate, read by
+    // Dx12ReflectionsPass.WouldRun so the existing reflections pass YIELDS (mutual exclusion — never two reflection
+    // composites). True iff the Lumen GI scene path runs AND the REFL door is on. Env-frame-independent (doors only),
+    // safe for the static yield check.
+    public static bool ReflectionsActive(Dx12FrameContext ctx) => WouldRun(ctx) && ReflArmed();
+
     // FAZ 2 debug view (BALLISTIC_DX12_GLOBALSDF_DEBUG=1): a fullscreen sphere-trace of the clipmap, opaque-replace
     // into the HDR scene color, so the field's correctness is VISIBLE. Lazily built with the SDF.
     ID3D12RootSignature dbgRootSig;
@@ -753,6 +773,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
 
             screenProbe ??= new Dx12LumenScreenProbe(dev);
             screenProbe.Run(ctx, scene.CardScene, globalSdf, RcArmed() ? radianceCache : null);
+
+            // FAZ 8 — LUMEN REFLECTIONS at event 600 timing (after the GI combine above). Each reflective G-buffer
+            // pixel reflects through LumenTrace → the LIT surface cache, so a mirror surface carries the cache's GI
+            // color. Runs AFTER the screen-probe combine wrote the diffuse GI into scene color (the reflection
+            // composite reads/lerps the now-lit scene color). Gated on the REFL door; the existing Dx12ReflectionsPass
+            // yields when this is active (ReflectionsActive → its WouldRun returns false). Default ON when Lumen on.
+            if (ReflArmed())
+            {
+                reflections ??= new Dx12LumenReflections(dev);
+                reflections.Run(ctx, scene.CardScene, globalSdf);
+            }
         }
     }
 
@@ -762,6 +793,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         globalSdf?.Dispose();
         screenProbe?.Dispose();
         radianceCache?.Dispose();
+        reflections?.Dispose();
         dbgPso?.Dispose(); dbgRootSig?.Dispose(); dbgCb?.Dispose(); dbgSrv?.Dispose();
         cardDbgPso?.Dispose(); cardDbgRootSig?.Dispose(); cardDbgCb?.Dispose();
         capDbgPso?.Dispose(); capDbgRootSig?.Dispose(); capDbgCb?.Dispose(); capDbgSrv?.Dispose();

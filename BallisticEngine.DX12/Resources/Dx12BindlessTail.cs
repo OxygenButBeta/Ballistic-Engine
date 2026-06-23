@@ -72,7 +72,17 @@ internal static class Dx12BindlessTail
     public const int LumenRadianceCacheUsed = 8;
     public const int LumenRadianceCacheTableBase = LumenScreenProbeTableBase - LumenRadianceCacheReserved;
 
-    public const int TailStart = LumenRadianceCacheTableBase;
+    // Lumen FAZ 8 REFLECTIONS — its own reserved tail below the radiance-cache tail. The reflection compute shader's
+    // root sig uses a per-frame DESCRIPTOR TABLE (mirroring the screen-probe table) for the resources that are NOT
+    // root buffers: G-buffer depth/normal/material SRVs + the half-res reflection target UAV. Re-stamped each frame
+    // but live OUTSIDE the dynamic Allocate()/Reset() cursor so the GPU-driven material re-stamp can't clobber them
+    // mid-frame (typed-mismatch descriptor → GPU page fault → device removed). Slot layout (4):
+    //   +0 depth SRV (t4), +1 normal SRV (t5), +2 material SRV (t6), +3 reflection-target UAV (u0). +4..+7 slack.
+    const int LumenReflReserved = 8;
+    public const int LumenReflUsed = 4;
+    public const int LumenReflTableBase = LumenRadianceCacheTableBase - LumenReflReserved;
+
+    public const int TailStart = LumenReflTableBase;
 
     const int A_RtReflFits = 1 / (RtReflUsed <= RtReflReserved ? 1 : 0);
     const int A_AuroraFits = 1 / (AuroraUsed <= AuroraReserved ? 1 : 0);
@@ -82,7 +92,8 @@ internal static class Dx12BindlessTail
     const int A_LumenSurfaceCacheFits = 1 / (LumenSurfaceCacheUsed <= LumenSurfaceCacheReserved ? 1 : 0);
     const int A_LumenScreenProbeFits = 1 / (LumenScreenProbeUsed <= LumenScreenProbeReserved ? 1 : 0);
     const int A_LumenRadianceCacheFits = 1 / (LumenRadianceCacheUsed <= LumenRadianceCacheReserved ? 1 : 0);
+    const int A_LumenReflFits = 1 / (LumenReflUsed <= LumenReflReserved ? 1 : 0);
     const int A_TailStartPositive = 1 / (TailStart > 0 ? 1 : 0);
 
-    static Dx12BindlessTail() => _ = A_RtReflFits + A_AuroraFits + A_AuroraCardFits + A_AuroraScreenProbeFits + A_GlobalSdfFits + A_LumenSurfaceCacheFits + A_LumenScreenProbeFits + A_LumenRadianceCacheFits + A_TailStartPositive;
+    static Dx12BindlessTail() => _ = A_RtReflFits + A_AuroraFits + A_AuroraCardFits + A_AuroraScreenProbeFits + A_GlobalSdfFits + A_LumenSurfaceCacheFits + A_LumenScreenProbeFits + A_LumenRadianceCacheFits + A_LumenReflFits + A_TailStartPositive;
 }
