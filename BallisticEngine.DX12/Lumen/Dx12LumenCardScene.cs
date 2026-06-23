@@ -792,7 +792,15 @@ public sealed class Dx12LumenCardScene : IDisposable {
         // capture we relight ALL pages every frame (window = full) so a fixed golden frame is independent of the cursor
         // phase — amortization is a perf optimization, not a correctness one, and the golden must stay reproducible.
         int updateFactor = ctx.DeterministicCapture ? 1 : LightUpdateFactor();
-        int pageUpdateCount = Math.Max(1, (PageCount + updateFactor - 1) / updateFactor);
+        // Small scenes (CornellBox = 12 pages) must NOT amortize: a 1-page/frame window on a tiny set both stalls
+        // convergence and is pointless (relighting all 12 pages is already free). Relight the WHOLE atlas in one frame
+        // whenever the resident set is small (≤ AmortizeMinPages); amortization only kicks in for the Bistro-scale
+        // counts it was built for. This is also what keeps the emissive-only CornellBox lit (the bug this fixes:
+        // updateFactor=16 → ceil(12/16)=1 page/frame → 0/12 cache texels lit).
+        const int AmortizeMinPages = 64;
+        int pageUpdateCount = (PageCount <= AmortizeMinPages)
+            ? PageCount
+            : Math.Max(1, (PageCount + updateFactor - 1) / updateFactor);
         int pageBegin;
         if (updateFactor <= 1 || pageUpdateCount >= PageCount) { pageBegin = 0; pageUpdateCount = PageCount; }
         else {
