@@ -2029,6 +2029,13 @@ public sealed class DX12HDRenderer : HDRenderer
         // this flag (see the // FAZ 6 marker in Dx12DeferredLightingPass.Record).
         ctx.LumenActiveThisFrame = Dx12LumenGiPass.WouldRun(ctx);
 
+        // FAZ 10 — publish the (persisted) Lumen radiance cache params NOW, at frame setup, so the TRANSPARENT pass
+        // (which runs BEFORE the GI pass at event 500) can read them for translucency GI. The cache is camera-centered
+        // + temporally stable, so last frame's cache is the right source for this frame's transparents (mirrors how
+        // translucency lighting commonly reads the previous frame's GI). The GI pass re-publishes after its rebuild for
+        // the fog pass (event ~700), which gets this-frame's cache. No-op until the cache exists + is valid.
+        if (ctx.LumenActiveThisFrame) lumenGiPass.PublishRadianceCacheParams(ctx);
+
         // FAZ -1d-FINAL — full-frame v2 ownership. When rgV2FullFrame is on, the v2 graph (RunRenderGraphV2)
         // runs the WHOLE frame from Deferred(300) -> ... -> Reflections(600), then the existing post chain. A
         // pass is owned by v2 IFF it would have run in v1 THIS frame, so each flag is `rgV2FullFrame && <the

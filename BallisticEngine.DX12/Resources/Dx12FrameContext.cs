@@ -191,4 +191,6 @@ public struct LumenRcParamsForVolumetrics {
     public uint GridRes, AtlasInProbes, ProbeRes, FinalProbeRes;
     public float TraceStop;
     public int IndirBindless, RadBindless, HitBindless;
+    // FAZ 10 — the raw textures, for a consumer that creates explicit SRVs (transparent forward, no bindless heap).
+    public Vortice.Direct3D12.ID3D12Resource IndirTex, RadTex, HitTex;
 }

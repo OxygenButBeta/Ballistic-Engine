@@ -724,6 +724,26 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (prof.Enabled && dev.FrameList is { } fl) prof.End(fl);
     }
 
+    // FAZ 10 — publish the (persisted) radiance cache's sampling params into ctx.LumenRc so consumers (transparent
+    // forward at the Transparents event = BEFORE this GI pass; fog at event ~700 = after) can sample it. The cache
+    // persists across frames, so calling this at frame setup hands the transparent pass last-frame's stable cache.
+    // No-op until the cache exists + is valid (LumenRc stays Valid=false → consumers fall back to IBL/flat ambient).
+    public void PublishRadianceCacheParams(Dx12FrameContext ctx)
+    {
+        if (radianceCache is null || !radianceCache.Valid) return;
+        ctx.LumenRc = new LumenRcParamsForVolumetrics {
+            Valid = true,
+            Origin = radianceCache.Origin, ProbeSpacing = radianceCache.ProbeSpacingPub,
+            GridRes = (uint)radianceCache.GridRes, AtlasInProbes = (uint)radianceCache.AtlasInProbesPub,
+            ProbeRes = (uint)radianceCache.ProbeResPub, FinalProbeRes = (uint)radianceCache.FinalProbeResPub,
+            TraceStop = radianceCache.TraceStop,
+            IndirBindless = radianceCache.IndirBindless, RadBindless = radianceCache.RadBindless,
+            HitBindless = radianceCache.HitBindless,
+            IndirTex = radianceCache.IndirectionTex, RadTex = radianceCache.RadianceTex,
+            HitTex = radianceCache.HitDistTex,
+        };
+    }
+
     public void Record(Dx12FrameContext ctx)
     {
         // FAZ 0: build/refresh the scene substrate ONLY. No GI is traced or combined → scene color is untouched,
@@ -818,19 +838,10 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_RC_STATS") == "1")
                     radianceCache.DumpStats();
 
-                // FAZ 10 — publish the radiance cache's sampling params for the LATER fog pass (volumetric GI). The fog
-                // march in-scatters SampleRadianceCacheInterpolated(p, dir) instead of a flat constant ambient. Only when
-                // the cache is valid (built) — else LumenRc stays Valid=false and fog keeps its old constant ambient.
-                if (radianceCache.Valid)
-                    ctx.LumenRc = new LumenRcParamsForVolumetrics {
-                        Valid = true,
-                        Origin = radianceCache.Origin, ProbeSpacing = radianceCache.ProbeSpacingPub,
-                        GridRes = (uint)radianceCache.GridRes, AtlasInProbes = (uint)radianceCache.AtlasInProbesPub,
-                        ProbeRes = (uint)radianceCache.ProbeResPub, FinalProbeRes = (uint)radianceCache.FinalProbeResPub,
-                        TraceStop = radianceCache.TraceStop,
-                        IndirBindless = radianceCache.IndirBindless, RadBindless = radianceCache.RadBindless,
-                        HitBindless = radianceCache.HitBindless,
-                    };
+                // FAZ 10 — re-publish the radiance cache params (now THIS-frame's rebuilt cache) for the LATER fog pass
+                // (volumetric GI, event ~700). The transparent pass already got LAST-frame's via PublishRadianceCacheParams
+                // at frame setup (it runs before this GI pass). No-op when the cache isn't valid.
+                PublishRadianceCacheParams(ctx);
             }
 
             screenProbe ??= new Dx12LumenScreenProbe(dev);

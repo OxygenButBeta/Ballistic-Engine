@@ -80,6 +80,14 @@ internal sealed class Dx12LumenRadianceCache : IDisposable
     public Vector3 Origin { get; private set; }
     public bool Valid { get; private set; }
 
+    // FAZ 10 — the cache's three sampling textures, exposed so a consumer pass (transparent forward) that does NOT use
+    // the bindless heap can create its OWN SRVs over them in its own descriptor heap (explicit t-slots). The bindless
+    // indices above (IndirBindless/RadBindless/HitBindless) remain the path for HeapDirectlyIndexed consumers (fog,
+    // screen probe). All three rest in UnorderedAccess (read as SRV cross-pass, the established pattern).
+    public ID3D12Resource IndirectionTex => indirection;
+    public ID3D12Resource RadianceTex => radianceAtlas;
+    public ID3D12Resource HitDistTex => hitDistAtlas;
+
     // Pipeline.
     ID3D12RootSignature rootSig;
     ID3D12PipelineState initPso, allocPso, tracePso, fixupPso;

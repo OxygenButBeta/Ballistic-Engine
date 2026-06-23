@@ -22,6 +22,13 @@ cbuffer TransparentConstants : register(b0) {
     float    PackedOrm;      float Cutout;      float UseIBL; float PrefilterMaxMip;
     float    Opacity;        float PunctualCount; float2 ScreenSize;
     float2   ClusterNearFar; float2 _pad;
+    // FAZ 10 — Lumen radiance-cache params (translucency GI). When RcEnabled, the diffuse ambient is the real Lumen
+    // indirect (6-axis cache mean) instead of the IBL irradiance, so glass/foliage match the Lumen-lit opaque world.
+    // Fields mirror RC_PARAMS in LumenRadianceCacheSample.hlsl (read by name by the inlined sampler). RcEnabled==0 →
+    // IBL/flat ambient (byte-identical). The cache textures are EXPLICIT SRVs t13-t15 (this pass has no bindless heap).
+    float3 RcOrigin;        float RcProbeSpacing;
+    uint   RcGridRes;       uint  RcAtlasInProbes; uint RcProbeRes; uint RcFinalProbeRes;
+    float  RcTraceStop;     float RcEnabled;       float RcGiIntensity; float RcPad0;
 };
 
 Texture2D DiffuseMap   : register(t0);
@@ -46,6 +53,11 @@ struct GpuLight {
 StructuredBuffer<GpuLight> ClusterLights : register(t10);
 Buffer<int2>               ClusterGrid   : register(t11);  // per-cluster {offset, count}
 Buffer<uint>               ClusterIndex  : register(t12);  // flat light-index list
+
+// FAZ 10 — Lumen radiance-cache textures (translucency GI), EXPLICIT SRVs (this forward pass has no bindless heap).
+Texture3D<uint>   RcIndirection : register(t13);   // GridRes^3 atlas-index volume (0xFFFFFFFF = unallocated)
+Texture2D<float4> RcRadiance    : register(t14);   // octahedral radiance probe atlas
+Texture2D<float>  RcHitDist     : register(t15);   // octahedral hit-distance atlas
 
 SamplerState LinearWrap  : register(s0);
 SamplerState LinearClamp : register(s1);
@@ -231,6 +243,56 @@ int ClusterIndexFor(float2 pixel, float3 worldPos) {
     return tile.x + ClusterDimX * (tile.y + ClusterDimY * zSlice);
 }
 
+// FAZ 10 — explicit-texture Lumen radiance-cache sample (mirrors LumenRadianceCacheSample.hlsl's
+// SampleRadianceCacheInterpolated, but reads the bound t13-t15 SRVs instead of ResourceDescriptorHeap[] since this
+// forward pass has no bindless heap). Trilinear, depth-occlusion-weighted blend of the 8 surrounding probes.
+float2 RcOctEncode(float3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 e = n.xy;
+    if (n.z < 0.0) e = (1.0 - abs(e.yx)) * float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return e * 0.5 + 0.5;
+}
+float3 RcSanitize3(float3 v) {
+    return float3(isnan(v.x)||isinf(v.x)?0:v.x, isnan(v.y)||isinf(v.y)?0:v.y, isnan(v.z)||isinf(v.z)?0:v.z);
+}
+void RcProbe(uint atlasIndex, float3 dir, out float3 rad, out float hitDist) {
+    uint px = atlasIndex % RcAtlasInProbes, py = atlasIndex / RcAtlasInProbes;
+    float2 inner = RcOctEncode(dir) * (float)RcProbeRes + 1.0;
+    float2 atlasTexel = float2(px, py) * (float)RcFinalProbeRes + inner;
+    float atlasDim = (float)(RcFinalProbeRes * RcAtlasInProbes);
+    float2 uv = atlasTexel / max(atlasDim, 1.0);
+    rad = RcSanitize3(RcRadiance.SampleLevel(LinearClamp, uv, 0).rgb);
+    hitDist = RcHitDist.SampleLevel(LinearClamp, uv, 0).r;
+}
+float3 RcSampleExplicit(float3 worldPos, float3 dir) {
+    if (RcEnabled < 0.5) return 0.0.xxx;
+    float3 g = (worldPos - RcOrigin) / max(RcProbeSpacing, 1e-4);
+    if (any(g < 0.0) || any(g >= (float)RcGridRes)) return 0.0.xxx;
+    int3 base = (int3)floor(g - 0.5);
+    float3 frac3 = saturate(g - 0.5 - (float3)base);
+    float3 accum = 0.0.xxx; float wsum = 0.0;
+    [unroll] for (int k = 0; k < 8; k++) {
+        int3 corner = base + int3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+        if (any(corner < 0) || any(corner >= (int)RcGridRes)) continue;
+        uint atlasIndex = RcIndirection.Load(int4(corner, 0));
+        if (atlasIndex == 0xFFFFFFFFu) continue;
+        float3 cw = float3((k & 1) ? frac3.x : 1.0 - frac3.x,
+                           (k >> 1) & 1 ? frac3.y : 1.0 - frac3.y,
+                           (k >> 2) & 1 ? frac3.z : 1.0 - frac3.z);
+        float triW = cw.x * cw.y * cw.z;
+        if (triW <= 0.0) continue;
+        float3 rad; float storedHit; RcProbe(atlasIndex, dir, rad, storedHit);
+        float3 probeCenter = RcOrigin + ((float3)corner) * RcProbeSpacing;
+        float along = dot(worldPos - probeCenter, dir);
+        float margin = RcProbeSpacing * 0.5;
+        float occW = saturate((storedHit + margin - along) / max(RcProbeSpacing, 1e-4));
+        occW = (along <= 0.0) ? 1.0 : occW;
+        float w = triW * occW;
+        accum += rad * w; wsum += w;
+    }
+    return wsum > 1e-5 ? RcSanitize3(accum / wsum) : 0.0.xxx;
+}
+
 float4 PSMain(VSOutput i) : SV_Target {
     float4 albedoSample = DiffuseMap.Sample(LinearWrap, i.Uv);
     float3 albedo = albedoSample.rgb * BaseColorFactor.rgb;
@@ -281,13 +343,24 @@ float4 PSMain(VSOutput i) : SV_Target {
         }
     }
 
-    // Ambient: split-sum IBL when baked, flat fill otherwise.
+    // Ambient: split-sum IBL when baked, flat fill otherwise. FAZ 10 — TRANSLUCENCY GI: the diffuse ambient is the real
+    // Lumen indirect (6-axis radiance-cache mean) when the cache is bound, applied REGARDLESS of IBL (interiors have
+    // UseIBL=0 but still want GI on glass). The specular ambient stays IBL prefilter (Lumen reflections own glossy).
+    // RcEnabled==0 → the original IBL/flat path (byte-identical).
     float NdotVamb = max(dot(N, V), 0.0);
     float3 ambient;
+    float3 lumenGiDiffuse = 0.0.xxx; bool haveLumenGi = false;
+    if (RcEnabled > 0.5) {
+        float3 gi = RcSampleExplicit(i.PosW, float3( 1,0,0)) + RcSampleExplicit(i.PosW, float3(-1,0,0))
+                  + RcSampleExplicit(i.PosW, float3(0, 1,0)) + RcSampleExplicit(i.PosW, float3(0,-1,0))
+                  + RcSampleExplicit(i.PosW, float3(0,0, 1)) + RcSampleExplicit(i.PosW, float3(0,0,-1));
+        lumenGiDiffuse = gi * (RcGiIntensity / 6.0);
+        haveLumenGi = true;
+    }
     if (UseIBL > 0.5) {
         float3 Famb = FresnelSchlickRoughness(NdotVamb, F0, roughness);
         float3 kD = (1.0 - Famb) * (1.0 - metallic);
-        float3 irradiance = IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
+        float3 irradiance = haveLumenGi ? lumenGiDiffuse : IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
         float3 ambientDiffuse = kD * irradiance * albedo * ao;
         float3 R = reflect(-V, N);
         float mip = clamp(roughness * PrefilterMaxMip, 0.0, PrefilterMaxMip);
@@ -295,6 +368,9 @@ float4 PSMain(VSOutput i) : SV_Target {
         float2 brdf = BrdfLut.SampleLevel(LinearClamp, float2(NdotVamb, roughness), 0).rg;
         float3 ambientSpecular = prefiltered * (Famb * brdf.x + brdf.y) * ao;
         ambient = ambientDiffuse + ambientSpecular;
+    } else if (haveLumenGi) {
+        // No IBL (e.g. interior) but Lumen GI present → diffuse GI replaces the flat constant ambient.
+        ambient = (1.0 - metallic) * lumenGiDiffuse * albedo * ao;
     } else {
         ambient = Ambient * albedo * ao;
     }

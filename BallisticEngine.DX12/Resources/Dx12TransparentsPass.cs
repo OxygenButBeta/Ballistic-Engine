@@ -53,6 +53,10 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         public float PackedOrm, Cutout, UseIBL, PrefilterMaxMip;
         public float Opacity, PunctualCount; public Vector2 ScreenSize;
         public Vector2 ClusterNearFar; public Vector2 Pad;
+        // FAZ 10 — Lumen radiance-cache params (translucency GI). Must mirror the cbuffer tail in TransparentForward.hlsl.
+        public Vector3 RcOrigin; public float RcProbeSpacing;
+        public uint RcGridRes, RcAtlasInProbes, RcProbeRes, RcFinalProbeRes;
+        public float RcTraceStop, RcEnabled, RcGiIntensity, RcPad0;
     }
 
     readonly Dx12Device dev;
@@ -63,6 +67,7 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
     int transparentCbSlotSize, transparentCbSlotCount;
     Dx12DescriptorHeap transparentSrvVisible;
     readonly List<(IStaticMeshRenderer r, int submesh, float dist)> transparentItems = new();
+    bool loggedTgi;
 
     public unsafe Dx12TransparentsPass(Dx12Device device) {
         dev = device;
@@ -70,7 +75,9 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         var frameCbv = new RootParameter1(RootParameterType.ConstantBufferView, new RootDescriptor1(1, 0), ShaderVisibility.Pixel);
         var matRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, MaterialSrvCount, baseShaderRegister: 0);
         var matTable = new RootParameter1(new RootDescriptorTable1(matRange), ShaderVisibility.Pixel);
-        var lightRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 7, baseShaderRegister: 6);
+        // 10 SRVs: t6-t12 (irradiance/prefilter/brdf/cascades/cluster×3) + FAZ 10 t13-t15 Lumen radiance-cache
+        // (indirection/radiance/hitdist) for translucency GI. Bound once per frame.
+        var lightRange = new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 10, baseShaderRegister: 6);
         var lightTable = new RootParameter1(new RootDescriptorTable1(lightRange), ShaderVisibility.Pixel);
         var wrap = new StaticSamplerDescription(ShaderVisibility.Pixel, 0, 0) {
             Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
@@ -114,7 +121,7 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         transparentCbMapped = transparentCb.Map<byte>(0);
         transparentSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
-            7 + transparentCbSlotCount * MaterialSrvCount, shaderVisible: true, framesInFlight: dev.FramesInFlight);
+            10 + transparentCbSlotCount * MaterialSrvCount, shaderVisible: true, framesInFlight: dev.FramesInFlight);
     }
 
     public unsafe void Record(Dx12FrameContext ctx) {
@@ -157,7 +164,7 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
         transparentSrvVisible.Reset();
-        int lightBase = transparentSrvVisible.AllocateRange(7);
+        int lightBase = transparentSrvVisible.AllocateRange(10);
         dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 0), ibl.IrradianceSrv, heapType);
         dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 1), ibl.PrefilterSrv, heapType);
         dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 2), ibl.BrdfSrv, heapType);
@@ -166,11 +173,56 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
         dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 5), clusteredLights.GridSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 6), clusteredLights.IndexSrvCpu, heapType);
 
+        // FAZ 10 — TRANSLUCENCY GI: t13-t15 Lumen radiance-cache SRVs (indirection 3D / radiance 2D / hitdist 2D),
+        // created directly over the published cache resources. lumenGi gates the shader's RcEnabled. When the cache is
+        // absent, point all three at a benign fallback (the BRDF LUT — a valid 2D SRV; the 3D slot reuses it harmlessly
+        // since RcEnabled=0 makes the shader never sample) so the table is always fully populated.
+        bool lumenGi = ctx.LumenRc.Valid && ctx.LumenRc.RadTex != null && ctx.LumenRc.IndirTex != null;
+        if (lumenGi) {
+            dev.Device.CreateShaderResourceView(ctx.LumenRc.IndirTex, new ShaderResourceViewDescription {
+                Format = Format.R32_UInt, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture3D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture3D = new Texture3DShaderResourceView { MipLevels = 1 },
+            }, transparentSrvVisible.Cpu(lightBase + 7));
+            dev.Device.CreateShaderResourceView(ctx.LumenRc.RadTex, new ShaderResourceViewDescription {
+                Format = Format.R16G16B16A16_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+            }, transparentSrvVisible.Cpu(lightBase + 8));
+            dev.Device.CreateShaderResourceView(ctx.LumenRc.HitTex, new ShaderResourceViewDescription {
+                Format = Format.R16_Float, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture2D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture2D = new Texture2DShaderResourceView { MipLevels = 1 },
+            }, transparentSrvVisible.Cpu(lightBase + 9));
+        } else {
+            // Fallback: the 3D slot needs a Texture3D-typed SRV or the table is invalid; create one over... there's no
+            // spare 3D texture, so when no cache is present we simply don't bind GI (RcEnabled=0) and point t13 at a
+            // null-described 3D SRV (a NULL resource with a 3D desc is legal and reads 0).
+            dev.Device.CreateShaderResourceView(null, new ShaderResourceViewDescription {
+                Format = Format.R32_UInt, ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Texture3D,
+                Shader4ComponentMapping = ShaderComponentMapping.Default,
+                Texture3D = new Texture3DShaderResourceView { MipLevels = 1 },
+            }, transparentSrvVisible.Cpu(lightBase + 7));
+            dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 8), ibl.BrdfSrv, heapType);
+            dev.Device.CopyDescriptorsSimple(1, transparentSrvVisible.Cpu(lightBase + 9), ibl.BrdfSrv, heapType);
+        }
+
         var fallbackDiffuse = DefaultTextures.Neutral(TextureType.Diffuse) as Dx12Texture2D;
         float prefMaxMip = ibl != null ? ibl.PrefilterMipCount - 1 : 0f;
         float useIbl = iblActiveThisFrame ? 1f : 0f;
         float punctualCount = clusteredLights.LightCount;
         int tslot = 0;
+
+        // FAZ 10 — translucency GI params (shared by all transparent draws this frame). Gated by the LumenVolume toggle
+        // (PostFX) with the same env precedence as the rest of Lumen; off → RcEnabled=0 → the shader uses IBL irradiance.
+        var rc = ctx.LumenRc;
+        bool tgiWanted = lumenGi && (ctx.PostFX?.LumenVolumetricGi ?? true)
+                         && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_TRANSLUCENCY_GI") != "0";
+        float rcGiIntensity = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_INTENSITY"),
+            System.Globalization.CultureInfo.InvariantCulture, out float ti) ? ti : (ctx.PostFX?.LumenIntensity ?? 1f);
+        if (tgiWanted && !loggedTgi) { loggedTgi = true;
+            string l = $"[LumenTranslucencyGI] ON: items={transparentItems.Count} useIbl={useIbl} intensity={rcGiIntensity:0.##} (transparent diffuse ← radiance cache)";
+            Console.WriteLine(l); Debugging.Log(l); }
 
         if (!ctx.BarriersDerived) gbuffer.DepthToReadOnly();
         target.RenderColorWithExternalDepth(gbuffer.DsvHandle, cl => {
@@ -215,6 +267,10 @@ public sealed class Dx12TransparentsPass : IRenderPass, IDisposable {
                     UseIBL = useIbl, PrefilterMaxMip = prefMaxMip,
                     Opacity = mat.Opacity, PunctualCount = punctualCount,
                     ScreenSize = new Vector2(targetW, targetH), ClusterNearFar = new Vector2(CameraNear, CameraFar),
+                    RcOrigin = rc.Origin, RcProbeSpacing = rc.ProbeSpacing,
+                    RcGridRes = rc.GridRes, RcAtlasInProbes = rc.AtlasInProbes,
+                    RcProbeRes = rc.ProbeRes, RcFinalProbeRes = rc.FinalProbeRes,
+                    RcTraceStop = rc.TraceStop, RcEnabled = tgiWanted ? 1f : 0f, RcGiIntensity = rcGiIntensity,
                 };
                 *(TransparentConstants*)(transparentCbMapped + (long)tslot * transparentCbSlotSize) = c;
                 cl.SetGraphicsRootConstantBufferView(0,
