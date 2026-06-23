@@ -73,6 +73,22 @@ pass reads it pixel-shader; verify the state (the fog/screen-probe read it fine 
   bindless slots, like the clipmap/FinalLighting; then LUMEN_TRACE_PARAMS just gains gridIdx + grid placement floats,
   no per-consumer root-sig edits). That keeps Stage 2 as contained as Stage 1.
 
+## STAGE 1.5 DONE `10ce9077`
+Grid buffers stamped into surface-cache reserved-tail bindless slots +14/+15 (Used 14→16). Exposed
+CardGridCellBindless/CardGridIndexBindless + placement. VERIFIED door ON Bistro: grid builds + SRVs stamp,
+exit 0, no device-removed, renders normally. Now reachable via ResourceDescriptorHeap[] for stage 2.
+
+## STAGE 2 — REMAINING (needs user review; touches production GI CB)
+Add to LUMEN_TRACE_PARAMS (macro) + EACH consumer's inline-mirrored CB tail (LumenScreenProbe / LumenReflections
+/ LumenRadianceCache / LumenTraceDebug — they MIRROR the fields, not just #use the macro) + each C# CB struct:
+  `float3 LtCardGridOrigin; float LtCardGridEnabled; float3 LtCardGridCellSize; uint LtCardGridDim;`
+  `uint LtCardGridCellIdx; uint LtCardGridIndexIdx; uint LtCgPad0, LtCgPad1;`  (16B-aligned, append at END)
+Then rewrite SampleSurfaceCache_WorldPos: when LtCardGridEnabled, worldPos→cell, loop the home + 6 face-neighbor
+cells' card indices (from the bindless cell/index buffers) instead of `for ci in 0..LtCardCount`. Set the C# fields
+from cards.CardGrid* in each driver (Dx12LumenScreenProbe/Reflections/RadianceCache + the trace-debug pass).
+RISK: 5 HLSL CBs + 5 C# structs must stay byte-aligned (mismatch = device-removed on the PRODUCTION GI path).
+Verify: CornellBox determinism byte-identical + Bistro SW-trace (PROBE_SW=1) GI ≈ HW + faster; door OFF unchanged.
+
 ## RISK / SIZE
 Medium. Isolated to Dx12LumenCardScene (build) + LumenTrace.hlsl (consume) + TransparentForward (payoff).
 Froxel precedent de-risks the build. Door-gated → safe to land incrementally (grid build first, then SW-trace
