@@ -226,6 +226,32 @@ public sealed class Dx12LumenCardScene : IDisposable {
     ID3D12Resource rangeBuf;   // InstanceCardRange[] (GpuLumenCardScene.InstanceCardRange layout)
     public ulong RangeBufferGpuAddress => rangeBuf?.GPUVirtualAddress ?? 0;
 
+    // ---- FAZ 11 — SPATIAL CARD GRID (world-pos → card lookup acceleration; see Docs/Plans/lumen-faz11-*). A coarse
+    // uniform grid over the resident-card world AABB; each cell holds the indices of cards whose OBB overlaps it, so a
+    // world-pos sample (SW trace / translucency) loops O(cards-in-cell) not O(CardCount). Froxel-style two-buffer layout
+    // (cell {offset,count} + flat index list), mirroring Dx12ClusteredLights. Built CPU-side at card (re)build. Gated by
+    // BALLISTIC_DX12_LUMEN_CARDGRID (default OFF → not built, zero behaviour change; the consumer also gates on it).
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GpuCardGridCell { public uint Offset, Count; }   // 8B
+    ID3D12Resource cardGridBuf;     // GpuCardGridCell[cellCount]
+    ID3D12Resource cardGridIndexBuf;// uint[] flat card indices, cell-contiguous
+    public ulong CardGridBufferGpuAddress => cardGridBuf?.GPUVirtualAddress ?? 0;
+    public ulong CardGridIndexGpuAddress => cardGridIndexBuf?.GPUVirtualAddress ?? 0;
+    public Vector3 CardGridOrigin { get; private set; }     // min corner of the grid AABB (world)
+    public Vector3 CardGridCellSize { get; private set; }   // world size of one cell
+    public int CardGridDim { get; private set; }            // cells per axis
+    public bool CardGridValid { get; private set; }
+    static int cardGridDoor = -2;   // -2 unread, 0 off, 1 on
+    static bool CardGridArmed() {
+        if (cardGridDoor == -2)
+            cardGridDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_CARDGRID") == "1" ? 1 : 0;
+        return cardGridDoor == 1;
+    }
+    static int CardGridDimEnv() {
+        int d = (int)EnvF("BALLISTIC_DX12_LUMEN_CARDGRID_DIM", 32f);
+        return Math.Clamp(d, 8, 64);
+    }
+
     // ---- dirty tracking (mirrors Dx12LumenScene) ----
     int topologyStamp = -1;
     int transformStamp = -1;
@@ -334,6 +360,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
         cardBuf = dev.CreateUavBuffer<GpuLumenCard>(cardArr, ResourceStates.GenericRead);
         pageBuf = dev.CreateUavBuffer<GpuLumenPage>(pageArr, ResourceStates.GenericRead);
         UploadRanges();
+        BuildCardGrid();   // FAZ 11 — spatial card grid (gated; no-op when the door is off)
     }
 
     // FAZ 3d — upload the per-instance card ranges as a GPU StructuredBuffer (root SRV t5) so the lighting compute can
@@ -343,6 +370,101 @@ public sealed class Dx12LumenCardScene : IDisposable {
         dev.DeferredRelease(rangeBuf);
         rangeBuf = dev.CreateUavBuffer<InstanceCardRange>(arr, ResourceStates.GenericRead);
     }
+
+    // FAZ 11 — build the spatial card grid from the current world cards (RESIDENT only — PageId != 0xFFFFFFFF, the
+    // sampleable set). Two-pass froxel build (count → prefix-sum offsets → fill), mirroring Dx12ClusteredLights. Each
+    // card's OBB is conservatively bucketed by its world-AABB cell range. Gated: when the door is off we free any old
+    // grid + mark invalid (the consumer falls back to the linear scan). Called after AllocatePages set the PageIds.
+    void BuildCardGrid() {
+        if (!CardGridArmed()) {
+            if (cardGridBuf != null) { dev.DeferredRelease(cardGridBuf); cardGridBuf = null; }
+            if (cardGridIndexBuf != null) { dev.DeferredRelease(cardGridIndexBuf); cardGridIndexBuf = null; }
+            CardGridValid = false;
+            return;
+        }
+        int dim = CardGridDimEnv();
+        int cellCount = dim * dim * dim;
+
+        // World AABB over RESIDENT cards' OBB corners. Resident = has a page (the only cards a world-pos lookup can sample).
+        Vector3 mn = new(float.MaxValue), mx = new(float.MinValue);
+        int resident = 0;
+        for (int c = 0; c < cardsCpu.Length; c++) {
+            GpuLumenCard k = cardsCpu[c];
+            if (k.PageId == 0xFFFFFFFFu) continue;
+            resident++;
+            // OBB world AABB = |extent.x|*|AxisX| + ... around Origin (axis-aligned bound of the oriented box).
+            Vector3 r = new(
+                MathF.Abs(k.AxisX.X) * k.ExtentX + MathF.Abs(k.AxisY.X) * k.ExtentY + MathF.Abs(k.AxisZ.X) * k.ExtentZ,
+                MathF.Abs(k.AxisX.Y) * k.ExtentX + MathF.Abs(k.AxisY.Y) * k.ExtentY + MathF.Abs(k.AxisZ.Y) * k.ExtentZ,
+                MathF.Abs(k.AxisX.Z) * k.ExtentX + MathF.Abs(k.AxisY.Z) * k.ExtentY + MathF.Abs(k.AxisZ.Z) * k.ExtentZ);
+            mn = Vector3.Min(mn, k.Origin - r);
+            mx = Vector3.Max(mx, k.Origin + r);
+        }
+        if (resident == 0) {
+            if (cardGridBuf != null) { dev.DeferredRelease(cardGridBuf); cardGridBuf = null; }
+            if (cardGridIndexBuf != null) { dev.DeferredRelease(cardGridIndexBuf); cardGridIndexBuf = null; }
+            CardGridValid = false;
+            return;
+        }
+        Vector3 size = Vector3.Max(mx - mn, new Vector3(1e-3f));
+        Vector3 pad = size / dim;            // one-cell pad so border cards aren't clipped
+        mn -= pad; mx += pad;
+        size = mx - mn;
+        Vector3 cellSize = size / dim;
+        CardGridOrigin = mn; CardGridCellSize = cellSize; CardGridDim = dim;
+
+        int Cell(int x, int y, int z) => (z * dim + y) * dim + x;
+        void CellRange(GpuLumenCard k, out int x0, out int y0, out int z0, out int x1, out int y1, out int z1) {
+            Vector3 r = new(
+                MathF.Abs(k.AxisX.X) * k.ExtentX + MathF.Abs(k.AxisY.X) * k.ExtentY + MathF.Abs(k.AxisZ.X) * k.ExtentZ,
+                MathF.Abs(k.AxisX.Y) * k.ExtentX + MathF.Abs(k.AxisY.Y) * k.ExtentY + MathF.Abs(k.AxisZ.Y) * k.ExtentZ,
+                MathF.Abs(k.AxisX.Z) * k.ExtentX + MathF.Abs(k.AxisY.Z) * k.ExtentY + MathF.Abs(k.AxisZ.Z) * k.ExtentZ);
+            Vector3 lo = (k.Origin - r - mn) / cellSize, hi = (k.Origin + r - mn) / cellSize;
+            x0 = Math.Clamp((int)MathF.Floor(lo.X), 0, dim - 1); x1 = Math.Clamp((int)MathF.Floor(hi.X), 0, dim - 1);
+            y0 = Math.Clamp((int)MathF.Floor(lo.Y), 0, dim - 1); y1 = Math.Clamp((int)MathF.Floor(hi.Y), 0, dim - 1);
+            z0 = Math.Clamp((int)MathF.Floor(lo.Z), 0, dim - 1); z1 = Math.Clamp((int)MathF.Floor(hi.Z), 0, dim - 1);
+        }
+
+        // Pass 1: count per cell.
+        var counts = new int[cellCount];
+        for (int c = 0; c < cardsCpu.Length; c++) {
+            if (cardsCpu[c].PageId == 0xFFFFFFFFu) continue;
+            CellRange(cardsCpu[c], out int x0, out int y0, out int z0, out int x1, out int y1, out int z1);
+            for (int z = z0; z <= z1; z++) for (int y = y0; y <= y1; y++) for (int x = x0; x <= x1; x++)
+                counts[Cell(x, y, z)]++;
+        }
+        // Prefix-sum → offsets; total index entries.
+        var cells = new GpuCardGridCell[cellCount];
+        uint running = 0;
+        for (int i = 0; i < cellCount; i++) { cells[i].Offset = running; cells[i].Count = (uint)counts[i]; running += (uint)counts[i]; }
+        int total = (int)running;
+        var indices = new uint[Math.Max(total, 1)];
+        var fillCursor = new int[cellCount];
+        // Pass 2: fill.
+        for (int c = 0; c < cardsCpu.Length; c++) {
+            if (cardsCpu[c].PageId == 0xFFFFFFFFu) continue;
+            CellRange(cardsCpu[c], out int x0, out int y0, out int z0, out int x1, out int y1, out int z1);
+            for (int z = z0; z <= z1; z++) for (int y = y0; y <= y1; y++) for (int x = x0; x <= x1; x++) {
+                int cell = Cell(x, y, z);
+                indices[cells[cell].Offset + fillCursor[cell]] = (uint)c;
+                fillCursor[cell]++;
+            }
+        }
+
+        dev.DeferredRelease(cardGridBuf);
+        dev.DeferredRelease(cardGridIndexBuf);
+        cardGridBuf = dev.CreateUavBuffer<GpuCardGridCell>(cells, ResourceStates.GenericRead);
+        cardGridIndexBuf = dev.CreateUavBuffer<uint>(indices, ResourceStates.GenericRead);
+        CardGridValid = true;
+
+        if (!loggedCardGrid) {
+            loggedCardGrid = true;
+            string line = $"[LumenCardGrid] dim={dim}^3 resident={resident} entries={total} avgPerCell={(cellCount>0?(float)total/cellCount:0):0.##} " +
+                          $"cellSize=({cellSize.X:0.##},{cellSize.Y:0.##},{cellSize.Z:0.##}) (FAZ 11 — world-pos card lookup accel)";
+            Console.WriteLine(line); Debugging.Log(line);
+        }
+    }
+    bool loggedCardGrid;
 
     // Transform-only refresh: re-derive the world cards (origins/axes/extents follow the instance world matrices) and
     // re-run the (deterministic) allocator. Card COUNT/order is topology-invariant, so the page table comes out
@@ -370,6 +492,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
         cardBuf = dev.CreateUavBuffer<GpuLumenCard>(cardArr, ResourceStates.GenericRead);
         pageBuf = dev.CreateUavBuffer<GpuLumenPage>(pageArr, ResourceStates.GenericRead);
         UploadRanges();
+        BuildCardGrid();   // FAZ 11 — re-derive the spatial card grid for the new world placement (gated; no-op when off)
     }
 
     // Transform each instance's mesh-local cards into WORLD space (Aurora's exact convention) + record per-instance
@@ -1229,6 +1352,8 @@ public sealed class Dx12LumenCardScene : IDisposable {
         cardBuf?.Dispose(); cardBuf = null;
         pageBuf?.Dispose(); pageBuf = null;
         rangeBuf?.Dispose(); rangeBuf = null;
+        cardGridBuf?.Dispose(); cardGridBuf = null;
+        cardGridIndexBuf?.Dispose(); cardGridIndexBuf = null;
         albedo?.Tex?.Dispose(); normal?.Tex?.Dispose(); emissive?.Tex?.Dispose();
         depthA?.Tex?.Dispose(); directLight?.Tex?.Dispose(); finalLight?.Tex?.Dispose();
         finalLightB?.Tex?.Dispose();
