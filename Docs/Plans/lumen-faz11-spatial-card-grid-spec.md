@@ -89,6 +89,17 @@ from cards.CardGrid* in each driver (Dx12LumenScreenProbe/Reflections/RadianceCa
 RISK: 5 HLSL CBs + 5 C# structs must stay byte-aligned (mismatch = device-removed on the PRODUCTION GI path).
 Verify: CornellBox determinism byte-identical + Bistro SW-trace (PROBE_SW=1) GI ≈ HW + faster; door OFF unchanged.
 
+## STAGE 2 — CONFIRMED NEEDS USER REVIEW (re-investigated, no trivially-safe path)
+Re-checked the "make it zero-CB" idea: the codebase passes ALL bindless indices via the CB (no HLSL hardcodes a
+tail slot — verified by grep; the tail layout is relative/derived so a hardcoded HLSL #define would drift). So the
+grid SRV indices + placement (origin/cellSize/dim/enabled) MUST reach the shader via the CB. `SampleSurfaceCache_WorldPos`
+lives in the shared LumenTrace include → all 4 consumers (ScreenProbe/Reflections/RadianceCache/TraceDebug) reference
+those fields by name → all 4 HLSL CBs + 4 C# CB structs must gain them, byte-aligned. This is the PRODUCTION GI path;
+a misalignment = device-removed. → DO WITH USER REVIEW (per "yıkıcı/mimari kararlarda bana sor"). The change is
+MECHANICAL (each consumer: append 8 fields to its CB tail in HLSL + C#, set from cards.CardGrid*, rebuild+verify) —
+just needs attention because of the alignment fan-out + production blast radius. Stage 1+1.5 (build + bindless SRVs)
+are landed + verified; only this consume step remains.
+
 ## RISK / SIZE
 Medium. Isolated to Dx12LumenCardScene (build) + LumenTrace.hlsl (consume) + TransparentForward (payoff).
 Froxel precedent de-risks the build. Door-gated → safe to land incrementally (grid build first, then SW-trace
