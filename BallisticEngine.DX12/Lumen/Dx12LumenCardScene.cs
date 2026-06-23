@@ -231,6 +231,20 @@ public sealed class Dx12LumenCardScene : IDisposable {
     int transformStamp = -1;
     bool loggedThisStamp;
 
+    // FAZ 10 — camera-prioritized residency. The allocator favours cards near/large to the camera; when the camera
+    // moves far enough the residency set must be re-evaluated (re-pack pages so the new working set is cached). Tracked
+    // here; the re-pack reuses the RefreshTransforms path (re-gather world cards + re-allocate). Threshold tuned to a
+    // few metres so small jitters don't thrash the atlas; door BALLISTIC_DX12_LUMEN_RESIDENCY_MOVE overrides.
+    Vector3 cameraPos;
+    bool cameraValid;
+    Vector3 lastResidencyCamPos;
+    static float residencyMoveThreshold = -1f;
+    static float ResidencyMoveThreshold() {
+        if (residencyMoveThreshold < 0f)
+            residencyMoveThreshold = EnvF("BALLISTIC_DX12_LUMEN_RESIDENCY_MOVE", 4f);
+        return residencyMoveThreshold;
+    }
+
     // FAZ 3c — CPU-side card + page lists retained from the last (re)build so the capture pass can read each card's
     // page rect + its world ortho frame. (3b discarded them after upload; capture needs them on the CPU.)
     GpuLumenCard[] cardsCpu = Array.Empty<GpuLumenCard>();
@@ -257,17 +271,28 @@ public sealed class Dx12LumenCardScene : IDisposable {
         if (sceneAS is null || !sceneAS.Valid) return;
         EnsureAtlas();
 
+        // FAZ 10 — track the camera for residency prioritization. Under a deterministic capture we DON'T move-trigger
+        // re-residency (the camera is fixed anyway, and a stable allocation keeps the golden reproducible).
+        cameraPos = ctx.CamPos; cameraValid = true;
+
         int s = ComputeTopologyStamp(sceneAS);
         if (topologyDirty || s != topologyStamp || cardBuf == null) {
             topologyStamp = s;
+            lastResidencyCamPos = cameraPos;
             Rebuild(sceneAS);
             transformStamp = ComputeTransformStamp(sceneAS);
             loggedThisStamp = false;
         } else {
             int ts = ComputeTransformStamp(sceneAS);
-            if (ts != transformStamp) {
+            bool camMoved = !ctx.DeterministicCapture &&
+                Vector3.Distance(cameraPos, lastResidencyCamPos) > ResidencyMoveThreshold();
+            if (ts != transformStamp || camMoved) {
                 transformStamp = ts;
+                if (camMoved) lastResidencyCamPos = cameraPos;
+                // Re-pack residency for the new camera working set (re-gather world cards + re-allocate by priority).
+                // This re-mints the page table → the newly-resident pages must be re-captured, so reset the capture gate.
                 RefreshTransforms(sceneAS);
+                if (camMoved) captureStamp = -1;   // force Capture to re-rasterize the new resident set next frame
             }
         }
 
@@ -414,54 +439,99 @@ public sealed class Dx12LumenCardScene : IDisposable {
         }
     }
 
-    // Shelf/row allocator: pick a res-level per card from its world size, pack the footprint into the physical atlas,
-    // set the card's PageId, and append a GpuLumenPage. Overflow cards are DROPPED (PageId stays 0xFFFFFFFF, counted).
+    // FAZ 10 — CAMERA-PRIORITIZED, SIZE-BINNED RESIDENCY (UE surface-cache sub-allocation). The atlas can't hold all
+    // 8775 Bistro cards. TWO things matter:
+    //  (1) WHICH cards drop — the OLD allocator dropped in gather order (arbitrary: a wall in front of the camera could
+    //      drop while an off-screen card stayed resident). We prioritize by distance + projected size so the camera's
+    //      working set always gets cache; far/small cards drop.
+    //  (2) HOW TIGHTLY pages pack — a naive shelf allocator over MIXED res-levels wastes huge space (one 128px card sets
+    //      a row's height to 128, tiny cards in that row waste the rest — packing priority-sorted cards this way collapsed
+    //      coverage to 283 pages). UE sub-allocates SAME-SIZE pages into uniform bins. We do the same: bucket cards by
+    //      res-level, and within the atlas lay each bucket's uniform-size pages as a tight grid. Uniform tiles waste zero
+    //      space → far more cards fit. Buckets are filled largest-res first (big near cards get cache before small ones).
+    // Card ARRAY ORDER is untouched (instance ranges + cardSubMesh stay valid) — only PageId/page-table change.
     void AllocatePages(List<GpuLumenCard> cards, List<GpuLumenPage> pages, out int dropped) {
         dropped = 0;
+        int n = cards.Count;
+
+        // Priority score: projected size / distance² (≈ screen contribution). No camera yet → score 0 (gather order).
+        float[] score = new float[n];
+        if (cameraValid) {
+            Vector3 cam = cameraPos;
+            for (int i = 0; i < n; i++) {
+                GpuLumenCard c = cards[i];
+                float d2 = Vector3.DistanceSquared(c.Origin, cam) + 1f;
+                score[i] = MathF.Max(c.ExtentX, c.ExtentY) / d2;
+            }
+        }
+
+        // Bucket card indices by res-level. Within each bucket, sort by descending priority (the highest-priority cards
+        // get the resident slots; the tail drops if the bucket overflows its atlas region).
+        var buckets = new List<int>[CapResLevel + 1];
+        for (int r = MinResLevel; r <= CapResLevel; r++) buckets[r] = new List<int>();
+        var cardRes = new int[n];
+        for (int c = 0; c < n; c++) { int r = PickResLevel(cards[c]); cardRes[c] = r; buckets[r].Add(c); }
+        for (int r = MinResLevel; r <= CapResLevel; r++)
+            buckets[r].Sort((a, b) => score[b].CompareTo(score[a]));
+
+        // Lay buckets out as uniform grids, packing the atlas top-to-bottom. Each bucket advances a shared shelf cursor;
+        // because every page in a bucket is the SAME size, rows pack with zero internal waste. Largest res first so big
+        // near cards win the space. A bucket's overflow (and any card past the atlas) drops.
         int cursorX = 0, cursorY = 0, rowHeight = 0;
-        for (int c = 0; c < cards.Count; c++) {
-            GpuLumenCard card = cards[c];
-            int res = PickResLevel(card);
-            int size = 1 << res;                 // texels per edge (8..128)
+        for (int r = CapResLevel; r >= MinResLevel; r--) {
+            int size = 1 << r;
+            List<int> bucket = buckets[r];
+            if (bucket.Count == 0) continue;
+            // Start each (smaller) bucket on a fresh shelf row so the previous bucket's taller rowHeight doesn't waste
+            // vertical space for this bucket's uniform tiles.
+            if (cursorX > 0) { cursorX = 0; cursorY += rowHeight; rowHeight = 0; }
+            for (int bi = 0; bi < bucket.Count; bi++) {
+                int c = bucket[bi];
+                GpuLumenCard card = cards[c];
 
-            // Wrap to the next shelf row when this footprint won't fit in the remaining width.
-            if (cursorX + size > AtlasSize) {
-                cursorX = 0;
-                cursorY += rowHeight;
-                rowHeight = 0;
-            }
-            // Atlas full (no vertical room) → drop this card.
-            if (cursorY + size > AtlasSize) {
-                card.PageId = 0xFFFFFFFFu;
+                if (cursorX + size > AtlasSize) { cursorX = 0; cursorY += rowHeight; rowHeight = 0; }
+                if (cursorY + size > AtlasSize) { card.PageId = 0xFFFFFFFFu; cards[c] = card; dropped++; continue; }
+
+                uint pageId = (uint)pages.Count;
+                pages.Add(new GpuLumenPage {
+                    AtlasOffsetX = (uint)cursorX, AtlasOffsetY = (uint)cursorY,
+                    SizeX = (uint)size, SizeY = (uint)size,
+                    CardId = (uint)c, ResLevel = (uint)r,
+                });
+                card.PageId = pageId;
                 cards[c] = card;
-                dropped++;
-                continue;
+
+                cursorX += size;
+                rowHeight = Math.Max(rowHeight, size);
             }
-
-            uint pageId = (uint)pages.Count;
-            pages.Add(new GpuLumenPage {
-                AtlasOffsetX = (uint)cursorX, AtlasOffsetY = (uint)cursorY,
-                SizeX = (uint)size, SizeY = (uint)size,
-                CardId = (uint)c, ResLevel = (uint)res,
-            });
-            card.PageId = pageId;
-            cards[c] = card;
-
-            cursorX += size;
-            rowHeight = Math.Max(rowHeight, size);
         }
     }
 
-    // Pick a resolution level from the card's world footprint: 1 texel per CardTileSize world-cm-ish unit, clamped to
-    // [MinResLevel..CapResLevel]. v1 keeps every footprint <= one physical page (CapResLevel). The texels-per-edge is
-    // a power of two so the page table stays tile-aligned (UE constraint).
+    // Pick a resolution level for a card. FAZ 10 — DISTANCE-AWARE (UE ComputeCardResLevel). The OLD rule sized purely by
+    // WORLD extent, so EVERY multi-metre Bistro wall maxed out at CapResLevel (128px = a full page) → only 256 cards fit
+    // the 2048² atlas (8519 dropped). A far wall doesn't need 128² texels — its surface cache only needs ~screen-size
+    // resolution. So we budget texels by PROJECTED screen size: texelsPerEdge ≈ (worldSize / distance) · ResScale. Near
+    // cards still get up to CapResLevel; distant cards collapse to 8-32px, so thousands fit. Without a camera (headless
+    // pre-camera build) we fall back to the world-size rule (so a no-camera build stays well-defined). Door
+    // BALLISTIC_DX12_LUMEN_RES_SCALE tunes the global density.
+    static float resScale = -1f;
+    static float ResScale() {
+        if (resScale < 0f) resScale = EnvF("BALLISTIC_DX12_LUMEN_RES_SCALE", 1f);
+        return resScale;
+    }
     int PickResLevel(in GpuLumenCard card) {
-        // Largest in-plane world extent (full size = 2*half-extent) drives the texel budget.
-        float maxExtent = MathF.Max(card.ExtentX, card.ExtentY) * 2f;
-        // Aim for ~CardTileSize world units per texel → texels = maxExtent / unitPerTexel. unitPerTexel tuned so a
-        // ~1 m wall card lands around 64 texels (a reasonable v1 capture density).
-        const float unitPerTexel = 0.03125f;             // 1/32 (world unit per texel)
-        float texels = MathF.Max(1f, maxExtent / unitPerTexel);
+        float maxExtent = MathF.Max(card.ExtentX, card.ExtentY) * 2f;   // full in-plane world size
+        float texels;
+        if (cameraValid) {
+            // Projected screen size ∝ worldSize / distance. Tuned so a card ~5 m across at ~5 m distance ≈ 128 texels,
+            // falling off with distance (a 5 m card at 40 m ≈ 16 texels). The 128 constant folds the "near reference"
+            // distance + density into one factor; ResScale lets the user push global cache resolution up/down.
+            float dist = MathF.Max(1f, Vector3.Distance(card.Origin, cameraPos));
+            texels = MathF.Max(1f, (maxExtent / dist) * 128f * ResScale());
+        } else {
+            const float unitPerTexel = 0.03125f;   // legacy world-size rule (no camera): ~1 m wall → ~64 texels
+            texels = MathF.Max(1f, maxExtent / unitPerTexel);
+        }
         int res = (int)MathF.Round(MathF.Log2(texels));
         return Math.Clamp(res, MinResLevel, CapResLevel);
     }
