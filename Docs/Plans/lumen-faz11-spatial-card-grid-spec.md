@@ -1,7 +1,10 @@
-# Lumen FAZ 11 SPEC — Spatial Card Acceleration Grid (world-pos surface-cache lookup)
+# Lumen FAZ 11 — Spatial Card Acceleration Grid (world-pos surface-cache lookup)
 
-> Status: SPEC (ready to implement). Author: architect pass during FAZ 10 loop. Branch: `feature/lumen-gi`.
-> Prereq: FAZ 10 complete (HEAD `157c2d4b`). Zero-risk additive; gated; default OFF until proven.
+> Status: **COMPLETE** (all 3 stages landed + verified). Branch: `feature/lumen-gi`.
+> `33fb6b98` build · `10ce9077` bindless · `3aec6e83` consume. Door BALLISTIC_DX12_LUMEN_CARDGRID (default OFF).
+> VERIFIED: door OFF = byte-identical to pre-FAZ-11 golden (8-CB fan-out aligns perfectly); grid ON vs linear scan
+> = byte-identical (pure accel, correctness-equivalent); ~100x fewer card tests/sample (avgPerCell 1.86 vs 14804).
+> Unblocks SW-trace at Bistro scale + is the foundation for near-field translucency (FAZ 10.6 limitation).
 
 ## WHY (the gap this closes)
 `LumenTrace.hlsl :: SampleSurfaceCache_WorldPos(hitPos, hitNormal)` currently **linear-scans ALL cards**
