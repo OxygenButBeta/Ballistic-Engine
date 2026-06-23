@@ -702,7 +702,10 @@ public sealed class Dx12LumenCardScene : IDisposable {
             InstanceCount = (uint)instanceRanges.Length,
             EmissiveCount = neeCount, NeeIntensity = neeIntensity,
             IndirectRays = indirectRays, IndirectIntensity = indirectIntensity,
-            FinalValid = finalValid ? 1f : 0f, FrameIndex = (uint)ctx.FrameCounter,
+            // Determinism: zero the frame index under a deterministic capture (it seeds the radiosity hemisphere
+            // jitter; the raw frame counter can carry warmup variance run-to-run → non-deterministic golden). Mirrors
+            // the screen-probe's `DeterministicCapture ? 0 : frameCounter`. The EMA still accumulates reproducibly.
+            FinalValid = finalValid ? 1f : 0f, FrameIndex = ctx.DeterministicCapture ? 0u : (uint)ctx.FrameCounter,
             SkyIntensity = 0f, UseSky = 0f,
             AlbedoSrvIdx = (uint)albedo.SrvBindless, NormalSrvIdx = (uint)normal.SrvBindless,
             EmissiveSrvIdx = (uint)emissive.SrvBindless, DepthSrvIdx = (uint)depthA.SrvBindless,
@@ -720,12 +723,16 @@ public sealed class Dx12LumenCardScene : IDisposable {
         dev.ExecuteSync(cl => {
             // READ atlases (Albedo/Normal/Emissive/Depth + last FinalLighting) → NonPixelShaderResource; WRITE atlases
             // (DirectLighting + this frame's FinalLighting) → UnorderedAccess. Persistent resting state is UAV.
+            // EXCEPTION (determinism): finalLightWrite rests in NonPixelShaderResource (see below), so transition it
+            // BACK to UAV before this frame writes it.
             cl.ResourceBarrierTransition(albedo.Tex,    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
             cl.ResourceBarrierTransition(normal.Tex,    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
             cl.ResourceBarrierTransition(emissive.Tex,  ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
             cl.ResourceBarrierTransition(depthA.Tex,    ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
-            cl.ResourceBarrierTransition(finalLightRead.Tex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
-            // directLight + finalLightWrite stay UnorderedAccess (their resting state).
+            // finalLightRead already rests in NonPixelShaderResource (left there last frame for the GI consumers); the
+            // radiosity reads it as an SRV, so NO transition needed. finalLightWrite rests in NonPixel → flip to UAV.
+            cl.ResourceBarrierTransition(finalLightWrite.Tex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            // directLight stays UnorderedAccess (its resting state).
 
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(lightRootSig);
@@ -744,7 +751,12 @@ public sealed class Dx12LumenCardScene : IDisposable {
             cl.ResourceBarrierTransition(normal.Tex,    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
             cl.ResourceBarrierTransition(emissive.Tex,  ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
             cl.ResourceBarrierTransition(depthA.Tex,    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
-            cl.ResourceBarrierTransition(finalLightRead.Tex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
+            // DETERMINISM: this frame's lit cache (finalLightWrite, which SwapFinalLighting makes next-read) is READ by
+            // the screen-probe + reflection + radiance-cache traces later in this SAME open frame list, via the bindless
+            // SRV. Leave it in a PROPER read state (NonPixelShaderResource) rather than UnorderedAccess — reading a
+            // UAV-state texture through an SRV is undefined and let a few hit texels be read mid-retire → ~1-LSB diffs
+            // that varied run-to-run (the golden-diff alternated). The transition also orders the write before any read.
+            cl.ResourceBarrierTransition(finalLightWrite.Tex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
         });
 
         SwapFinalLighting();
@@ -780,10 +792,11 @@ public sealed class Dx12LumenCardScene : IDisposable {
             ResourceDescription.Buffer(total), ResourceStates.CopyDest);
 
         dev.ExecuteSyncImmediate(cl => {
-            cl.ResourceBarrierTransition(lit.Tex, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+            // finalLightRead rests in NonPixelShaderResource (the GI consumers' read state) after LightCards.
+            cl.ResourceBarrierTransition(lit.Tex, ResourceStates.NonPixelShaderResource, ResourceStates.CopySource);
             cl.CopyTextureRegion(new TextureCopyLocation(readback, fps[0]), 0, 0, 0,
                 new TextureCopyLocation(lit.Tex, 0), null);
-            cl.ResourceBarrierTransition(lit.Tex, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+            cl.ResourceBarrierTransition(lit.Tex, ResourceStates.CopySource, ResourceStates.NonPixelShaderResource);
         });
 
         byte* m = readback.Map<byte>(0);
@@ -928,6 +941,14 @@ public sealed class Dx12LumenCardScene : IDisposable {
         finalLightRead  = finalLightB;
 
         ClearAtlases();
+        // DETERMINISM: the two FinalLighting atlases REST in NonPixelShaderResource (LightCards reads finalLightRead as
+        // an SRV and now leaves finalLightWrite in NonPixel for the GI consumers — see LightCards). ClearAtlases left
+        // them in UnorderedAccess, so flip both to the resting read state now; LightCards' first frame then transitions
+        // its write atlas NonPixel→UAV from a valid prior state.
+        dev.ExecuteSync(cl => {
+            cl.ResourceBarrierTransition(finalLight.Tex,  ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+            cl.ResourceBarrierTransition(finalLightB.Tex, ResourceStates.UnorderedAccess, ResourceStates.NonPixelShaderResource);
+        });
         CreateCaptureTargets();
     }
 

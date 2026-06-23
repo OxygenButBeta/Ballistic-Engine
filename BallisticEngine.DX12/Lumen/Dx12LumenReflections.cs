@@ -41,7 +41,14 @@ internal sealed class Dx12LumenReflections : IDisposable
     ID3D12Resource ssrCb;
     unsafe byte* ssrCbMapped;
     int ssrCbStride;
-    long SsrCbOffset => (long)dev.FrameSlot * ssrCbStride;
+    // TWO distinct CB sub-slots per in-flight frame: the temporal denoise (PSTemporal) and the combine (PSCombine)
+    // run in the SAME open frame list and BOTH write their constants to this mapped buffer at RECORD time, BEFORE the
+    // GPU executes either. If they shared one offset, the combine's CPU write would clobber the temporal's constants
+    // (notably Intensity, which PSTemporal reads as the hasHistory flag) before the GPU runs the temporal pass — so
+    // the DeterministicCapture history gate was silently defeated and the motion-reprojected EMA ran anyway →
+    // non-determinism. Separate slots keep each pass's constants intact through GPU execution.
+    long SsrCbTemporalOffset => (long)(dev.FrameSlot * 2 + 0) * ssrCbStride;
+    long SsrCbCombineOffset  => (long)(dev.FrameSlot * 2 + 1) * ssrCbStride;
     Dx12DescriptorHeap ssrSrvVisible;
 
     // Half-res reflection target + temporal history ping-pong.
@@ -122,8 +129,11 @@ internal sealed class Dx12LumenReflections : IDisposable
         Dx12SceneAS sceneAS = ctx.Dxr?.SceneAS;
         bool hasTlas = sceneAS != null && sceneAS.Valid;
         bool forceSW = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_REFL_SW") == "1";
-        bool preferSW = forceSW || !hasTlas;
         bool sdfReady = globalSdf != null && globalSdf.Valid && globalSdf.ClipmapSrvBindless >= 0;
+        // DETERMINISM: prefer the SW global-SDF march under a deterministic capture (when the clipmap is ready) — the
+        // HW closest-hit RayQuery tie-breaks at triangle edges run-to-run (≈1-LSB pixels) and breaks the byte-exact
+        // golden-diff. Production keeps the full HW path. Same rationale as the screen probe.
+        bool preferSW = forceSW || !hasTlas || (ctx.DeterministicCapture && sdfReady);
         if ((preferSW && !sdfReady) || (!preferSW && !hasTlas))
         {
             if (!loggedRun) { loggedRun = true;
@@ -135,6 +145,12 @@ internal sealed class Dx12LumenReflections : IDisposable
         EnsureSized(ctx.SceneColor.Width, ctx.SceneColor.Height);
         NoteHitLightDoor();
         globalSdf?.ToPixelShaderResource();   // SW march reads the clipmap as a (bindless) SRV.
+
+        // Reset the per-frame SRV ring ONCE per frame (here). The temporal denoise then the combine each AllocateRange(5)
+        // into DISTINCT slots [0..4] / [5..9] of this frame-slot's region, so neither overwrites the other's descriptors
+        // while both draws are still pending in the open frame list (the prior Reset()-in-both-passes aliased them →
+        // the combine clobbered the temporal table before the GPU ran it → garbage reads → non-determinism).
+        ssrSrvVisible.Reset();
 
         var gbuffer = ctx.GBuffer;
         var target = ctx.SceneColor;
@@ -238,11 +254,16 @@ internal sealed class Dx12LumenReflections : IDisposable
         Dx12OffscreenTarget histRead = reflHistWriteB ? reflHistoryA : reflHistoryB;
         Dx12OffscreenTarget histWrite = reflHistWriteB ? reflHistoryB : reflHistoryA;
         histRead.ColorToShaderResource();
-        *(SsrConstants*)(ssrCbMapped + SsrCbOffset) = new SsrConstants
+        // DETERMINISM: the temporal reproject reads the G-buffer MOTION buffer (prevUV = uv + motion). Under
+        // BALLISTIC_DETERMINISTIC the motion buffer is NOT byte-stable run-to-run, so the motion-driven history
+        // sample makes the EMA accumulate a different steady state each run → the golden-diff breaks. Aurora gates
+        // its temporal reproject the same way (HistoryValid && !DeterministicCapture). Force hasHistory=0 under
+        // deterministic capture so every reflection frame is a fresh, reproject-free trace.
+        bool useHistory = reflHistValid && !ctx.DeterministicCapture;
+        *(SsrConstants*)(ssrCbMapped + SsrCbTemporalOffset) = new SsrConstants
         {
-            Intensity = reflHistValid ? 1f : 0f, TexelSize = new Vector2(1f / reflTarget.Width, 1f / reflTarget.Height),
+            Intensity = useHistory ? 1f : 0f, TexelSize = new Vector2(1f / reflTarget.Width, 1f / reflTarget.Height),
         };
-        ssrSrvVisible.Reset();
         int tb = ssrSrvVisible.AllocateRange(5);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 0), reflTarget.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(tb + 1), histRead.ColorSrvCpu, heapType);
@@ -253,7 +274,7 @@ internal sealed class Dx12LumenReflections : IDisposable
         {
             cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrTemporalPso);
             cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress + (ulong)SsrCbOffset);
+            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress + (ulong)SsrCbTemporalOffset);
             cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(tb));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
@@ -271,13 +292,12 @@ internal sealed class Dx12LumenReflections : IDisposable
         Matrix4x4.Invert(proj, out Matrix4x4 invProj);
         target.ColorToShaderResource();
         gbuffer.DepthToShaderResource();
-        *(SsrConstants*)(ssrCbMapped + SsrCbOffset) = new SsrConstants
+        *(SsrConstants*)(ssrCbMapped + SsrCbCombineOffset) = new SsrConstants
         {
             Projection = Matrix4x4.Transpose(proj), InvProjection = Matrix4x4.Transpose(invProj),
             ViewMatrix = Matrix4x4.Transpose(view), Intensity = EnvF("BALLISTIC_DX12_LUMEN_REFL_INTENSITY", 1f),
             TexelSize = new Vector2(1f / reflTarget.Width, 1f / reflTarget.Height),
         };
-        ssrSrvVisible.Reset();
         int cb = ssrSrvVisible.AllocateRange(5);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 0), target.ColorSrvCpu, heapType);
         dev.Device.CopyDescriptorsSimple(1, ssrSrvVisible.Cpu(cb + 1), gbuffer.DepthSrvCpu, heapType);
@@ -288,7 +308,7 @@ internal sealed class Dx12LumenReflections : IDisposable
         {
             cl.SetGraphicsRootSignature(ssrRootSig); cl.SetPipelineState(ssrCombinePso);
             cl.SetDescriptorHeaps(ssrSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress + (ulong)SsrCbOffset);
+            cl.SetGraphicsRootConstantBufferView(0, ssrCb.GPUVirtualAddress + (ulong)SsrCbCombineOffset);
             cl.SetGraphicsRootDescriptorTable(1, ssrSrvVisible.Gpu(cb));
             cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             cl.DrawInstanced(3, 1, 0, 0);
@@ -384,8 +404,9 @@ internal sealed class Dx12LumenReflections : IDisposable
         ssrTemporalPso = MakePso("PSTemporal");
 
         ssrCbStride = (Marshal.SizeOf<SsrConstants>() + 255) & ~255;
+        // 2 CB sub-slots per in-flight frame (temporal + combine — see SsrCbTemporalOffset/SsrCbCombineOffset).
         ssrCb = dev.Device.CreateCommittedResource(HeapProperties.UploadHeapProperties, HeapFlags.None,
-            ResourceDescription.Buffer((ulong)(ssrCbStride * dev.FramesInFlight)), ResourceStates.GenericRead);
+            ResourceDescription.Buffer((ulong)(ssrCbStride * 2 * dev.FramesInFlight)), ResourceStates.GenericRead);
         ssrCbMapped = ssrCb.Map<byte>(0);
         ssrSrvVisible = new Dx12DescriptorHeap(dev,
             DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView, 10, shaderVisible: true, framesInFlight: dev.FramesInFlight);
@@ -406,6 +427,7 @@ internal sealed class Dx12LumenReflections : IDisposable
         reflHistoryA = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         reflHistoryB = new Dx12OffscreenTarget(dev, hw, hh, withDepth: false, colorFormat: Dx12OffscreenTarget.HdrFormat, colorReadable: true);
         reflHistValid = false;
+        reflHistWriteB = false;   // deterministic ping-pong phase across runs (was left dangling on resize).
         reflDescStamp = -1;
     }
 

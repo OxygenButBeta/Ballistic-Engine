@@ -137,8 +137,10 @@ internal sealed class Dx12LumenRadianceCache : IDisposable
         bool hasTlas = sceneAS != null && sceneAS.Valid;
         bool forceSW = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_RC_SW") == "1"
                        || Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_SW") == "1";
-        bool preferSW = forceSW || !hasTlas;
         bool sdfReady = globalSdf != null && globalSdf.Valid && globalSdf.ClipmapSrvBindless >= 0;
+        // DETERMINISM: prefer the SW march under a deterministic capture (clipmap ready) — the HW closest-hit RayQuery
+        // tie-breaks at edges run-to-run, breaking the byte-exact golden-diff. Same rationale as the screen probe.
+        bool preferSW = forceSW || !hasTlas || (ctx.DeterministicCapture && sdfReady);
         if ((preferSW && !sdfReady) || (!preferSW && !hasTlas)) return false;
 
         EnsureBuilt();
@@ -418,7 +420,7 @@ internal sealed class Dx12LumenRadianceCache : IDisposable
                 Dimension = ResourceDimension.Texture2D, Width = (ulong)atlasDim, Height = (uint)atlasDim,
                 DepthOrArraySize = 1, MipLevels = 1, Format = Format.R16G16B16A16_Float,
                 SampleDescription = new SampleDescription(1, 0), Layout = TextureLayout.Unknown,
-                Flags = ResourceFlags.AllowUnorderedAccess,
+                Flags = ResourceFlags.AllowUnorderedAccess | ResourceFlags.AllowRenderTarget,   // RTV for the one-time clear
             }, ResourceStates.UnorderedAccess);
         radianceAtlas.Name = "LumenRcRadiance";
         MakeTexViews(radianceAtlas, Format.R16G16B16A16_Float, RadUavSlot, RadSrvSlot, bindless, heapType);
@@ -429,7 +431,7 @@ internal sealed class Dx12LumenRadianceCache : IDisposable
                 Dimension = ResourceDimension.Texture2D, Width = (ulong)atlasDim, Height = (uint)atlasDim,
                 DepthOrArraySize = 1, MipLevels = 1, Format = Format.R16_Float,
                 SampleDescription = new SampleDescription(1, 0), Layout = TextureLayout.Unknown,
-                Flags = ResourceFlags.AllowUnorderedAccess,
+                Flags = ResourceFlags.AllowUnorderedAccess | ResourceFlags.AllowRenderTarget,   // RTV for the one-time clear
             }, ResourceStates.UnorderedAccess);
         hitDistAtlas.Name = "LumenRcHitDist";
         MakeTexViews(hitDistAtlas, Format.R16_Float, HitUavSlot, HitSrvSlot, bindless, heapType);
@@ -449,6 +451,14 @@ internal sealed class Dx12LumenRadianceCache : IDisposable
             Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)n, StructureByteStride = 4, CounterOffsetInBytes = 0 },
         }, bindless.Cpu(FreeUavSlot));
 
+        // DETERMINISM: the radiance + hit-dist atlases are CreateCommittedResource (NOT zero-filled) and are filled
+        // SPARSELY — only `traceBudget` probes are traced per frame, so freshly-allocated cells whose atlas slot has
+        // not been traced yet are SAMPLED by the screen probe while still holding uninitialized GPU memory → garbage
+        // that differs run-to-run (the early-frame golden-diff alternates). CSInit clears indirection + mark but NOT
+        // these atlases. Clear both to 0 ONCE on creation via a transient RTV clear (the card-scene ClearAtlases
+        // pattern — avoids the shader-visible-heap UAV-clear rule). One-time creation cost, not per-frame.
+        ClearAtlasesOnce();
+
         // The indirection volume + mark buffer are cleared to RC_UNALLOC / 0 by CSInit on the first Build (the free
         // list was just CPU-initialized with all slots free).
         indirState = ResourceStates.UnorderedAccess;
@@ -456,6 +466,35 @@ internal sealed class Dx12LumenRadianceCache : IDisposable
         radState = ResourceStates.UnorderedAccess;
         hitState = ResourceStates.UnorderedAccess;
         freeState = ResourceStates.UnorderedAccess;
+    }
+
+    // One-time RTV clear of the radiance + hit-dist atlases to 0 (see the determinism note in EnsureResources). RTV
+    // clear, NOT ClearUnorderedAccessViewFloat — the bindless UAV CPU handle lives in the SHADER-VISIBLE heap, and a
+    // UAV clear requires a NON-shader-visible CPU handle (a D3D12 rule). Both atlases have AllowRenderTarget, so a
+    // transient RTV clear is valid + simple. They are left in UnorderedAccess afterwards (their resting/Build state).
+    void ClearAtlasesOnce()
+    {
+        ID3D12Resource[] all = { radianceAtlas, hitDistAtlas };
+        using ID3D12DescriptorHeap rtvHeap = dev.Device.CreateDescriptorHeap(
+            new DescriptorHeapDescription(DescriptorHeapType.RenderTargetView, (uint)all.Length));
+        CpuDescriptorHandle rtvStart = rtvHeap.GetCPUDescriptorHandleForHeapStart();
+        uint rtvInc = dev.Device.GetDescriptorHandleIncrementSize(DescriptorHeapType.RenderTargetView);
+        for (int k = 0; k < all.Length; k++)
+        {
+            var h = rtvStart; h.Ptr += (nuint)(k * (int)rtvInc);
+            dev.Device.CreateRenderTargetView(all[k], null, h);
+        }
+        // ExecuteSyncImmediate so the clear completes before the transient RTV heap disposes (one-time creation path).
+        dev.ExecuteSyncImmediate(cl =>
+        {
+            for (int k = 0; k < all.Length; k++)
+            {
+                cl.ResourceBarrierTransition(all[k], ResourceStates.UnorderedAccess, ResourceStates.RenderTarget);
+                var h = rtvStart; h.Ptr += (nuint)(k * (int)rtvInc);
+                cl.ClearRenderTargetView(h, new Vortice.Mathematics.Color4(0, 0, 0, 0));
+                cl.ResourceBarrierTransition(all[k], ResourceStates.RenderTarget, ResourceStates.UnorderedAccess);
+            }
+        });
     }
 
     void MakeTexViews(ID3D12Resource tex, Format fmt, int uavSlot, int srvSlot, Dx12DescriptorHeap bindless, DescriptorHeapType heapType)
