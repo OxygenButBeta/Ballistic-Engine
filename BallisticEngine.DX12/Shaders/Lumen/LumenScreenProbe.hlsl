@@ -60,6 +60,11 @@ cbuffer ProbeConstants : register(b0) {
     uint  ProbesX;      uint ProbesY;     uint FullW;           uint FullH;
     float HistoryValid; float ProbeEma;   float OctSize;        float UseSH;
     float ProbeFilterRadius; float SpPad0; float SpPad1;        float SpPad2;
+    // --- FAZ 7 radiance-cache params (mirror RC_PARAMS in LumenRadianceCacheSample.hlsl — the include reads them by name) ---
+    float3 RcOrigin;        float RcProbeSpacing;
+    uint   RcGridRes;       uint  RcAtlasInProbes; uint RcProbeRes; uint RcFinalProbeRes;
+    float  RcTraceStop;     float RcEnabled;       uint RcIndirIdx; uint RcRadIdx;
+    uint   RcHitIdx;        uint  RcMarkIdx;       float RcSampleBias;  float RcPad0;
 };
 
 StructuredBuffer<LtCard>          Cards          : register(t1);
@@ -114,6 +119,10 @@ float3 OctDecode(float2 f) {
     n.xy += float2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
     return normalize(n);
 }
+
+// FAZ 7 — the world-space radiance-cache sampling helper (SampleRadianceCacheInterpolated + RcMarkCell). Needs
+// OctEncode/OctDecode (above) + LinearClamp (s0) + the Rc* CB fields (above). Source-prepended like LumenTrace.
+#include "Lumen/LumenRadianceCacheSample.hlsl"
 
 // --- Order-2 (9-coefficient) real spherical harmonics, evaluated for a direction. Standard basis. ---
 void ShBasis(float3 d, out float sh[9]) {
@@ -217,7 +226,22 @@ void CSProbeTrace(uint3 dtid : SV_DispatchThreadID) {
     float3 origin = P + N * max(LtSurfBias, NormalBias);
     bool preferSW = PreferSW > 0.5;
     float maxDist = MaxRayDist > 0.0 ? MaxRayDist : (LtMaxTraceDist > 0.0 ? LtMaxTraceDist : 1e4);
-    float3 rad = Sanitize(LumenTrace(origin, dir, maxDist, preferSW).Radiance);
+
+    // FAZ 7 NEAR/FAR SPLIT: when the radiance cache is on, the screen probe traces only SHORT — clamp maxDist to the
+    // cache's trace-stop (= probeSpacing*sqrt(3), the clipmap cell space-diagonal). On a MISS within that short
+    // distance, the FAR radiance comes from the cache instead (sampled below). This is the noise reducer: short rays
+    // are cheap + low-variance; the far field is the cache's smooth, temporally-accumulated job.
+    bool rcOn = RcEnabled > 0.5;
+    float traceMax = rcOn ? min(maxDist, RcTraceStop) : maxDist;
+    LumenTraceResult tr = LumenTrace(origin, dir, traceMax, preferSW);
+    float3 rad = Sanitize(tr.Radiance);
+
+    // MISS within the short distance → mark the covering cell (NEXT frame's allocate) + ADD the cache's far radiance.
+    [branch] if (rcOn && !tr.Hit) {
+        RcMarkCell(P);
+        rad += SampleRadianceCacheInterpolated(P, dir);
+        rad = Sanitize(rad);
+    }
 
     // TEMPORAL ACCUMULATION (cache-space EMA, reproject-rejected). Probe atlas cells are screen-tile-anchored; on a
     // static/slow camera the same probe maps to the same cell across frames → a straight per-cell EMA is correct.

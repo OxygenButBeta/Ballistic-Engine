@@ -58,7 +58,21 @@ internal static class Dx12BindlessTail
     public const int LumenScreenProbeUsed = 6;
     public const int LumenScreenProbeTableBase = LumenSurfaceCacheTableBase - LumenScreenProbeReserved;
 
-    public const int TailStart = LumenScreenProbeTableBase;
+    // Lumen FAZ 7 WORLD-SPACE RADIANCE CACHE — its own reserved tail below the screen-probe tail. All slots are
+    // PERSISTENT across frames (the cache atlas/indirection/mark/freelist are the temporal denoiser — allocated ONCE,
+    // never per-frame), so like every block above they MUST live OUTSIDE the dynamic Allocate()/Reset() cursor the
+    // GPU-driven material table rewinds, else the re-stamp clobbers them (typed-mismatch descriptor → GPU page fault →
+    // device removed). Both the cache build passes (Allocate/Trace/Fixup) AND the screen-probe gather read these
+    // bindlessly via ResourceDescriptorHeap[] (HeapDirectlyIndexed root sigs). Slot layout (8):
+    //   +0 Indirection UAV (32^3 R32_UINT) , +1 Indirection SRV ,
+    //   +2 MarkBuffer UAV (R32_UINT flat)  , +3 RadianceAtlas UAV (RGBA16F),
+    //   +4 RadianceAtlas SRV               , +5 HitDistAtlas UAV (R16F),
+    //   +6 HitDistAtlas SRV                , +7 FreeList+counter UAV (raw structured uint[]).
+    const int LumenRadianceCacheReserved = 12;
+    public const int LumenRadianceCacheUsed = 8;
+    public const int LumenRadianceCacheTableBase = LumenScreenProbeTableBase - LumenRadianceCacheReserved;
+
+    public const int TailStart = LumenRadianceCacheTableBase;
 
     const int A_RtReflFits = 1 / (RtReflUsed <= RtReflReserved ? 1 : 0);
     const int A_AuroraFits = 1 / (AuroraUsed <= AuroraReserved ? 1 : 0);
@@ -67,7 +81,8 @@ internal static class Dx12BindlessTail
     const int A_GlobalSdfFits = 1 / (GlobalSdfUsed <= GlobalSdfReserved ? 1 : 0);
     const int A_LumenSurfaceCacheFits = 1 / (LumenSurfaceCacheUsed <= LumenSurfaceCacheReserved ? 1 : 0);
     const int A_LumenScreenProbeFits = 1 / (LumenScreenProbeUsed <= LumenScreenProbeReserved ? 1 : 0);
+    const int A_LumenRadianceCacheFits = 1 / (LumenRadianceCacheUsed <= LumenRadianceCacheReserved ? 1 : 0);
     const int A_TailStartPositive = 1 / (TailStart > 0 ? 1 : 0);
 
-    static Dx12BindlessTail() => _ = A_RtReflFits + A_AuroraFits + A_AuroraCardFits + A_AuroraScreenProbeFits + A_GlobalSdfFits + A_LumenSurfaceCacheFits + A_LumenScreenProbeFits + A_TailStartPositive;
+    static Dx12BindlessTail() => _ = A_RtReflFits + A_AuroraFits + A_AuroraCardFits + A_AuroraScreenProbeFits + A_GlobalSdfFits + A_LumenSurfaceCacheFits + A_LumenScreenProbeFits + A_LumenRadianceCacheFits + A_TailStartPositive;
 }

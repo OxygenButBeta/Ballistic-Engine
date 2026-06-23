@@ -74,6 +74,11 @@ internal sealed class Dx12LumenScreenProbe : IDisposable
         public uint ProbesX;        public uint ProbesY;     public uint FullW;           public uint FullH;
         public float HistoryValid;  public float ProbeEma;   public float OctSize;        public float UseSH;
         public float ProbeFilterRadius; public float SpPad0; public float SpPad1;        public float SpPad2;
+        // --- FAZ 7 radiance-cache params (mirror RC_PARAMS layout in LumenRadianceCacheSample.hlsl) ---
+        public Vector3 RcOrigin;     public float RcProbeSpacing;
+        public uint RcGridRes;       public uint RcAtlasInProbes; public uint RcProbeRes; public uint RcFinalProbeRes;
+        public float RcTraceStop;    public float RcEnabled;      public uint RcIndirIdx; public uint RcRadIdx;
+        public uint RcHitIdx;        public uint RcMarkIdx;       public float RcSampleBias; public float RcPad0;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -88,7 +93,8 @@ internal sealed class Dx12LumenScreenProbe : IDisposable
     // RUN the screen-probe gather + combine. Returns true if it contributed GI (placed probes + combined).
     // `cards` must be a valid, FinalLighting-lit surface cache; `globalSdf` may be null (HW backend) but is needed
     // for the SW backend. Caller gates on Lumen armed + a valid scene.
-    public unsafe bool Run(Dx12FrameContext ctx, Dx12LumenCardScene cards, Dx12GlobalSdf globalSdf)
+    public unsafe bool Run(Dx12FrameContext ctx, Dx12LumenCardScene cards, Dx12GlobalSdf globalSdf,
+                           Dx12LumenRadianceCache radianceCache)
     {
         if (ctx.SceneColor == null || ctx.GBuffer == null) return false;
         if (cards is null || !cards.Valid || cards.CardCount == 0 || !cards.FinalValid) return false;
@@ -122,6 +128,9 @@ internal sealed class Dx12LumenScreenProbe : IDisposable
         int clipIdx = globalSdf?.ClipmapSrvBindless ?? -1;
         bool useSH = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_PROBE_NOSH") != "1";
 
+        // FAZ 7 radiance cache: enabled when a valid, built cache is supplied (the GiPass gates it on the RC door).
+        bool rcOn = radianceCache != null && radianceCache.Valid;
+
         spProbeCb.Write(new ProbeConstants
         {
             LtClipOrigin = globalSdf?.ClipOrigin ?? Vector3.Zero,
@@ -146,6 +155,20 @@ internal sealed class Dx12LumenScreenProbe : IDisposable
             ProbeEma = EnvF("BALLISTIC_DX12_LUMEN_PROBE_EMA", 0.1f),
             OctSize = octSize, UseSH = useSH ? 1f : 0f,
             ProbeFilterRadius = EnvF("BALLISTIC_DX12_LUMEN_PROBE_FILTER_RADIUS", 2f),
+            // --- FAZ 7 radiance cache ---
+            RcOrigin = rcOn ? radianceCache.Origin : Vector3.Zero,
+            RcProbeSpacing = rcOn ? radianceCache.ProbeSpacingPub : 1f,
+            RcGridRes = rcOn ? (uint)radianceCache.GridRes : 1u,
+            RcAtlasInProbes = rcOn ? (uint)radianceCache.AtlasInProbesPub : 1u,
+            RcProbeRes = rcOn ? (uint)radianceCache.ProbeResPub : 1u,
+            RcFinalProbeRes = rcOn ? (uint)radianceCache.FinalProbeResPub : 1u,
+            RcTraceStop = rcOn ? radianceCache.TraceStop : 0f,
+            RcEnabled = rcOn ? 1f : 0f,
+            RcIndirIdx = rcOn ? (uint)radianceCache.IndirBindless : 0u,
+            RcRadIdx = rcOn ? (uint)radianceCache.RadBindless : 0u,
+            RcHitIdx = rcOn ? (uint)radianceCache.HitBindless : 0u,
+            RcMarkIdx = rcOn ? (uint)radianceCache.MarkBindless : 0u,
+            RcSampleBias = 0f, RcPad0 = 0f,
         });
 
         var heapType = DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView;
@@ -175,7 +198,7 @@ internal sealed class Dx12LumenScreenProbe : IDisposable
         if (!loggedRun) { loggedRun = true;
             Console.WriteLine($"[LumenScreenProbe] RUN backend={(preferSW?"SW":"HW")} probes={probesX}x{probesY} oct={octSize} " +
                 $"stride={probeStride} cards={cards.CardCount} inst={cards.InstanceCount} finalReadIdx={cards.FinalReadSrvIdx} " +
-                $"clipIdx={clipIdx} sh={useSH} maxDist={maxDist:0.#}"); }
+                $"clipIdx={clipIdx} sh={useSH} maxDist={maxDist:0.#} rc={(rcOn?$"ON traceStop={radianceCache.TraceStop:0.#}":"OFF")}"); }
 
         indirect.ColorToUnorderedAccess();
         probeAtlas.ColorToUnorderedAccess();
@@ -367,13 +390,16 @@ internal sealed class Dx12LumenScreenProbe : IDisposable
                 new[] { cbv0, tlas, cards, pages, ranges, table, headerUav, prevHeader, probeShUav },
                 new[] { clamp, wrap })));
 
-        // The probe shader #includes "Lumen/LumenTrace.hlsl"; there is NO DXC include handler (shaders are embedded
-        // strings) → prepend the include source + strip the #include line (the established pattern, mirroring the
-        // FAZ 5 trace debug shader).
+        // The probe shader #includes "Lumen/LumenTrace.hlsl" + "Lumen/LumenRadianceCacheSample.hlsl"; there is NO DXC
+        // include handler (shaders are embedded strings) → source-prepend each include in place (strip the #include
+        // line, paste the source). The established pattern (mirroring the FAZ 5 trace debug shader).
         string inc  = EmbeddedShaderSource.ReadHlsl("Lumen/LumenTrace.hlsl");
+        string rcInc = EmbeddedShaderSource.ReadHlsl("Lumen/LumenRadianceCacheSample.hlsl");
         string body = EmbeddedShaderSource.ReadHlsl("Lumen/LumenScreenProbe.hlsl");
         body = System.Text.RegularExpressions.Regex.Replace(
             body, "(?m)^\\s*#include\\s+\"Lumen/LumenTrace\\.hlsl\".*$", inc);
+        body = System.Text.RegularExpressions.Regex.Replace(
+            body, "(?m)^\\s*#include\\s+\"Lumen/LumenRadianceCacheSample\\.hlsl\".*$", rcInc);
 
         ID3D12PipelineState Pso(string entry) => dev.Device.CreateComputePipelineState(new ComputePipelineStateDescription
         {

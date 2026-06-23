@@ -44,6 +44,20 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // deferred pass suppresses its IBL diffuse ambient when ctx.LumenActiveThisFrame so this doesn't double-count.
     Dx12LumenScreenProbe screenProbe;
 
+    // FAZ 7: the WORLD-SPACE RADIANCE CACHE — a sparse, persistent, camera-centered clipmap of octahedral world-space
+    // radiance probes. The far-field GI noise reducer: the screen probes trace SHORT rays and, on a miss within the
+    // cell's space-diagonal trace-stop, MARK the covering cell + SAMPLE the cache for distant radiance. 1-frame
+    // deferred: this builds (allocate+trace+fixup) the cells the screen probes marked LAST frame BEFORE the
+    // screen-probe gather, which then samples the (now-filled) cache + marks for NEXT frame. Gated on the RC door
+    // (BALLISTIC_DX12_LUMEN_RC, default ON when Lumen on; =0 → screen probe traces full distance = FAZ 6 fallback).
+    Dx12LumenRadianceCache radianceCache;
+    static int rcDoor = -2;   // -2 unread, 0 off, 1 on
+    static bool RcArmed() {
+        if (rcDoor == -2)
+            rcDoor = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_RC") == "0" ? 0 : 1;
+        return rcDoor == 1;
+    }
+
     // FAZ 2 debug view (BALLISTIC_DX12_GLOBALSDF_DEBUG=1): a fullscreen sphere-trace of the clipmap, opaque-replace
     // into the HDR scene color, so the field's correctness is VISIBLE. Lazily built with the SDF.
     ID3D12RootSignature dbgRootSig;
@@ -725,8 +739,20 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // double-count. Default off (BALLISTIC_DX12_LUMEN unset) → never reached → byte-identical render path.
         if (Armed(ctx) && ctx.SceneColor != null)
         {
+            // FAZ 7: BUILD the world-space radiance cache FIRST (1-frame-deferred — allocate+trace+fixup the cells the
+            // screen probes marked LAST frame), so the screen-probe gather below SAMPLES the now-filled cache on a
+            // short-trace miss + marks cells for NEXT frame. Door-gated; when off the screen probe traces full distance
+            // (FAZ 6 fallback) because Run() gets a null cache → RcEnabled=0 in the CB.
+            if (RcArmed())
+            {
+                radianceCache ??= new Dx12LumenRadianceCache(dev);
+                radianceCache.Build(ctx, scene.CardScene, globalSdf);
+                if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_RC_STATS") == "1")
+                    radianceCache.DumpStats();
+            }
+
             screenProbe ??= new Dx12LumenScreenProbe(dev);
-            screenProbe.Run(ctx, scene.CardScene, globalSdf);
+            screenProbe.Run(ctx, scene.CardScene, globalSdf, RcArmed() ? radianceCache : null);
         }
     }
 
@@ -735,6 +761,7 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         scene?.Dispose();
         globalSdf?.Dispose();
         screenProbe?.Dispose();
+        radianceCache?.Dispose();
         dbgPso?.Dispose(); dbgRootSig?.Dispose(); dbgCb?.Dispose(); dbgSrv?.Dispose();
         cardDbgPso?.Dispose(); cardDbgRootSig?.Dispose(); cardDbgCb?.Dispose();
         capDbgPso?.Dispose(); capDbgRootSig?.Dispose(); capDbgCb?.Dispose(); capDbgSrv?.Dispose();
