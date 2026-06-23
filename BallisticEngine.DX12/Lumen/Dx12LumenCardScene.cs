@@ -241,6 +241,9 @@ public sealed class Dx12LumenCardScene : IDisposable {
     public Vector3 CardGridCellSize { get; private set; }   // world size of one cell
     public int CardGridDim { get; private set; }            // cells per axis
     public bool CardGridValid { get; private set; }
+    // FAZ 11 — bindless indices for the consumer (LumenTrace SampleSurfaceCache_WorldPos via ResourceDescriptorHeap[]).
+    public int CardGridCellBindless  => CardGridValid ? Dx12BindlessTail.LumenCardGridCellSrv  : -1;
+    public int CardGridIndexBindless => CardGridValid ? Dx12BindlessTail.LumenCardGridIndexSrv : -1;
     static int cardGridDoor = -2;   // -2 unread, 0 off, 1 on
     static bool CardGridArmed() {
         if (cardGridDoor == -2)
@@ -455,6 +458,23 @@ public sealed class Dx12LumenCardScene : IDisposable {
         dev.DeferredRelease(cardGridIndexBuf);
         cardGridBuf = dev.CreateUavBuffer<GpuCardGridCell>(cells, ResourceStates.GenericRead);
         cardGridIndexBuf = dev.CreateUavBuffer<uint>(indices, ResourceStates.GenericRead);
+
+        // Stamp the two grid SRVs into the surface-cache block's spare reserved-tail bindless slots (+14/+15), so the
+        // shared LumenTrace include reads them via ResourceDescriptorHeap[] with NO per-consumer root-sig change. These
+        // are persistent reserved slots (not the dynamic Allocate cursor) — safe to re-stamp on each grid rebuild.
+        var bl = Dx12Backend.BindlessHeap;
+        dev.Device.CreateShaderResourceView(cardGridBuf, new ShaderResourceViewDescription {
+            ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Buffer,
+            Format = Format.Unknown, Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Buffer = new BufferShaderResourceView { FirstElement = 0, NumElements = (uint)cellCount,
+                StructureByteStride = (uint)Marshal.SizeOf<GpuCardGridCell>(), Flags = BufferShaderResourceViewFlags.None },
+        }, bl.Cpu(Dx12BindlessTail.LumenCardGridCellSrv));
+        dev.Device.CreateShaderResourceView(cardGridIndexBuf, new ShaderResourceViewDescription {
+            ViewDimension = Vortice.Direct3D12.ShaderResourceViewDimension.Buffer,
+            Format = Format.R32_UInt, Shader4ComponentMapping = ShaderComponentMapping.Default,
+            Buffer = new BufferShaderResourceView { FirstElement = 0, NumElements = (uint)Math.Max(total, 1),
+                StructureByteStride = 0, Flags = BufferShaderResourceViewFlags.None },
+        }, bl.Cpu(Dx12BindlessTail.LumenCardGridIndexSrv));
         CardGridValid = true;
 
         if (!loggedCardGrid) {

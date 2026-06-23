@@ -43,9 +43,13 @@ internal static class Dx12BindlessTail
     // Allocate()/Reset() cursor the GPU-driven material table rewinds — else the re-stamp clobbers them (typed-mismatch
     // descriptor → GPU page fault → device removed). Door-gated; nothing allocated when Lumen cards are off. Slot
     // order: per atlas, SRV then UAV, in atlas-creation order.
-    const int LumenSurfaceCacheReserved = 16;   // 14 used (7 atlases × SRV+UAV) + slack
-    public const int LumenSurfaceCacheUsed = 14;
+    const int LumenSurfaceCacheReserved = 16;   // 14 atlas SRV/UAV + 2 FAZ 11 card-grid SRVs (+14,+15) = 16, exact
+    public const int LumenSurfaceCacheUsed = 16;
     public const int LumenSurfaceCacheTableBase = GlobalSdfTableBase - LumenSurfaceCacheReserved;
+    // FAZ 11 — the spatial card-grid SRVs ride the surface-cache block's 2 spare slots (the grid is part of the card
+    // scene). +14 = cell {offset,count} buffer SRV, +15 = flat card-index buffer SRV. Persistent, stamped on grid build.
+    public const int LumenCardGridCellSrv  = LumenSurfaceCacheTableBase + 14;
+    public const int LumenCardGridIndexSrv = LumenSurfaceCacheTableBase + 15;
 
     // Lumen FAZ 6 SCREEN-PROBE GATHER — its own reserved tail below the surface-cache tail. The probe shader's
     // root sig uses a per-frame DESCRIPTOR TABLE (mirroring Aurora's screen-probe table) for the resources that are
