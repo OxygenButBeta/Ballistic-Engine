@@ -708,6 +708,22 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // Dx12AuroraGiPass.RecordV2.
     public void RecordV2(Dx12FrameContext ctx) => Record(ctx);
 
+    // FAZ 10 — per-pass GPU timing. The Lumen sub-passes (capture/light/sdf/radiance-cache/screen-probe/reflections)
+    // all record onto the SINGLE open frame list (ExecuteSync does not flush — see the determinism memory), so a
+    // flush-per-pass timer (dev.GpuTimerBegin/End) would serialize the GPU and lie. Instead we use the deferred ring
+    // profiler (Dx12GpuProfiler): it writes timestamp query pairs INTO the open list and drains them N frames later
+    // after the fence completes — zero serialization, race-safe. Gated on BALLISTIC_DX12_GPU_PROFILE=1; the drained
+    // "[GpuProf] LumenCapture=… LumenLight=… …" line lets us see WHICH Lumen sub-pass dominates the Bistro frame
+    // before optimizing blind. Marks nest harmlessly inside the renderer's own marks (a flat timestamp-pair list).
+    void GpuMark(string name) {
+        var prof = dev.GpuProfiler;
+        if (prof.Enabled && dev.FrameList is { } fl) prof.Begin(fl, name);
+    }
+    void GpuMarkEnd() {
+        var prof = dev.GpuProfiler;
+        if (prof.Enabled && dev.FrameList is { } fl) prof.End(fl);
+    }
+
     public void Record(Dx12FrameContext ctx)
     {
         // FAZ 0: build/refresh the scene substrate ONLY. No GI is traced or combined → scene color is untouched,
@@ -724,13 +740,19 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         // their atlas pages. Runs ONCE per (re)build (the card scene's own capturedStamp gate); a static scene captures
         // on the first armed frame and never again. No lighting — 3d lights the cache. Recorded into the open frame
         // list. Gated implicitly on the card scene existing (built whenever cards-or-Lumen is armed).
+        GpuMark("LumenCapture");
         scene.CardScene?.Capture(ctx, ctx.Dxr.SceneAS);
+        GpuMarkEnd();
 
         // FAZ 3d: LIGHT the surface cache. Per atlas texel: direct (sun + punctual + emissive NEE, shadow-rayed) +
         // indirect (radiosity gather of last frame's FinalLighting → multi-bounce) → a lit, view-independent
         // FinalLighting atlas. Runs every armed frame (lighting is dynamic; multi-bounce accumulates over frames).
         if (LightArmed(ctx))
+        {
+            GpuMark("LumenLight");
             scene.CardScene?.LightCards(ctx, ctx.Dxr.SceneAS);
+            GpuMarkEnd();
+        }
 
         // FAZ 2: build/refresh the camera-centered GLOBAL DISTANCE FIELD clipmap from the visible meshes' per-mesh
         // SDFs. Armed by BALLISTIC_DX12_GLOBALSDF=1 (independent test) OR whenever Lumen GI is on (the field is part
@@ -738,7 +760,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (SdfArmed(ctx))
         {
             globalSdf ??= new Dx12GlobalSdf(dev);
+            GpuMark("LumenGlobalSdf");
             globalSdf.Build(ctx, ctx.Dxr.SceneAS, scene.DirtyThisFrame);
+            GpuMarkEnd();
 
             // FAZ 2 verification artifact: sphere-trace the field per screen pixel into the HDR scene color so the
             // silhouette/surfaces appear where geometry is. Default off → scene color untouched. Guarded on a valid
@@ -788,13 +812,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             if (RcArmed())
             {
                 radianceCache ??= new Dx12LumenRadianceCache(dev);
+                GpuMark("LumenRadianceCache");
                 radianceCache.Build(ctx, scene.CardScene, globalSdf);
+                GpuMarkEnd();
                 if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_RC_STATS") == "1")
                     radianceCache.DumpStats();
             }
 
             screenProbe ??= new Dx12LumenScreenProbe(dev);
+            GpuMark("LumenScreenProbe");
             screenProbe.Run(ctx, scene.CardScene, globalSdf, RcArmed() ? radianceCache : null);
+            GpuMarkEnd();
 
             // FAZ 8 — LUMEN REFLECTIONS at event 600 timing (after the GI combine above). Each reflective G-buffer
             // pixel reflects through LumenTrace → the LIT surface cache, so a mirror surface carries the cache's GI
@@ -804,7 +832,9 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             if (ReflArmed())
             {
                 reflections ??= new Dx12LumenReflections(dev);
+                GpuMark("LumenReflections");
                 reflections.Run(ctx, scene.CardScene, globalSdf);
+                GpuMarkEnd();
             }
         }
     }

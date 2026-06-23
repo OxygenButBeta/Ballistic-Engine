@@ -386,7 +386,7 @@ public sealed class Dx12Device : IDisposable {
         frameFenceTargets[frameSlot] = target;
         if (gpuProfiler is { Enabled: true }) {
             string line = gpuProfiler.Drain(frameFence.CompletedValue);
-            if (line is not null) Console.WriteLine(line);
+            if (line is not null) { Console.WriteLine(line); BallisticEngine.Debugging.Log(line); }
         }
 
         if (FramesInFlight == 1 || syncThisFrame) WaitFrameFence(target);

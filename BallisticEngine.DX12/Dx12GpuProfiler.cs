@@ -93,7 +93,10 @@ public sealed class Dx12GpuProfiler : IDisposable {
         for (int i = 0; i < count; i++) {
             ulong begin = p[baseSlot + i * 2], end = p[baseSlot + i * 2 + 1];
             double ms = end > begin ? (end - begin) * 1000.0 / frequency : 0.0;
-            const double FlushGuardMs = 6.0;
+            // Guard against a timestamp pair that straddled a queue flush / frame boundary (reads as an absurd span).
+            // Raised from 6ms: with the deferred ring drain these are REAL GPU times — a heavy Lumen pass on Bistro
+            // can legitimately take tens of ms at 5 FPS, and the old 6ms cap hid exactly the cost we want to measure.
+            const double FlushGuardMs = 250.0;
             if (ms > FlushGuardMs) {
                 sb.Append($" {ringNames[ring][i]}=~flush?");
             } else {
