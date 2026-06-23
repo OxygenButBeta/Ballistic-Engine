@@ -276,10 +276,15 @@ void CSMain(uint3 dtid : SV_DispatchThreadID) {
         indirect = acc / float(ir) * IndirectIntensity;
     }
 
-    // === FINAL === Albedo*(Direct+Indirect) + Emissive. Energy: the captured albedo is the surface reflectance;
-    // direct/indirect are incoming irradiance-like terms; emissive is added on top (self-emission).
+    // === FINAL === Lambertian diffuse: L_out = (albedo/π)·E_direct + albedo·E_indirect + emissive.
+    // ENERGY (the FAZ 8.5 calibration): the diffuse BRDF is albedo/π. The DIRECT term (sun N·L + punctual + NEE) is
+    // computed as explicit IRRADIANCE (N·L, projected solid angle), so it needs the /π. The INDIRECT term is gathered
+    // by COSINE-importance-sampled hemisphere rays, whose pdf (cosθ/π) already cancels the Lambert π — the estimator
+    // mean(L_in) IS the (albedo·) outgoing factor, so it must NOT get a second /π (that was the Aurora "cosine cancels
+    // π" rule; double-dividing = the old dark-GI bug). Emissive is self-emission, added on top. Result was ~π× too
+    // bright before this fix (direct was missing /π), inflating every downstream bounce + the screen-probe gather.
     float3 directRad = Sanitize(max(direct, 0.0.xxx));
-    float3 finalLit = albedo * (directRad + indirect) + emissive;
+    float3 finalLit = albedo * (directRad * (1.0 / PI) + indirect) + emissive;
     finalLit = Sanitize(max(finalLit, 0.0.xxx));
 
     directOut[tc] = float4(directRad, 1.0);
