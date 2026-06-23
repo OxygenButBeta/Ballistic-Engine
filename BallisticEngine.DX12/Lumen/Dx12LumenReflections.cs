@@ -74,6 +74,10 @@ internal sealed class Dx12LumenReflections : IDisposable
         public uint LtAtlasSize, LtCardCount, LtInstanceCount, LtFinalReadIdx;
         public uint LtClipmapIdx, LtFinalValid, LtHasTlas, LtSkyIdx;
         public float LtSkyIntensity, LtUseSky, LtSurfBias, LtPad0;
+        // FAZ 11 — spatial card grid (matches LUMEN_TRACE_PARAMS tail in LumenTrace.hlsl)
+        public Vector3 LtCgOrigin; public float LtCgEnabled;
+        public Vector3 LtCgCellSize; public uint LtCgDim;
+        public uint LtCgCellIdx, LtCgIndexIdx, LtCgPad0, LtCgPad1;
         // --- reflection params ---
         public Matrix4x4 InvViewProj;
         public Vector3 CameraPos;   public float Intensity;
@@ -179,6 +183,10 @@ internal sealed class Dx12LumenReflections : IDisposable
             LtClipmapIdx = (uint)Math.Max(clipIdx, 0), LtFinalValid = cards.FinalValid ? 1u : 0u,
             LtHasTlas = hasTlas ? 1u : 0u, LtSkyIdx = 0u,
             LtSkyIntensity = 0f, LtUseSky = 0f, LtSurfBias = 0.03f, LtPad0 = 0f,
+            // FAZ 11 — spatial card grid (world-pos lookup accel; off → linear scan, byte-id)
+            LtCgEnabled = cards.CardGridValid ? 1f : 0f, LtCgOrigin = cards.CardGridOrigin,
+            LtCgCellSize = cards.CardGridCellSize, LtCgDim = (uint)Math.Max(cards.CardGridDim, 1),
+            LtCgCellIdx = (uint)Math.Max(cards.CardGridCellBindless, 0), LtCgIndexIdx = (uint)Math.Max(cards.CardGridIndexBindless, 0),
             InvViewProj = Matrix4x4.Transpose(invVP),
             CameraPos = ctx.CamPos, Intensity = intensity,
             HalfTexel = new Vector2(1f / reflTarget.Width, 1f / reflTarget.Height),

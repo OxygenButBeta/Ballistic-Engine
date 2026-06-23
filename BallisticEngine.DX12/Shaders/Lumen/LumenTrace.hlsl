@@ -47,7 +47,11 @@ struct LtInstanceRange { uint Offset; uint Count; };   // InstanceCardRange
     uint   LtClipResX, LtClipResY, LtClipResZ; float LtMaxTraceDist;   \
     uint   LtAtlasSize, LtCardCount, LtInstanceCount, LtFinalReadIdx;  \
     uint   LtClipmapIdx, LtFinalValid, LtHasTlas, LtSkyIdx;            \
-    float  LtSkyIntensity, LtUseSky, LtSurfBias, LtPad0
+    float  LtSkyIntensity, LtUseSky, LtSurfBias, LtPad0;               \
+    /* FAZ 11 — spatial card grid (world-pos lookup accel). LtCgEnabled=0 → linear scan (old). 48B, 16-aligned. */ \
+    float3 LtCgOrigin;     float LtCgEnabled;                          \
+    float3 LtCgCellSize;   uint  LtCgDim;                              \
+    uint   LtCgCellIdx, LtCgIndexIdx, LtCgPad0, LtCgPad1
 
 struct LumenTraceResult { float3 Radiance; float HitT; bool Hit; };
 
@@ -112,23 +116,53 @@ float3 SampleSurfaceCache_Instance(uint instance, float3 hitPos, float3 hitNorma
 // scan. Fine for the GI test scenes (~12 cards). For Bistro-scale card counts this is slow; a spatial accel (a card
 // grid / per-voxel card list) is a LATER refinement (see the FAZ 5 brief). Picks the card whose OBB contains the point
 // AND whose outward normal best aligns with the SDF-gradient hit normal.
+// Score + sample one card against the world hit; updates best* if it wins. Factored so the grid + linear paths share it.
+void LtScoreCard(uint ci, float3 hitPos, float3 hitNormal, Texture2D<float4> finalRead,
+                 inout float bestScore, inout float3 bestRad, inout bool found) {
+    if (ci >= LtCardCount) return;
+    LtCard c = Cards[ci];
+    float3 rad;
+    if (!LtSampleCard(c, hitPos, hitNormal, finalRead, rad)) return;
+    float3 rel = hitPos - c.Origin;
+    float du = dot(rel, c.AxisX) / max(c.ExtentX, 1e-4);
+    float dv = dot(rel, c.AxisY) / max(c.ExtentY, 1e-4);
+    float dd = dot(rel, c.AxisZ) / max(c.ExtentZ, 1e-4);
+    float score = dot(hitNormal, c.AxisZ) - 0.25 * (abs(du) + abs(dv)) - 0.5 * abs(dd);
+    if (score > bestScore) { bestScore = score; bestRad = rad; found = true; }
+}
+
 float3 SampleSurfaceCache_WorldPos(float3 hitPos, float3 hitNormal) {
     Texture2D<float4> finalRead = ResourceDescriptorHeap[LtFinalReadIdx];
     float bestScore = -1e9; float3 bestRad = 0.0.xxx; bool found = false;
-    uint n = min(LtCardCount, 65536u);
-    [loop] for (uint ci = 0; ci < n; ci++) {
-        LtCard c = Cards[ci];
-        float3 rad;
-        if (!LtSampleCard(c, hitPos, hitNormal, finalRead, rad)) continue;
-        float3 rel = hitPos - c.Origin;
-        float du = dot(rel, c.AxisX) / max(c.ExtentX, 1e-4);
-        float dv = dot(rel, c.AxisY) / max(c.ExtentY, 1e-4);
-        float dd = dot(rel, c.AxisZ) / max(c.ExtentZ, 1e-4);
-        // World-pos scoring: align + a slab-distance penalty (we have no instance to pre-filter, so reward the card the
-        // point sits closest to, on its front).
-        float score = dot(hitNormal, c.AxisZ) - 0.25 * (abs(du) + abs(dv)) - 0.5 * abs(dd);
-        if (score > bestScore) { bestScore = score; bestRad = rad; found = true; }
+
+    // FAZ 11 — SPATIAL CARD GRID fast path: bucket the hit into its grid cell + the 6 face neighbours (cards straddling
+    // a cell border), loop ONLY those cells' card indices (O(cards-in-cell) ≈ a handful vs O(CardCount)). The grid +
+    // index buffers are bindless (reserved-tail slots in the CB). LtCgEnabled=0 → fall through to the linear scan.
+    if (LtCgEnabled > 0.5) {
+        StructuredBuffer<uint2> CgCells = ResourceDescriptorHeap[LtCgCellIdx];   // .x=offset, .y=count
+        Buffer<uint>            CgIndex = ResourceDescriptorHeap[LtCgIndexIdx];
+        int3 base = (int3)floor((hitPos - LtCgOrigin) / max(LtCgCellSize, 1e-4));
+        if (all(base >= -1) && all(base <= (int)LtCgDim)) {
+            // home + 6 face neighbours
+            int3 offs[7] = { int3(0,0,0), int3(1,0,0), int3(-1,0,0), int3(0,1,0), int3(0,-1,0), int3(0,0,1), int3(0,0,-1) };
+            [loop] for (int o = 0; o < 7; o++) {
+                int3 cc = base + offs[o];
+                if (any(cc < 0) || any(cc >= (int)LtCgDim)) continue;
+                uint cell = ((uint)cc.z * LtCgDim + (uint)cc.y) * LtCgDim + (uint)cc.x;
+                uint2 oc = CgCells[cell];   // offset, count
+                [loop] for (uint k = 0; k < oc.y; k++)
+                    LtScoreCard(CgIndex[oc.x + k], hitPos, hitNormal, finalRead, bestScore, bestRad, found);
+            }
+            return (found && bestScore > -0.5) ? bestRad : 0.0.xxx;
+        }
+        // hitPos outside the grid AABB → nothing cached here.
+        return 0.0.xxx;
     }
+
+    // Linear scan fallback (door off / grid not built): O(CardCount). Fine for small scenes.
+    uint n = min(LtCardCount, 65536u);
+    [loop] for (uint ci = 0; ci < n; ci++)
+        LtScoreCard(ci, hitPos, hitNormal, finalRead, bestScore, bestRad, found);
     return (found && bestScore > -0.5) ? bestRad : 0.0.xxx;
 }
 

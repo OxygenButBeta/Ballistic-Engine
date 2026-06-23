@@ -51,6 +51,10 @@ cbuffer ProbeConstants : register(b0) {
     uint   LtAtlasSize, LtCardCount, LtInstanceCount, LtFinalReadIdx;
     uint   LtClipmapIdx, LtFinalValid, LtHasTlas, LtSkyIdx;
     float  LtSkyIntensity, LtUseSky, LtSurfBias, LtPad0;
+    // FAZ 11 — spatial card grid (matches LUMEN_TRACE_PARAMS tail; LtCgEnabled=0 = linear scan)
+    float3 LtCgOrigin;     float LtCgEnabled;
+    float3 LtCgCellSize;   uint  LtCgDim;
+    uint   LtCgCellIdx, LtCgIndexIdx, LtCgPad0, LtCgPad1;
     // --- probe params (after the trace block) ---
     float4x4 InvViewProj;
     float4x4 ViewProj;
