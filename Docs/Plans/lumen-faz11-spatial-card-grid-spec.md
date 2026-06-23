@@ -59,6 +59,20 @@ pass reads it pixel-shader; verify the state (the fog/screen-probe read it fine 
 - No regression with door OFF (linear scan path retained).
 - GPU timing: the grid lookup should make SW-trace screen-probe + translucency cheaper, not just correct.
 
+## IMPLEMENTATION STATUS
+- **STAGE 1 DONE** `33fb6b98`: CPU grid build + upload in Dx12LumenCardScene (BuildCardGrid, called from Rebuild +
+  RefreshTransforms). Gated BALLISTIC_DX12_LUMEN_CARDGRID (default OFF). Verified: door OFF → CornellBox 6/12 lit (no
+  regression); door ON → Bistro dim=32³ resident=496 entries=60808 **avgPerCell=1.86** (vs O(CardCount) linear scan →
+  ~100×+ fewer card tests per world-pos sample). No consumer yet → nothing observable changes.
+- **STAGE 2 (consume in LumenTrace.hlsl) — CAVEAT:** `SampleSurfaceCache_WorldPos` is in the SHARED LumenTrace.hlsl
+  include (screen-probe + reflections + radiance-cache + trace-debug all #include it). Binding the grid cell/index
+  SRVs + adding grid CB params means touching EVERY consumer's root sig + CB, even though only the SW path
+  (`LumenTraceSW`) calls the world-pos sampler. Wider blast radius than Stage 1 → do with user attention. Option to
+  narrow: bind the grid only in the SW-using consumers (screen-probe SW mode), or via bindless ResourceDescriptorHeap[]
+  (the consumers are already HeapDirectlyIndexed) to avoid root-sig changes — RECOMMENDED (grid SRVs as 2 reserved-tail
+  bindless slots, like the clipmap/FinalLighting; then LUMEN_TRACE_PARAMS just gains gridIdx + grid placement floats,
+  no per-consumer root-sig edits). That keeps Stage 2 as contained as Stage 1.
+
 ## RISK / SIZE
 Medium. Isolated to Dx12LumenCardScene (build) + LumenTrace.hlsl (consume) + TransparentForward (payoff).
 Froxel precedent de-risks the build. Door-gated → safe to land incrementally (grid build first, then SW-trace
