@@ -61,6 +61,12 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
         public float ShaftDensity, ShaftDecay, ShaftSharpness, ShaftPad;
         public Vector3 DustDrift; public float DustIntensity;
         public float DustSize, DustSparkle, Time, DustPad;
+        // FAZ 10 — RC_PARAMS (must mirror the macro in LumenRadianceCacheSample.hlsl, field-for-field) + GI intensity.
+        public Vector3 RcOrigin; public float RcProbeSpacing;
+        public uint RcGridRes, RcAtlasInProbes, RcProbeRes, RcFinalProbeRes;
+        public float RcTraceStop, RcEnabled; public uint RcIndirIdx, RcRadIdx;
+        public uint RcHitIdx, RcMarkIdx; public float RcSampleBias, RcPad0;
+        public float RcGiIntensity, RcPad1, RcPad2, RcPad3;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -98,11 +104,20 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
             AddressV = TextureAddressMode.Clamp, AddressW = TextureAddressMode.Clamp, MaxAnisotropy = 1,
             ComparisonFunction = ComparisonFunction.Never, MinLOD = 0, MaxLOD = float.MaxValue,
         };
+        // FAZ 10 — HeapDirectlyIndexed so the volumetric-GI radiance-cache sampler can read ResourceDescriptorHeap[]
+        // (the same bindless pattern GlobalSdf/LumenTrace use). The t0-t3 fog SRVs ride a dynamic bindless range (copied
+        // in per-frame) since only ONE CBV/SRV/UAV heap can be bound — the bindless heap, which also holds the cache.
         fogRootSig = dev.Device.CreateRootSignature(new VersionedRootSignatureDescription(
-            new RootSignatureDescription1(RootSignatureFlags.None, new[] { cbv0, cbv1, srvTable },
-                new[] { sampLinear, sampPoint })));
+            new RootSignatureDescription1(RootSignatureFlags.ConstantBufferViewShaderResourceViewUnorderedAccessViewHeapDirectlyIndexed,
+                new[] { cbv0, cbv1, srvTable }, new[] { sampLinear, sampPoint })));
 
         string hlsl = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("VolumetricFog.hlsl");
+        // FAZ 10 — no DXC include handler (shaders are embedded strings) → inline the radiance-cache sampler in place of
+        // its #include line (the established trace-debug/screen-probe pattern). The sampler lands AFTER the FogConstants
+        // cbuffer, so it sees the Rc* fields the cbuffer declares.
+        string rcInc = BallisticEngine.DX12.EmbeddedShaderSource.ReadHlsl("Lumen/LumenRadianceCacheSample.hlsl");
+        hlsl = System.Text.RegularExpressions.Regex.Replace(
+            hlsl, "(?m)^\\s*#include\\s+\"Lumen/LumenRadianceCacheSample\\.hlsl\".*$", rcInc);
         byte[] vs = Dx12ShaderCompiler.Compile(DxcShaderStage.Vertex, hlsl, "VSMain", "VolumetricFog.hlsl");
         byte[] psMarch = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSMarch", "VolumetricFog.hlsl");
         byte[] psCombine = Dx12ShaderCompiler.Compile(DxcShaderStage.Pixel, hlsl, "PSCombine", "VolumetricFog.hlsl");
@@ -188,6 +203,26 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
             DustSize = pf.DustSize, DustSparkle = pf.DustSparkle,
             Time = ctx.FrameCounter * (1f / 60f), DustPad = 0f,
         };
+
+        // FAZ 10 — VOLUMETRIC GI: when the Lumen radiance cache is published this frame, fill RC_PARAMS so the march
+        // in-scatters real indirect radiance. Off (Valid=false / door) → RcEnabled=0 → the march keeps its constant
+        // SkyAmbient (byte-identical). The march's SRVs then ride a dynamic bindless range (see the march draw below).
+        bool fogGi = ctx.LumenRc.Valid
+                     && Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_VOLGI") != "0";
+        if (fogGi) {
+            var rc = ctx.LumenRc;
+            fc.RcOrigin = rc.Origin; fc.RcProbeSpacing = rc.ProbeSpacing;
+            fc.RcGridRes = rc.GridRes; fc.RcAtlasInProbes = rc.AtlasInProbes;
+            fc.RcProbeRes = rc.ProbeRes; fc.RcFinalProbeRes = rc.FinalProbeRes;
+            fc.RcTraceStop = rc.TraceStop; fc.RcEnabled = 1f;
+            fc.RcIndirIdx = (uint)Math.Max(rc.IndirBindless, 0);
+            fc.RcRadIdx = (uint)Math.Max(rc.RadBindless, 0);
+            fc.RcHitIdx = (uint)Math.Max(rc.HitBindless, 0);
+            fc.RcMarkIdx = 0u; fc.RcSampleBias = 0f;
+            float volGiIntensity = float.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_VOLGI_INTENSITY"),
+                System.Globalization.CultureInfo.InvariantCulture, out float gi) ? gi : 1f;
+            fc.RcGiIntensity = volGiIntensity;
+        }
         fogCb.Write(fc);
 
         if (!ctx.BarriersDerived) gbuffer.DepthToShaderResource();
@@ -208,19 +243,41 @@ public sealed class Dx12FogPass : IRenderPass, IDisposable {
             return;
         }
 
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(1), shadowMap.SrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(2), gbuffer.DepthSrvCpu, heapType);
-        dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(3), gbuffer.DepthSrvCpu, heapType);
-        fogHalf.RenderColorOnly(cl => {
-            cl.SetGraphicsRootSignature(fogRootSig);
-            cl.SetPipelineState(fogMarchPso);
-            cl.SetDescriptorHeaps(fogSrvVisible.Heap);
-            cl.SetGraphicsRootConstantBufferView(0, fogCb.Gpu);
-            cl.SetGraphicsRootDescriptorTable(2, fogSrvVisible.Gpu(0));
-            cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-            cl.DrawInstanced(3, 1, 0, 0);
-        });
+        // The march reads t0 depth / t1 shadow (t2/t3 unused by PSMarch). When volumetric GI is on, the march ALSO
+        // reads the radiance cache via ResourceDescriptorHeap[] → bind the BINDLESS heap, with t0-t3 copied into a
+        // dynamic bindless range (the trace-debug pattern); else keep the dedicated fog SRV heap (byte-identical path).
+        if (fogGi) {
+            Dx12DescriptorHeap bl = Dx12Backend.BindlessHeap;
+            int b = bl.AllocateRange(4);
+            dev.Device.CopyDescriptorsSimple(1, bl.Cpu(b + 0), gbuffer.DepthSrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, bl.Cpu(b + 1), shadowMap.SrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, bl.Cpu(b + 2), gbuffer.DepthSrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, bl.Cpu(b + 3), gbuffer.DepthSrvCpu, heapType);
+            var blGpu = bl.Gpu(b);
+            fogHalf.RenderColorOnly(cl => {
+                cl.SetGraphicsRootSignature(fogRootSig);
+                cl.SetPipelineState(fogMarchPso);
+                cl.SetDescriptorHeaps(bl.Heap);
+                cl.SetGraphicsRootConstantBufferView(0, fogCb.Gpu);
+                cl.SetGraphicsRootDescriptorTable(2, blGpu);
+                cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+                cl.DrawInstanced(3, 1, 0, 0);
+            });
+        } else {
+            dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(0), gbuffer.DepthSrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(1), shadowMap.SrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(2), gbuffer.DepthSrvCpu, heapType);
+            dev.Device.CopyDescriptorsSimple(1, fogSrvVisible.Cpu(3), gbuffer.DepthSrvCpu, heapType);
+            fogHalf.RenderColorOnly(cl => {
+                cl.SetGraphicsRootSignature(fogRootSig);
+                cl.SetPipelineState(fogMarchPso);
+                cl.SetDescriptorHeaps(fogSrvVisible.Heap);
+                cl.SetGraphicsRootConstantBufferView(0, fogCb.Gpu);
+                cl.SetGraphicsRootDescriptorTable(2, fogSrvVisible.Gpu(0));
+                cl.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+                cl.DrawInstanced(3, 1, 0, 0);
+            });
+        }
 
         Matrix4x4.Invert(ctx.Proj, out Matrix4x4 invProj);
         fogCombineCb.Write(new FogCombineConstants {

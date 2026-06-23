@@ -169,7 +169,26 @@ public sealed class Dx12FrameContext {
     // // FAZ 6 marker in Dx12DeferredLightingPass.Record). Set now so later phases need no extra wiring.
     public bool   LumenActiveThisFrame { get; set; }
 
+    // FAZ 10 — VOLUMETRIC GI. When Lumen GI runs with the world-space radiance cache armed, the Lumen pass publishes
+    // the cache's sampling params here (event 500), so the LATER fog pass (event ~700) can in-scatter the actual
+    // indirect radiance at each march sample instead of a flat constant SkyAmbient. Valid==false → fog uses its old
+    // constant ambient (byte-identical). This is the same RC_PARAMS the screen-probe gather samples (world-space,
+    // view-independent), so the fog GI is consistent with the surface GI. Set by Dx12LumenGiPass.Record.
+    public LumenRcParamsForVolumetrics LumenRc { get; set; }
+
     public int GrainFrame { get; set; }
 
     public int FrameCounter { get; set; }
+}
+
+// FAZ 10 — the Lumen world-space radiance cache's sampling parameters, published by the Lumen GI pass for the fog pass
+// to in-scatter indirect light (volumetric GI). Mirrors the RC_PARAMS block in LumenRadianceCacheSample.hlsl. Valid=false
+// (default) → the consumer falls back to its constant ambient (no behaviour change). A plain struct (default = all-zero,
+// Valid=false) so a frame with no Lumen / no radiance cache leaves it inert.
+public struct LumenRcParamsForVolumetrics {
+    public bool Valid;
+    public System.Numerics.Vector3 Origin; public float ProbeSpacing;
+    public uint GridRes, AtlasInProbes, ProbeRes, FinalProbeRes;
+    public float TraceStop;
+    public int IndirBindless, RadBindless, HitBindless;
 }

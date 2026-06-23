@@ -7,6 +7,23 @@
 // Single full-screen pass (no half-res / temporal yet — a quality follow-up). Reads scene depth + the
 // shadow cascade array as SRVs; constants in a dedicated CBV.
 
+// FAZ 10 — octahedral map (the radiance-cache sampler needs OctEncode; declare before the include) + the RC sampler.
+// The cache sampler reads ResourceDescriptorHeap[] (bindless) — the fog root sig is HeapDirectlyIndexed and binds the
+// bindless heap; the t0-t3 fog SRVs ride a dynamic bindless range copied in by the CPU (the trace-debug pattern).
+float2 OctEncode(float3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    float2 e = n.xy;
+    if (n.z < 0.0) e = (1.0 - abs(e.yx)) * float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return e * 0.5 + 0.5;
+}
+float3 OctDecode(float2 f) {
+    f = f * 2.0 - 1.0;
+    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = saturate(-n.z);
+    n.xy += float2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+    return normalize(n);
+}
+
 cbuffer FogConstants : register(b0) {
     float4x4 InvViewProj;        // unjittered camera (view*proj)^-1, transposed on upload
     float4x4 Cascade0, Cascade1, Cascade2, Cascade3;
@@ -26,6 +43,17 @@ cbuffer FogConstants : register(b0) {
     // --- Volumetric dust (procedural sun-lit motes) ---
     float3   DustDrift;          float DustIntensity;   // DustIntensity==0 ⇒ dust layer off (CPU gate)
     float    DustSize; float DustSparkle; float Time; float DustPad;
+
+    // --- FAZ 10: Lumen world-space radiance cache (volumetric GI). When RcEnabled, the march in-scatters the actual
+    // indirect radiance at each sample (SampleRadianceCacheInterpolated) instead of the flat constant SkyAmbient, so fog
+    // in a coloured/shadowed/indoor region picks up the real GI bounce. RcEnabled==0 ⇒ old constant-ambient (byte-id).
+    // Fields written explicitly (NOT the RC_PARAMS macro) so the cbuffer needs no macro before it — they MUST match the
+    // RC_PARAMS layout in LumenRadianceCacheSample.hlsl field-for-field (the inlined sampler reads them by name). ---
+    float3 RcOrigin;        float RcProbeSpacing;
+    uint   RcGridRes;       uint  RcAtlasInProbes; uint RcProbeRes; uint RcFinalProbeRes;
+    float  RcTraceStop;     float RcEnabled;       uint RcIndirIdx; uint RcRadIdx;
+    uint   RcHitIdx;        uint  RcMarkIdx;       float RcSampleBias;  float RcPad0;
+    float    RcGiIntensity; float RcPad1; float RcPad2; float RcPad3;
 };
 
 Texture2D      DepthTex      : register(t0);
@@ -40,6 +68,10 @@ cbuffer FogCombineConstants : register(b1) {
     float4x4 InvProjection;   // transposed on upload
     float2   HalfTexel;       float2 CombinePad;
 };
+
+// FAZ 10 — the radiance-cache sampling helper (RC_PARAMS pasted in FogConstants above; OctEncode declared above;
+// LinearClamp at s0). Provides SampleRadianceCacheInterpolated(worldPos, dir) for the volumetric GI in-scatter.
+#include "Lumen/LumenRadianceCacheSample.hlsl"
 
 static const float PI = 3.14159265359;
 static const float ALBEDO = 0.92;
@@ -191,7 +223,21 @@ float4 PSMarch(VSOut i) : SV_Target {
         if (sigma > 1e-6) {
             float stepT = exp(-sigma * stepLen);
             vis = SunVisibility(p);
-            float3 src = ALBEDO * (sunSource * vis + ambSource);
+            // FAZ 10 — VOLUMETRIC GI ambient. When the Lumen radiance cache is bound, the in-scatter ambient at THIS
+            // sample is the real indirect radiance (the cache's omnidirectional estimate ≈ average of the 6 axis
+            // directions — fog scattering is near-isotropic, so a 6-tap mean is a good irradiance proxy), so fog under
+            // an arch goes dark, fog by a red wall reddens, etc. Falls back to the flat SkyAmbient when RcEnabled==0.
+            float3 amb = ambSource;
+            if (RcEnabled > 0.5) {
+                float3 gi = SampleRadianceCacheInterpolated(p, float3( 1, 0, 0))
+                          + SampleRadianceCacheInterpolated(p, float3(-1, 0, 0))
+                          + SampleRadianceCacheInterpolated(p, float3( 0, 1, 0))
+                          + SampleRadianceCacheInterpolated(p, float3( 0,-1, 0))
+                          + SampleRadianceCacheInterpolated(p, float3( 0, 0, 1))
+                          + SampleRadianceCacheInterpolated(p, float3( 0, 0,-1));
+                amb = gi * (RcGiIntensity / 6.0) * AmbientScatter;
+            }
+            float3 src = ALBEDO * (sunSource * vis + amb);
             scatter += src * (transmittance * (1.0 - stepT));
             transmittance *= stepT;
         }

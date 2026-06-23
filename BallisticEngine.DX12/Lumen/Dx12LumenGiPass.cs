@@ -817,6 +817,20 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
                 GpuMarkEnd();
                 if (Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_RC_STATS") == "1")
                     radianceCache.DumpStats();
+
+                // FAZ 10 — publish the radiance cache's sampling params for the LATER fog pass (volumetric GI). The fog
+                // march in-scatters SampleRadianceCacheInterpolated(p, dir) instead of a flat constant ambient. Only when
+                // the cache is valid (built) — else LumenRc stays Valid=false and fog keeps its old constant ambient.
+                if (radianceCache.Valid)
+                    ctx.LumenRc = new LumenRcParamsForVolumetrics {
+                        Valid = true,
+                        Origin = radianceCache.Origin, ProbeSpacing = radianceCache.ProbeSpacingPub,
+                        GridRes = (uint)radianceCache.GridRes, AtlasInProbes = (uint)radianceCache.AtlasInProbesPub,
+                        ProbeRes = (uint)radianceCache.ProbeResPub, FinalProbeRes = (uint)radianceCache.FinalProbeResPub,
+                        TraceStop = radianceCache.TraceStop,
+                        IndirBindless = radianceCache.IndirBindless, RadBindless = radianceCache.RadBindless,
+                        HitBindless = radianceCache.HitBindless,
+                    };
             }
 
             screenProbe ??= new Dx12LumenScreenProbe(dev);
