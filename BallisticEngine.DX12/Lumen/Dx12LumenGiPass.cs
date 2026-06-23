@@ -645,10 +645,17 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         float.TryParse(Environment.GetEnvironmentVariable(name), System.Globalization.CultureInfo.InvariantCulture,
             out float v) ? v : fallback;
 
-    // The product door. FAZ 0 is ENV-ONLY (BALLISTIC_DX12_LUMEN=1) — there is no LumenVolume yet.
-    // TODO (later phase): add a LumenVolume (mirroring AuroraVolume) and follow it when the env is unset, just like
-    // Aurora's Armed() folds in ctx.PostFX.AuroraEnabled. For now: armed iff the env door is "1".
-    static int envDoor = -2;   // -2 unread, -1 unset (off), 0 force-off, 1 force-on
+    // The product door. FAZ 9 — Lumen is now the DEFAULT GI (the full pipeline — surface cache, trace, screen-probe
+    // GI, radiance cache, reflections — is verified on CornellBox AND Bistro-scale). The selection chain:
+    //   1. BALLISTIC_DX12_LUMEN=1/0 — explicit per-system override (force Lumen on/off), highest priority.
+    //   2. else the master GI selector BALLISTIC_DX12_GI = lumen | aurora | off (DEFAULT lumen when unset).
+    // So with NO env set, Lumen runs. BALLISTIC_DX12_GI=aurora picks Aurora (Lumen yields — Aurora is KEPT behind the
+    // door, NOT deleted, until Lumen is long-proven at production scale incl. async/perf). When Lumen is armed, its
+    // card scene + SDF + screen-probe + reflections all cascade from this (CardsArmed()/SdfArmed() fold in Armed()).
+    // A LumenVolume mirroring AuroraVolume (artist-facing, scene-driven) is a FAZ 10 follow-up; the master env selector
+    // is the engine-wide default switch.
+    static int envDoor = -2;   // -2 unread, -1 unset (follow master), 0 force-off, 1 force-on
+    static int masterGi = -2;  // -2 unread, 0 aurora, 1 lumen (DEFAULT), 2 off
     public static bool Armed(Dx12FrameContext ctx)
     {
         if (envDoor == -2)
@@ -656,8 +663,23 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
             string v = Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN");
             envDoor = v == "1" ? 1 : v == "0" ? 0 : -1;
         }
-        // FAZ 0: env-only. No volume fallback yet → unset (-1) and force-off (0) both mean OFF.
-        return envDoor == 1;
+        if (envDoor == 1) return true;
+        if (envDoor == 0) return false;
+        // Unset → follow the master GI selector (DEFAULT = lumen).
+        return MasterGi() == 1;
+    }
+
+    // The engine-wide GI selector BALLISTIC_DX12_GI = lumen (DEFAULT) | aurora | off. Read once; shared so Aurora can
+    // also honour it (BALLISTIC_DX12_GI=off must disable BOTH GI systems, not just hand the frame to Aurora). Returns
+    // 1 lumen, 0 aurora, 2 off.
+    public static int MasterGi()
+    {
+        if (masterGi == -2)
+        {
+            string g = (Environment.GetEnvironmentVariable("BALLISTIC_DX12_GI") ?? "lumen").Trim().ToLowerInvariant();
+            masterGi = g == "aurora" ? 0 : g == "off" || g == "none" ? 2 : 1;   // default + any other value → lumen
+        }
+        return masterGi;
     }
 
     // FAZ 2: "the Lumen PASS should run this frame" — Lumen GI armed OR the global-SDF door is set on its own (so

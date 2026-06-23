@@ -81,13 +81,18 @@ public sealed class Dx12AuroraGiPass : IRenderPass, IDisposable
     // plan §Target Shape: one product-facing mode). The BALLISTIC_DX12_AURORA env door overrides for A/B:
     // "1" forces on, "0" forces off, unset → follow the volume. Always hard-gated by hardware ray tracing in
     // WouldRun (no HW RT → Aurora unavailable, plan gate #6: NO hidden screen-space fallback).
-    static int envDoor = -2;   // -2 unread, -1 unset(follow volume), 0 force-off, 1 force-on
+    static int envDoor = -2;   // -2 unread, -1 unset(follow master+volume), 0 force-off, 1 force-on
     static bool Armed(Dx12FrameContext ctx) {
         if (envDoor == -2) {
             string v = Environment.GetEnvironmentVariable("BALLISTIC_DX12_AURORA");
             envDoor = v == "1" ? 1 : v == "0" ? 0 : -1;
         }
-        return envDoor == 1 || (envDoor == -1 && ctx.PostFX.AuroraEnabled);
+        if (envDoor == 1) return true;    // explicit BALLISTIC_DX12_AURORA=1 forces Aurora on (A/B), overrides master.
+        if (envDoor == 0) return false;
+        // FAZ 9 — Lumen is the DEFAULT GI. Aurora (env unset) only arms when the master selector explicitly picks it
+        // (BALLISTIC_DX12_GI=aurora). master=lumen → Lumen runs + Aurora yields via WouldRun's !ScenePathArmed (this
+        // also returns false, belt-and-suspenders); master=off → BOTH off. Then still gated on its volume.
+        return Dx12LumenGiPass.MasterGi() == 0 && ctx.PostFX.AuroraEnabled;
     }
 
     // ---- ASYNC (1-frame-delayed) GI door ----
