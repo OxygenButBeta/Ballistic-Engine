@@ -636,9 +636,9 @@ float4 PSMain(VSOut i) : SV_Target {
             kD = (1.0 - Famb) * (1.0 - metallic);
         }
         float3 irradiance = IrradianceMap.SampleLevel(LinearClamp, N, 0).rgb;
-        // When Lumen V2 owns diffuse GI (UseIBLDiffuse=0), suppress the IBL diffuse-irradiance ambient here so
-        // the Lumen GI combine (which ADDS its own sky-visibility-aware diffuse indirect) does not double-count.
-        // Specular IBL below is untouched — Lumen P2 is diffuse-only; reflections stay on the IBL/RT path.
+        // When a GI pass owns diffuse GI (UseIBLDiffuse=0 — Aurora OR Lumen's FAZ 6 screen-probe gather), suppress
+        // the IBL diffuse-irradiance ambient here so the GI combine (which ADDS its own diffuse indirect) does not
+        // double-count. Specular IBL below is untouched — the GI here is diffuse-only; reflections stay IBL/RT.
         float3 ambDiffAlbedo = (MsBrdfEnabled > 0.5) ? ambDiffBoost : albedo;
         float3 ambientDiffuse = (UseIBLDiffuse > 0.5) ? kD * irradiance * ambDiffAlbedo * ao : 0.0.xxx;
         float3 R = reflect(-V, N);

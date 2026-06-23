@@ -38,6 +38,12 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
     // in FAZ 5; FAZ 2 only builds + (optionally) sphere-trace-visualizes it. Lazily constructed on first armed frame.
     Dx12GlobalSdf globalSdf;
 
+    // FAZ 6: the SCREEN-PROBE GATHER — the first VISIBLE integrated Lumen GI. Places sparse screen probes, traces
+    // them via LumenTrace (sampling the LIT surface cache), integrates per-pixel diffuse irradiance E, and ADDS it
+    // to the scene color. Lazily constructed; runs only when Lumen GI is armed (BALLISTIC_DX12_LUMEN=1). The
+    // deferred pass suppresses its IBL diffuse ambient when ctx.LumenActiveThisFrame so this doesn't double-count.
+    Dx12LumenScreenProbe screenProbe;
+
     // FAZ 2 debug view (BALLISTIC_DX12_GLOBALSDF_DEBUG=1): a fullscreen sphere-trace of the clipmap, opaque-replace
     // into the HDR scene color, so the field's correctness is VISIBLE. Lazily built with the SDF.
     ID3D12RootSignature dbgRootSig;
@@ -711,14 +717,24 @@ public sealed class Dx12LumenGiPass : IRenderPass, IDisposable
         if (TraceDebug() && ctx.SceneColor != null)
             RecordTraceDebug(ctx);
 
-        // TODO FAZ 5+: SDF software ray trace (sphere-march this clipmap) → FAZ 3: surface-cache gather → FAZ 6:
-        // screen-probe diffuse + additive combine.
+        // FAZ 6 — THE VISIBLE GI OUTPUT. When Lumen GI is armed (not a cards-only/SDF-only test), place sparse screen
+        // probes, trace them via LumenTrace (sampling the LIT surface cache filled by LightCards above), integrate
+        // per-pixel diffuse irradiance E, and ADD it to the scene color. This runs AFTER LightCards (so the probe
+        // trace reads this frame's lit FinalLighting) and AFTER the SDF build (so the SW backend has a clipmap). The
+        // deferred pass suppressed its IBL diffuse ambient (ctx.LumenActiveThisFrame), so this is the diffuse GI — no
+        // double-count. Default off (BALLISTIC_DX12_LUMEN unset) → never reached → byte-identical render path.
+        if (Armed(ctx) && ctx.SceneColor != null)
+        {
+            screenProbe ??= new Dx12LumenScreenProbe(dev);
+            screenProbe.Run(ctx, scene.CardScene, globalSdf);
+        }
     }
 
     public void Dispose()
     {
         scene?.Dispose();
         globalSdf?.Dispose();
+        screenProbe?.Dispose();
         dbgPso?.Dispose(); dbgRootSig?.Dispose(); dbgCb?.Dispose(); dbgSrv?.Dispose();
         cardDbgPso?.Dispose(); cardDbgRootSig?.Dispose(); cardDbgCb?.Dispose();
         capDbgPso?.Dispose(); capDbgRootSig?.Dispose(); capDbgCb?.Dispose(); capDbgSrv?.Dispose();
