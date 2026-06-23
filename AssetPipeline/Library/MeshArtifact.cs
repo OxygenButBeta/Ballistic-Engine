@@ -4,7 +4,7 @@ namespace BallisticEngine.AssetPipeline;
 
 public static class MeshArtifact {
     const uint Magic = 0x48534D42;
-    const uint FormatVersion = 9;
+    const uint FormatVersion = 10;
 
     public static void Write(string path, in MeshData data) {
         using FileStream stream = File.Create(path);
@@ -14,10 +14,13 @@ public static class MeshArtifact {
         foreach (SubMeshData sm in data.SubMeshes) if (sm.Lods is { Length: > 1 }) { hasLods = true; break; }
         bool hasSdf = data.Sdf is { IsValid: true };
         bool hasCards = data.Cards is { IsValid: true };
-        // v8 = v7 payload + trailing SDF block; v9 = v8 + trailing CARD block. We only stamp the higher
-        // version when that block is actually present, so SDF/card-less meshes keep the v6/v7/v8 byte
-        // layout (existing readers + diffs unchanged). Cards imply an SDF, so v9 always writes the v8 block.
-        uint writeVersion = hasCards ? 9u : hasSdf ? 8u : hasLods ? 7u : 6u;
+        bool hasSubCards = HasAnySubMeshCards(data);
+        // v8 = v7 payload + trailing SDF block; v9 = v8 + trailing CARD block; v10 = v9 + trailing PER-SUBMESH
+        // card block. We only stamp the higher version when that block is actually present, so older meshes keep
+        // the v6/v7/v8/v9 byte layout (existing readers + diffs unchanged). Per-submesh cards are INDEPENDENT of
+        // the whole-mesh card/SDF blocks (a split mesh stores per-submesh cards but no whole-mesh SDF), so v10
+        // does NOT require v8/v9 content — the v10 reader still emits the v8/v9 absence flags before it.
+        uint writeVersion = hasSubCards ? 10u : hasCards ? 9u : hasSdf ? 8u : hasLods ? 7u : 6u;
 
         writer.Write(Magic);
         writer.Write(writeVersion);
@@ -109,6 +112,54 @@ public static class MeshArtifact {
                 writer.Write((byte)0);
             }
         }
+
+        if (writeVersion >= 10) {
+            // PER-SUBMESH card block (Lumen FAZ 8.6). One byte: 1 = present. When present, write a count per
+            // submesh (parallel to data.SubMeshes) followed by that submesh's cards (0 = none for that submesh).
+            if (hasSubCards) {
+                writer.Write((byte)1);
+                MeshCards[] sub = data.SubMeshCards;
+                int subCount = data.SubMeshes.Length;
+                writer.Write(subCount);
+                for (int i = 0; i < subCount; i++) {
+                    MeshCards mc = (sub is not null && i < sub.Length) ? sub[i] : null;
+                    int n = mc is { IsValid: true } ? mc.Count : 0;
+                    writer.Write(n);
+                    if (n > 0)
+                        foreach (MeshCard card in mc.Cards)
+                            WriteCard(writer, card);
+                }
+            }
+            else {
+                writer.Write((byte)0);
+            }
+        }
+    }
+
+    static bool HasAnySubMeshCards(in MeshData data) {
+        MeshCards[] sub = data.SubMeshCards;
+        if (sub is null) return false;
+        foreach (MeshCards mc in sub) if (mc is { IsValid: true }) return true;
+        return false;
+    }
+
+    static void WriteCard(BinaryWriter writer, in MeshCard card) {
+        WriteVector3(writer, card.Origin);
+        WriteVector3(writer, card.AxisX);
+        WriteVector3(writer, card.AxisY);
+        WriteVector3(writer, card.AxisZ);
+        WriteVector3(writer, card.Extent);
+        writer.Write(card.DirectionIndex);
+    }
+
+    static MeshCard ReadCard(BinaryReader reader) {
+        Vector3 origin = ReadVector3(reader);
+        Vector3 axisX = ReadVector3(reader);
+        Vector3 axisY = ReadVector3(reader);
+        Vector3 axisZ = ReadVector3(reader);
+        Vector3 extent = ReadVector3(reader);
+        int directionIndex = reader.ReadInt32();
+        return new MeshCard(origin, axisX, axisY, axisZ, extent, directionIndex);
     }
 
     static void WriteVector3(BinaryWriter writer, Vector3 v) {
@@ -237,25 +288,34 @@ public static class MeshArtifact {
         if (version >= 9 && reader.ReadByte() == 1) {
             int cardCount = reader.ReadInt32();
             var arr = new MeshCard[cardCount];
-            for (var i = 0; i < cardCount; i++) {
-                Vector3 origin = ReadVector3(reader);
-                Vector3 axisX = ReadVector3(reader);
-                Vector3 axisY = ReadVector3(reader);
-                Vector3 axisZ = ReadVector3(reader);
-                Vector3 extent = ReadVector3(reader);
-                int directionIndex = reader.ReadInt32();
-                arr[i] = new MeshCard(origin, axisX, axisY, axisZ, extent, directionIndex);
-            }
+            for (var i = 0; i < cardCount; i++)
+                arr[i] = ReadCard(reader);
             cards = new MeshCards(arr);
+        }
+
+        // v10 — PER-SUBMESH cards (Lumen FAZ 8.6). Parallel to subMeshes; absent entries (count 0) stay null.
+        MeshCards[] subMeshCards = null;
+        if (version >= 10 && reader.ReadByte() == 1) {
+            int subCount = reader.ReadInt32();
+            subMeshCards = new MeshCards[subCount];
+            for (var i = 0; i < subCount; i++) {
+                int n = reader.ReadInt32();
+                if (n <= 0) continue;
+                var arr = new MeshCard[n];
+                for (var k = 0; k < n; k++)
+                    arr[k] = ReadCard(reader);
+                subMeshCards[i] = new MeshCards(arr);
+            }
         }
 
         if (skinned)
             return new MeshData(vertices, indices, uvs, normals, tangents, subMeshes, nodes,
-                boneIndices, boneWeights, skeleton, sdf, cards);
+                boneIndices, boneWeights, skeleton, sdf, cards, subMeshCards);
 
         MeshData result = new(vertices, indices, uvs, normals, tangents, subMeshes, nodes);
         if (sdf is not null) result = result.WithSdf(sdf);
         if (cards is not null) result = result.WithCards(cards);
+        if (subMeshCards is not null) result = result.WithSubMeshCards(subMeshCards);
         return result;
     }
 

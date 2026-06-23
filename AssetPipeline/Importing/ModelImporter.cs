@@ -11,7 +11,7 @@ public sealed class ModelImporter : IAssetImporter {
 
     public string Name => "ModelImporter";
 
-    public int Version => 11;
+    public int Version => 13;
     public string ArtifactExtension => ".bmesh";
 
     public bool GeneratesSourceAssets => true;
@@ -33,6 +33,11 @@ public sealed class ModelImporter : IAssetImporter {
         ["sdfResolution"] = 64,
         ["generateCards"] = true,
         ["maxCards"] = 12,
+        // Lumen FAZ 8.6 — per-submesh cards for whole-mesh-merge / split-by-nodes meshes (Bistro). Each
+        // submesh gets its own tight submesh-local SDF (low res) + cards; tiny submeshes are skipped.
+        ["subMeshCardSdfResolution"] = 32,
+        ["subMeshMaxCards"] = 8,
+        ["subMeshMinTris"] = 32,
     };
 
     public void Import(AssetImportContext context) {
@@ -72,6 +77,7 @@ public sealed class ModelImporter : IAssetImporter {
         data = BuildLods(context, data);
         data = GenerateSdf(context, data);
         data = GenerateCards(context, data);
+        data = GenerateSubMeshCards(context, data);
         MeshArtifact.Write(context.ArtifactAbsolutePath, in data);
     }
 
@@ -153,6 +159,97 @@ public sealed class ModelImporter : IAssetImporter {
             Debugging.LogWarning($"[Cards] '{context.AssetPath}': generation failed: {exception.Message}");
             return data;
         }
+    }
+
+    /// <summary>
+    /// Generates PER-SUBMESH cards (Lumen FAZ 8.6) for whole-mesh-merge / split-by-nodes meshes. DECISION
+    /// RULE: only meshes with &gt;1 submesh trigger this — a single-submesh mesh (e.g. CornellBox) keeps the
+    /// whole-mesh <see cref="MeshData.Cards"/> path and is byte-identical. For each submesh we build a tight
+    /// SDF in that submesh's LOCAL space (a SMALL grid per component — no 512k-cap blowout) and cards from it;
+    /// the SDF is discarded (only the cards are stored). Tiny submeshes (&lt; subMeshMinTris) are skipped. Same
+    /// env gate (BALLISTIC_CARDS=0) and importer "generateCards" flag as the whole-mesh path. Skinned skipped.
+    /// </summary>
+    static MeshData GenerateSubMeshCards(AssetImportContext context, in MeshData data) {
+        if (Environment.GetEnvironmentVariable("BALLISTIC_CARDS") == "0")
+            return data;
+        bool enabled = context.Settings?["generateCards"]?.GetValue<bool>() ?? true;
+        if (!enabled || data.IsSkinned || !data.IsValid)
+            return data;
+
+        SubMeshData[] subs = data.SubMeshes;
+        if (subs is not { Length: > 1 })   // single submesh keeps the whole-mesh card path (no regression)
+            return data;
+
+        // DECISION RULE (FAZ 8.6): per-submesh cards are ONLY for genuine split-by-nodes meshes — components
+        // placed in their own LOCAL spaces via distinct NodeTransforms (Bistro, SunTemple). A mesh whose
+        // submeshes are merely MATERIAL splits of one node (e.g. CornellBox: 5 material groups, all identity /
+        // shared NodeTransform) is NOT split-by-nodes: its submeshes share mesh-local space, so a per-submesh SDF
+        // adds nothing over the whole-mesh SDF — keep the whole-mesh Cards path (no regression, cards unchanged).
+        if (!HasDistinctNodeTransforms(subs))
+            return data;
+
+        int sdfRes = context.Settings?["subMeshCardSdfResolution"]?.GetValue<int>() ?? 32;
+        sdfRes = Math.Clamp(sdfRes, 8, 128);
+        int maxCards = context.Settings?["subMeshMaxCards"]?.GetValue<int>() ?? 8;
+        maxCards = Math.Clamp(maxCards, 1, Sdf.MeshCardBuilder.MaxCardsPerMesh);
+        int minTris = Math.Max(1, context.Settings?["subMeshMinTris"]?.GetValue<int>() ?? 32);
+
+        var perSub = new MeshCards[subs.Length];
+        int generated = 0, skippedTiny = 0, skippedEmpty = 0, totalCards = 0;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        try {
+            for (int i = 0; i < subs.Length; i++) {
+                LodRange lod0Range = subs[i].LodAt(0);
+                int tris = Math.Max(0, lod0Range.IndexCount) / 3;
+                if (tris < minTris) { skippedTiny++; continue; }
+                MeshSdf sdf = Sdf.MeshSdfBuilder.GenerateForSubMesh(in data, in subs[i], sdfRes);
+                if (sdf is null || !sdf.IsValid) { skippedEmpty++; continue; }
+                MeshCards cards = Sdf.MeshCardBuilder.Generate(sdf, maxCards, quiet: true);
+                if (cards is { IsValid: true }) { perSub[i] = cards; generated++; totalCards += cards.Count; }
+                else skippedEmpty++;
+            }
+        }
+        catch (Exception exception) {
+            Debugging.LogWarning($"[SubCards] '{context.AssetPath}': generation failed: {exception.Message}");
+            return data;
+        }
+        sw.Stop();
+
+        if (generated == 0) {
+            Debugging.Log($"[SubCards] '{context.AssetPath}': {subs.Length} submeshes — no per-submesh cards " +
+                          $"(skippedTiny={skippedTiny} skippedEmpty={skippedEmpty}), {sw.ElapsedMilliseconds} ms.");
+            return data;
+        }
+        Debugging.Log($"[SubCards] '{context.AssetPath}': {totalCards} cards across {generated}/{subs.Length} submeshes " +
+                      $"(skippedTiny={skippedTiny} skippedEmpty={skippedEmpty}), {sw.ElapsedMilliseconds} ms.");
+        return data.WithSubMeshCards(perSub);
+    }
+
+    /// <summary>
+    /// True when the submeshes are placed by GENUINE split-by-nodes transforms (Bistro/SunTemple) rather than
+    /// being material splits of a single node (CornellBox). Heuristic: at least one submesh has a non-identity
+    /// NodeTransform, OR two submeshes have differing NodeTransforms — either means components live in distinct
+    /// local spaces and benefit from a per-submesh SDF. All-identical (typically all-identity) → material splits.
+    /// </summary>
+    static bool HasDistinctNodeTransforms(SubMeshData[] subs) {
+        Matrix4 first = subs[0].NodeTransform;
+        bool anyNonIdentity = !NearlyIdentity(first);
+        for (int i = 1; i < subs.Length; i++) {
+            Matrix4 m = subs[i].NodeTransform;
+            if (!NearlyIdentity(m)) anyNonIdentity = true;
+            if (!NearlyEqual(m, first)) return true;   // distinct placements → split-by-nodes
+        }
+        return anyNonIdentity;
+    }
+
+    static bool NearlyIdentity(in Matrix4 m) => NearlyEqual(m, Matrix4.Identity);
+
+    static bool NearlyEqual(in Matrix4 a, in Matrix4 b) {
+        const float eps = 1e-5f;
+        return MathF.Abs(a.M11 - b.M11) < eps && MathF.Abs(a.M12 - b.M12) < eps && MathF.Abs(a.M13 - b.M13) < eps && MathF.Abs(a.M14 - b.M14) < eps
+            && MathF.Abs(a.M21 - b.M21) < eps && MathF.Abs(a.M22 - b.M22) < eps && MathF.Abs(a.M23 - b.M23) < eps && MathF.Abs(a.M24 - b.M24) < eps
+            && MathF.Abs(a.M31 - b.M31) < eps && MathF.Abs(a.M32 - b.M32) < eps && MathF.Abs(a.M33 - b.M33) < eps && MathF.Abs(a.M34 - b.M34) < eps
+            && MathF.Abs(a.M41 - b.M41) < eps && MathF.Abs(a.M42 - b.M42) < eps && MathF.Abs(a.M43 - b.M43) < eps && MathF.Abs(a.M44 - b.M44) < eps;
     }
 
     static MeshData BuildLods(AssetImportContext context, in MeshData data) {

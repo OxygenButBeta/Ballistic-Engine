@@ -29,6 +29,15 @@ public class Mesh : BObject
     // bounding-box cards a later surface cache will capture/light. MESH-LOCAL space. Built from Sdf, so
     // null whenever Sdf is null (skinned, disabled, or v8-and-earlier artifacts).
     public readonly MeshCards Cards;
+
+    // Per-SUBMESH card representation (offline, FAZ 8.6; persisted in artifact v10), parallel to SubMeshes.
+    // SubMeshCards[i] holds SubMeshes[i]'s cards in that submesh's LOCAL space (mesh-local transformed by
+    // InverseNodeTransforms[i]). Used for whole-mesh-merge / split-by-nodes meshes (Bistro) where one coarse
+    // whole-mesh SDF can't place cards: the runtime card scene places each submesh's cards via
+    // instanceWorld * NodeTransform. Null (and entries may be null) for single-submesh meshes (CornellBox uses
+    // the whole-mesh Cards path), skinned, disabled, or v9-and-earlier artifacts.
+    public readonly MeshCards[] SubMeshCards;
+
     public bool IsSkinned { get; }
     public int BoneCount => Skeleton.BoneCount;
 
@@ -87,6 +96,7 @@ public class Mesh : BObject
         BoneWeights = data.BoneWeights;
         Sdf = data.Sdf;
         Cards = data.Cards;
+        SubMeshCards = data.SubMeshCards;
         if (IsSkinned) {
             boneIndexBuffer = GraphicAPI.CreateBoneIndexBuffer(renderContext);
             boneWeightBuffer = GraphicAPI.CreateBoneWeightBuffer(renderContext);

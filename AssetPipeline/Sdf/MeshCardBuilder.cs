@@ -55,8 +55,15 @@ public static class MeshCardBuilder {
     /// when the mesh has no valid SDF or when no cluster survives the validity cuts.
     /// <paramref name="maxCards"/> is the per-mesh card budget (clamped to [1, <see cref="MaxCardsPerMesh"/>]).
     /// </summary>
-    public static MeshCards Generate(in MeshData mesh, int maxCards = 12) {
-        MeshSdf sdf = mesh.Sdf;
+    public static MeshCards Generate(in MeshData mesh, int maxCards = 12) =>
+        Generate(mesh.Sdf, maxCards);
+
+    /// <summary>
+    /// Generates the card representation directly from an explicit <paramref name="sdf"/> (Lumen FAZ 8.6:
+    /// the per-submesh path passes each component's own submesh-local SDF here). Cards come out in the
+    /// SAME space as the SDF grid. Returns null when the SDF is invalid or no cluster survives.
+    /// </summary>
+    public static MeshCards Generate(MeshSdf sdf, int maxCards = 12, bool quiet = false) {
         if (sdf is null || !sdf.IsValid)
             return null;
 
@@ -200,11 +207,13 @@ public static class MeshCardBuilder {
         for (int i = 0; i < kept; i++)
             cards[i] = EmitCard(sdf, clusters[i]);
 
-        var perDir = new int[6];
-        for (int i = 0; i < kept; i++) perDir[cards[i].DirectionIndex]++;
-        Debugging.Log(
-            $"[Cards] {kept} cards kept ({dropped} dropped of {clusters.Count} clusters) — " +
-            $"per-direction [-X {perDir[0]}, +X {perDir[1]}, -Y {perDir[2]}, +Y {perDir[3]}, -Z {perDir[4]}, +Z {perDir[5]}]");
+        if (!quiet) {
+            var perDir = new int[6];
+            for (int i = 0; i < kept; i++) perDir[cards[i].DirectionIndex]++;
+            Debugging.Log(
+                $"[Cards] {kept} cards kept ({dropped} dropped of {clusters.Count} clusters) — " +
+                $"per-direction [-X {perDir[0]}, +X {perDir[1]}, -Y {perDir[2]}, +Y {perDir[3]}, -Z {perDir[4]}, +Z {perDir[5]}]");
+        }
 
         return new MeshCards(cards);
     }

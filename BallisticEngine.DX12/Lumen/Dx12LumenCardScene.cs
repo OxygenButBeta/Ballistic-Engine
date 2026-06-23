@@ -215,6 +215,11 @@ public sealed class Dx12LumenCardScene : IDisposable {
     // page rect + its world ortho frame. (3b discarded them after upload; capture needs them on the CPU.)
     GpuLumenCard[] cardsCpu = Array.Empty<GpuLumenCard>();
     GpuLumenPage[] pagesCpu = Array.Empty<GpuLumenPage>();
+    // FAZ 8.6 — per-card OWNING submesh index (parallel to cardsCpu). >=0 for a per-submesh card (Capture draws
+    // ONLY that submesh — critical so Bistro doesn't redraw all ~1600 submeshes per card); -1 = whole-mesh card
+    // (Capture draws the renderer's submesh range, the original behaviour). Rebuilt with the card list.
+    int[] cardSubMesh = Array.Empty<int>();
+    List<int> cardSubMeshBuild = new();
     int captureStamp = -1;   // last (rebuild) build stamp the capture ran for; -1 = never captured
 
     public Dx12LumenCardScene(Dx12Device device) {
@@ -274,7 +279,8 @@ public sealed class Dx12LumenCardScene : IDisposable {
 
         var cardArr = cards.Count > 0 ? cards.ToArray() : new GpuLumenCard[1];
         var pageArr = pages.Count > 0 ? pages.ToArray() : new GpuLumenPage[1];
-        cardsCpu = cardArr; pagesCpu = pageArr;   // FAZ 3c: retained for the capture pass (page rects + ortho frames)
+        cardsCpu = cardArr; pagesCpu = pageArr;   // FAZ 3c
+        cardSubMesh = cardSubMeshBuild.ToArray(); // FAZ 8.6 — per-card owning submesh: retained for the capture pass (page rects + ortho frames)
 
         dev.DeferredRelease(cardBuf);
         dev.DeferredRelease(pageBuf);
@@ -311,6 +317,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
         var cardArr = cards.Count > 0 ? cards.ToArray() : new GpuLumenCard[1];
         var pageArr = pages.Count > 0 ? pages.ToArray() : new GpuLumenPage[1];
         cardsCpu = cardArr; pagesCpu = pageArr;   // FAZ 3c
+        cardSubMesh = cardSubMeshBuild.ToArray(); // FAZ 8.6 — per-card owning submesh
         dev.DeferredRelease(cardBuf);
         dev.DeferredRelease(pageBuf);
         cardBuf = dev.CreateUavBuffer<GpuLumenCard>(cardArr, ResourceStates.GenericRead);
@@ -323,24 +330,36 @@ public sealed class Dx12LumenCardScene : IDisposable {
     // world length so a scaled instance's card spans the right world size.
     void GatherWorldCards(Dx12SceneAS sceneAS, List<GpuLumenCard> cards, InstanceCardRange[] ranges) {
         int n = sceneAS.InstanceCount;
+        cardSubMeshBuild.Clear();   // FAZ 8.6 — per-card owning submesh, filled in lockstep with `cards`
         for (int i = 0; i < n; i++) {
             int start = cards.Count;
             Mesh mesh = sceneAS.InstanceMesh(i);
-            MeshCards mc = mesh?.Cards;
-            if (mc is { IsValid: true }) {
-                Matrix4x4 w = sceneAS.InstanceWorld(i);
-                foreach (MeshCard card in mc.Cards) {
-                    Vector3 wo = Vector3.Transform(card.Origin, w);
-                    Vector3 wx = Vector3.TransformNormal(card.AxisX, w);
-                    Vector3 wy = Vector3.TransformNormal(card.AxisY, w);
-                    Vector3 wz = Vector3.TransformNormal(card.AxisZ, w);
-                    float lx = wx.Length(), ly = wy.Length(), lz = wz.Length();
-                    cards.Add(new GpuLumenCard {
-                        Origin = wo, PageId = 0xFFFFFFFFu,   // set by AllocatePages
-                        AxisX = lx > 1e-6f ? wx / lx : Vector3.UnitX, ExtentX = card.Extent.X * lx,
-                        AxisY = ly > 1e-6f ? wy / ly : Vector3.UnitY, ExtentY = card.Extent.Y * ly,
-                        AxisZ = lz > 1e-6f ? wz / lz : Vector3.UnitZ, ExtentZ = card.Extent.Z * lz,
-                    });
+            Matrix4x4 w = sceneAS.InstanceWorld(i);
+
+            // FAZ 8.6 — PER-SUBMESH cards (Bistro: one whole-mesh-merge, no whole-mesh cards). Each submesh's
+            // cards live in SUBMESH-LOCAL space, so the world matrix is NodeTransform (submesh-local -> mesh-local)
+            // composed with instanceWorld (mesh-local -> world): combined = NodeTransform * instanceWorld (row-vector
+            // convention, v_world = v_local * NodeTransform * instanceWorld). Falls back to the whole-mesh Cards
+            // path (CornellBox) when there are no per-submesh cards.
+            MeshCards[] subCards = mesh?.SubMeshCards;
+            bool usedSubMesh = false;
+            if (subCards is { Length: > 0 } && mesh.SubMeshes is { Length: > 0 }) {
+                int subN = Math.Min(subCards.Length, mesh.SubMeshes.Length);
+                for (int s = 0; s < subN; s++) {
+                    MeshCards smc = subCards[s];
+                    if (smc is not { IsValid: true }) continue;
+                    usedSubMesh = true;
+                    Matrix4x4 combined = mesh.SubMeshes[s].NodeTransform * w;
+                    AddCards(cards, smc.Cards, combined);
+                    for (int k = 0; k < smc.Cards.Length; k++) cardSubMeshBuild.Add(s);
+                }
+            }
+
+            if (!usedSubMesh) {
+                MeshCards mc = mesh?.Cards;
+                if (mc is { IsValid: true }) {
+                    AddCards(cards, mc.Cards, w);
+                    for (int k = 0; k < mc.Cards.Length; k++) cardSubMeshBuild.Add(-1);
                 }
             }
             ranges[i] = new InstanceCardRange { Offset = (uint)start, Count = (uint)(cards.Count - start) };
@@ -355,6 +374,25 @@ public sealed class Dx12LumenCardScene : IDisposable {
         }
     }
     bool loggedCards;
+
+    // Transform a card set by a world matrix and append (Aurora's exact convention). Origin = point (w=1); axes =
+    // directions (w=0) renormalized; extents scaled by the transformed-axis world length. Shared by the whole-mesh
+    // and per-submesh paths — the whole-mesh path is byte-identical to the inline code it replaced.
+    static void AddCards(List<GpuLumenCard> cards, MeshCard[] src, Matrix4x4 w) {
+        foreach (MeshCard card in src) {
+            Vector3 wo = Vector3.Transform(card.Origin, w);
+            Vector3 wx = Vector3.TransformNormal(card.AxisX, w);
+            Vector3 wy = Vector3.TransformNormal(card.AxisY, w);
+            Vector3 wz = Vector3.TransformNormal(card.AxisZ, w);
+            float lx = wx.Length(), ly = wy.Length(), lz = wz.Length();
+            cards.Add(new GpuLumenCard {
+                Origin = wo, PageId = 0xFFFFFFFFu,   // set by AllocatePages
+                AxisX = lx > 1e-6f ? wx / lx : Vector3.UnitX, ExtentX = card.Extent.X * lx,
+                AxisY = ly > 1e-6f ? wy / ly : Vector3.UnitY, ExtentY = card.Extent.Y * ly,
+                AxisZ = lz > 1e-6f ? wz / lz : Vector3.UnitZ, ExtentZ = card.Extent.Z * lz,
+            });
+        }
+    }
 
     // Shelf/row allocator: pick a res-level per card from its world size, pack the footprint into the physical atlas,
     // set the card's PageId, and append a GpuLumenPage. Overflow cards are DROPPED (PageId stays 0xFFFFFFFF, counted).
@@ -514,7 +552,11 @@ public sealed class Dx12LumenCardScene : IDisposable {
                 cl.ClearDepthStencilView(captureDsvHandle, ClearFlags.Depth, 1.0f, 0, new[] { pageRect });
 
                 Material mat0 = renderer?.MaterialFor(0);
-                int only = renderer?.SubMeshIndex ?? -1;
+                // FAZ 8.6 — a per-submesh card (cardSubMesh[c] >= 0) captures ONLY its owning submesh (else Bistro's
+                // whole-mesh renderer would redraw all ~1600 submeshes per card). A whole-mesh card (-1) keeps the
+                // original range: the renderer's SubMeshIndex if set, else every submesh.
+                int owningSub = (c < cardSubMesh.Length) ? cardSubMesh[c] : -1;
+                int only = owningSub >= 0 ? owningSub : (renderer?.SubMeshIndex ?? -1);
                 int first = only >= 0 ? only : 0;
                 int last  = only >= 0 ? only : mesh.SubMeshes.Length - 1;
 

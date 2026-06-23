@@ -59,6 +59,57 @@ public static class MeshSdfBuilder {
         // We build from every submesh's base range so split-by-nodes parts all contribute.
         List<int> triA = new(), triB = new(), triC = new();
         CollectLod0Triangles(mesh, triA, triB, triC);
+        return GenerateFromTriangles(verts, triA, triB, triC, maxResolution);
+    }
+
+    /// <summary>
+    /// PER-SUBMESH SDF (Lumen FAZ 8.6): builds an SDF over ONLY <paramref name="sub"/>'s LOD0 triangle
+    /// range, in that submesh's LOCAL space (mesh-local vertices pre-transformed by inverse(NodeTransform)
+    /// — the same convention MeshCollider uses). Each Bistro component thus gets a small, tight grid, so
+    /// the global 512k voxel cap never engages and cards can actually be placed. Returns null for a
+    /// degenerate/empty range. The caller supplies <paramref name="maxResolution"/> (kept low per submesh).
+    /// </summary>
+    public static MeshSdf GenerateForSubMesh(in MeshData mesh, in SubMeshData sub, int maxResolution = 32) {
+        if (!mesh.IsValid) return null;
+        uint[] idx = mesh.Indices;
+        Vector3[] meshVerts = mesh.Vertices;
+
+        LodRange lod0 = sub.LodAt(0);
+        int start = lod0.FirstIndex, count = lod0.IndexCount;
+        int end = start + count;
+        if (start < 0 || end > idx.Length) { start = sub.IndexStart; end = Math.Min(idx.Length, start + sub.IndexCount); }
+        if (end - start < 3) return null;
+
+        // Transform this submesh's vertices into SUBMESH-LOCAL space (mesh-local -> submesh-local).
+        // We build a compact remapped vertex list so the BVH only covers this component's verts.
+        Matrix4 inverseNode = Matrix4.Identity;
+        if (MathF.Abs(sub.NodeTransform.GetDeterminant()) > 1e-12f &&
+            Matrix4.Invert(sub.NodeTransform, out Matrix4 inv))
+            inverseNode = inv;
+
+        var remap = new Dictionary<int, int>(capacity: (end - start) / 2);
+        var localVerts = new List<Vector3>(capacity: (end - start) / 2);
+        List<int> triA = new(), triB = new(), triC = new();
+        int Local(int meshVertIndex) {
+            if (!remap.TryGetValue(meshVertIndex, out int li)) {
+                li = localVerts.Count;
+                localVerts.Add(Vector3.Transform(meshVerts[meshVertIndex], inverseNode));
+                remap[meshVertIndex] = li;
+            }
+            return li;
+        }
+        for (int i = start; i + 2 < end; i += 3) {
+            triA.Add(Local((int)idx[i]));
+            triB.Add(Local((int)idx[i + 1]));
+            triC.Add(Local((int)idx[i + 2]));
+        }
+        if (triA.Count == 0) return null;
+        return GenerateFromTriangles(localVerts.ToArray(), triA, triB, triC, maxResolution);
+    }
+
+    /// <summary>Core: builds a dense SDF from a triangle index list over <paramref name="verts"/>.</summary>
+    static MeshSdf GenerateFromTriangles(Vector3[] verts, List<int> triA, List<int> triB, List<int> triC,
+        int maxResolution) {
         int triCount = triA.Count;
         if (triCount == 0)
             return null;
