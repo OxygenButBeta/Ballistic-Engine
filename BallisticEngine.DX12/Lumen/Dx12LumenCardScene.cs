@@ -191,6 +191,22 @@ public sealed class Dx12LumenCardScene : IDisposable {
     bool lightBuilt;
     bool loggedLight;
 
+    // FAZ 10 — surface-cache lighting AMORTIZATION (UE LumenSceneLighting DirectLighting.UpdateFactor). Relighting the
+    // WHOLE 2048² atlas every frame cost ~208ms on Bistro (90% of the GI frame) — the per-texel O(PageCount=1878) page
+    // scan × 4.2M texels dominated. Instead we relight 1/UpdateFactor of the pages per frame in a rolling round-robin
+    // (lightPageCursor), so each page refreshes every ~UpdateFactor frames. Direct lighting on a static/slow scene is
+    // effectively unchanged frame-to-frame, so this is correct (it's exactly UE's amortization) — and the new dispatch
+    // is page-indexed (group.z = page) so there is NO scan at all. Door: BALLISTIC_DX12_LUMEN_LIGHT_UPDATEFACTOR
+    // (default 16; 1 = relight all pages every frame = old behaviour, for A/B).
+    int lightPageCursor;
+    static int lightUpdateFactor = -1;
+    static int LightUpdateFactor() {
+        if (lightUpdateFactor < 0)
+            lightUpdateFactor = int.TryParse(Environment.GetEnvironmentVariable("BALLISTIC_DX12_LUMEN_LIGHT_UPDATEFACTOR"),
+                out int v) && v >= 1 ? v : 16;
+        return lightUpdateFactor;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     struct LumenLightConstants {
         public Vector3 SunDir;   public float SunBias;
@@ -200,6 +216,10 @@ public sealed class Dx12LumenCardScene : IDisposable {
         public float FinalValid; public uint FrameIndex; public float SkyIntensity, UseSky;
         public uint AlbedoSrvIdx, NormalSrvIdx, EmissiveSrvIdx, DepthSrvIdx;
         public uint DirectUavIdx, FinalReadSrvIdx, FinalWriteUavIdx, Pad0;
+        // FAZ 10 — page-indexed amortized dispatch: this frame relights pages [PageBegin, PageBegin+PageUpdateCount).
+        // PhysicalPageSize = page edge in texels (dispatch maps group.z → page-in-window, group.xy → texel-in-page;
+        // NO per-texel O(PageCount) scan). Over ceil(PageCount/PageUpdateCount) frames every page is refreshed.
+        public uint PageBegin, PageUpdateCount, PhysicalPageSizeC, Pad1;
     }
 
     // ---- per-instance card range root SRV (built alongside the card/page buffers) ----
@@ -696,6 +716,24 @@ public sealed class Dx12LumenCardScene : IDisposable {
         float indirectRays = EnvF("BALLISTIC_DX12_LUMEN_INDIRECT_RAYS", 4f);
         float indirectIntensity = EnvF("BALLISTIC_DX12_LUMEN_INDIRECT_INTENSITY", 1f);
 
+        // FAZ 10 — pick this frame's page-update WINDOW (round-robin). updateFactor=N → ceil(PageCount/N) pages/frame,
+        // so every page refreshes within N frames. The cursor rolls and wraps; on wrap it restarts at 0 (the whole set
+        // is covered, then repeats). updateFactor=1 → the whole atlas every frame (old behaviour). Under a deterministic
+        // capture we relight ALL pages every frame (window = full) so a fixed golden frame is independent of the cursor
+        // phase — amortization is a perf optimization, not a correctness one, and the golden must stay reproducible.
+        int updateFactor = ctx.DeterministicCapture ? 1 : LightUpdateFactor();
+        int pageUpdateCount = Math.Max(1, (PageCount + updateFactor - 1) / updateFactor);
+        int pageBegin;
+        if (updateFactor <= 1 || pageUpdateCount >= PageCount) { pageBegin = 0; pageUpdateCount = PageCount; }
+        else {
+            if (lightPageCursor >= PageCount) lightPageCursor = 0;
+            pageBegin = lightPageCursor;
+            // Clamp the window to the page count (the last window may be short); advance the cursor (wrap handled above).
+            pageUpdateCount = Math.Min(pageUpdateCount, PageCount - pageBegin);
+            lightPageCursor = pageBegin + pageUpdateCount;
+            if (lightPageCursor >= PageCount) lightPageCursor = 0;
+        }
+
         lightCb.Write(new LumenLightConstants {
             SunDir = sunDir, SunBias = 0.03f, SunColor = sunColor, LightCount = lightCount,
             AtlasSize = (uint)AtlasSize, PageCount = (uint)PageCount, CardCount = (uint)CardCount,
@@ -711,6 +749,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
             EmissiveSrvIdx = (uint)emissive.SrvBindless, DepthSrvIdx = (uint)depthA.SrvBindless,
             DirectUavIdx = (uint)directLight.UavBindless,
             FinalReadSrvIdx = (uint)finalLightRead.SrvBindless, FinalWriteUavIdx = (uint)finalLightWrite.UavBindless,
+            PageBegin = (uint)pageBegin, PageUpdateCount = (uint)pageUpdateCount, PhysicalPageSizeC = PhysicalPageSize,
         });
 
         ulong cbAddr = lightCb.Gpu;
@@ -718,7 +757,9 @@ public sealed class Dx12LumenCardScene : IDisposable {
         ulong lightsAddr = lightAddr != 0 ? lightAddr : cardBuf.GPUVirtualAddress;   // valid filler when no punctual lights
         ulong rangeAddr = rangeBuf?.GPUVirtualAddress ?? cardBuf.GPUVirtualAddress;
         Dx12DescriptorHeap bindless = Dx12Backend.BindlessHeap;
-        int groups = (AtlasSize + 7) / 8;
+        // FAZ 10 — page-indexed dispatch: group.z = page-in-window, group.xy = texel-in-page (8×8 threads). No full-atlas
+        // sweep, no per-texel page scan. (PhysicalPageSize/8) groups per page edge × pageUpdateCount pages in Z.
+        int pageGroups = (PhysicalPageSize + 7) / 8;   // 128/8 = 16
 
         dev.ExecuteSync(cl => {
             // READ atlases (Albedo/Normal/Emissive/Depth + last FinalLighting) → NonPixelShaderResource; WRITE atlases
@@ -734,6 +775,22 @@ public sealed class Dx12LumenCardScene : IDisposable {
             cl.ResourceBarrierTransition(finalLightWrite.Tex, ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
             // directLight stays UnorderedAccess (its resting state).
 
+            // FAZ 10 — AMORTIZATION COPY-FORWARD. When we relight only a PAGE WINDOW (updateFactor>1), the dispatch
+            // writes ONLY this frame's pages into finalLightWrite. But the ping-pong makes finalLightWrite next frame's
+            // READ, so the pages NOT updated this frame must still carry their last-known radiance — otherwise they'd
+            // read 2-frames-stale (alternating buffer) garbage → flicker/half-lit cards. So first COPY the whole
+            // finalLightRead (last full state) into finalLightWrite, then the dispatch overwrites the window's pages.
+            // A 2048² R11G11B10 copy is ~0.1ms — negligible vs the lighting it replaces. Skipped when the window is the
+            // full atlas (pageUpdateCount==PageCount → every page rewritten anyway, no stale pages).
+            bool copyForward = pageUpdateCount < PageCount;
+            if (copyForward) {
+                cl.ResourceBarrierTransition(finalLightRead.Tex,  ResourceStates.NonPixelShaderResource, ResourceStates.CopySource);
+                cl.ResourceBarrierTransition(finalLightWrite.Tex, ResourceStates.UnorderedAccess,        ResourceStates.CopyDest);
+                cl.CopyResource(finalLightWrite.Tex, finalLightRead.Tex);
+                cl.ResourceBarrierTransition(finalLightRead.Tex,  ResourceStates.CopySource, ResourceStates.NonPixelShaderResource);
+                cl.ResourceBarrierTransition(finalLightWrite.Tex, ResourceStates.CopyDest,   ResourceStates.UnorderedAccess);
+            }
+
             cl.SetDescriptorHeaps(bindless.Heap);
             cl.SetComputeRootSignature(lightRootSig);
             cl.SetPipelineState(lightPso);
@@ -744,7 +801,7 @@ public sealed class Dx12LumenCardScene : IDisposable {
             cl.SetComputeRootShaderResourceView(4, lightsAddr);                   // t3 Lights
             cl.SetComputeRootShaderResourceView(5, emissiveAddr);                 // t4 EmissiveLights
             cl.SetComputeRootShaderResourceView(6, rangeAddr);                    // t5 InstanceRanges
-            cl.Dispatch((uint)groups, (uint)groups, 1);
+            cl.Dispatch((uint)pageGroups, (uint)pageGroups, (uint)pageUpdateCount);
 
             // Read atlases back to UnorderedAccess (the persistent inter-pass state the debug blit + next frame expect).
             cl.ResourceBarrierTransition(albedo.Tex,    ResourceStates.NonPixelShaderResource, ResourceStates.UnorderedAccess);
@@ -766,7 +823,8 @@ public sealed class Dx12LumenCardScene : IDisposable {
             loggedLight = true;
             string line = $"[LumenLight] lit pages={PageCount} cards={CardCount} atlas={AtlasSize} " +
                           $"sun={(sunColor.LengthSquared() > 0 ? "on" : "off")} lights={lightCount} emissive={neeCount} " +
-                          $"indirectRays={indirectRays} finalValid(was)={(!finalValid)} (FAZ 3d — surface cache lit)";
+                          $"indirectRays={indirectRays} updateFactor={updateFactor} pagesPerFrame={pageUpdateCount} " +
+                          $"finalValid(was)={(!finalValid)} (FAZ 3d/10 — surface cache lit, amortized)";
             Console.WriteLine(line);
             Debugging.Log(line);
         }

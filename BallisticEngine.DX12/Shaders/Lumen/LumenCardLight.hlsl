@@ -54,6 +54,8 @@ cbuffer LumenLightConstants : register(b0) {
     // bindless reserved-tail indices (ResourceDescriptorHeap[]).
     uint AlbedoSrvIdx; uint NormalSrvIdx; uint EmissiveSrvIdx; uint DepthSrvIdx;
     uint DirectUavIdx; uint FinalReadSrvIdx; uint FinalWriteUavIdx; uint Pad0;
+    // FAZ 10 — page-indexed amortized dispatch window: this dispatch relights pages [PageBegin, PageBegin+PageUpdateCount).
+    uint PageBegin; uint PageUpdateCount; uint PhysicalPageSizeC; uint Pad1;
 };
 SamplerState LinearClamp : register(s0);
 
@@ -149,21 +151,22 @@ float3 SampleFinalAtHit(uint instance, float3 hitPos, float3 hitNormal,
     return Sanitize(finalRead.Load(int3((int)px, (int)py, 0)).rgb);
 }
 
+// FAZ 10 — PAGE-INDEXED dispatch: group.z (= dtid.z) selects the page-in-window, dtid.xy is the texel WITHIN the
+// page. NO per-texel O(PageCount) atlas scan (that scan × 4.2M texels was 90% of the Bistro GI frame). The CPU
+// dispatches (PhysicalPageSize/8)² groups in XY × PageUpdateCount in Z, relighting only this frame's rolling page
+// window (amortized — UE LumenSceneLighting.UpdateFactor). Threads beyond a page's actual SizeX/SizeY early-out.
 [numthreads(8, 8, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID) {
-    uint px = dtid.x, py = dtid.y;
-    if (px >= AtlasSize || py >= AtlasSize) return;
-
-    // Map this atlas texel → its owning page (O(pages) scan — v1 simplification, fine for ~12 pages).
-    int page = -1;
-    [loop] for (uint p = 0; p < PageCount; p++) {
-        GpuLumenPage pg = Pages[p];
-        if (px >= pg.AtlasOffsetX && px < pg.AtlasOffsetX + pg.SizeX &&
-            py >= pg.AtlasOffsetY && py < pg.AtlasOffsetY + pg.SizeY) { page = (int)p; break; }
-    }
-    if (page < 0) return;   // not inside any page — nothing to light
+    uint pageInWindow = dtid.z;
+    if (pageInWindow >= PageUpdateCount) return;
+    uint page = PageBegin + pageInWindow;
+    if (page >= PageCount) return;
 
     GpuLumenPage pgo = Pages[page];
+    uint lx = dtid.x, ly = dtid.y;                 // texel WITHIN this page
+    if (lx >= pgo.SizeX || ly >= pgo.SizeY) return;
+    uint px = pgo.AtlasOffsetX + lx, py = pgo.AtlasOffsetY + ly;   // absolute atlas texel
+
     uint cardId = pgo.CardId;
     if (cardId >= CardCount) return;
     GpuLumenCard card = Cards[cardId];
