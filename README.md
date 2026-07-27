@@ -7,7 +7,7 @@
 ![Renderer](https://img.shields.io/badge/renderer-DX12%20%2B%20DXR-76B900)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Ballistic Engine is a solo project exploring how far a modern, real-time engine can be pushed in pure C#: a real-time-ray-traced global illumination pipeline, a GPU-driven renderer, a Unity-style editor and asset pipeline, C# hot-reload scripting, and a physics system — all written from the ground up. Its idioms deliberately mirror Unity (Entity/Behaviour, `AssetDatabase`, `.meta` files, an edit/play split) so the workflow feels familiar.
+Ballistic Engine is a solo project exploring how far a modern, real-time engine can be pushed in pure C#: a real-time-ray-traced global illumination pipeline, a GPU-driven renderer, a Unity-style editor and asset pipeline, C# hot-reload scripting, a physics system, and a server-authoritative networking stack — all written from the ground up. Its idioms deliberately mirror Unity (Entity/Behaviour, `AssetDatabase`, `.meta` files, an edit/play split) so the workflow feels familiar.
 
 > **Not a Unity project** despite what the folder name might suggest — it's a standalone engine.
 
@@ -51,9 +51,27 @@ All shots below are **live frames** straight from the editor / runtime — hardw
 - Hierarchy, asset browser (drag-and-drop), whole-scene YAML undo, and an in-editor realtime profiler.
 - **Unity-style post-processing volume framework** (`Volume` → `VolumeProfile` → `VolumeComponent`s, blended per frame).
 
-### Assets & Scripting
+### Assets
 - **Unity-style asset pipeline** — `AssetDatabase`, `.meta` GUID sidecars, and a `Library/` artifact cache. Import via AssimpNet / StbImageSharp / Magick.NET, with a `ModelImporter` that auto-binds PBR textures by filename convention, converts FBX units, and can import **Unity `.unitypackage`** scenes/prefabs.
-- **C# game scripting** — game code is any `.cs` under the project, compiled to a collectible `AssemblyLoadContext` and **hot-reloaded** (on window-focus regain or Ctrl+R), including **live reload during play**. Script exceptions are sandboxed — they never crash the engine.
+- Scenes are human-readable YAML; components are reflected automatically (public fields *and* properties), asset references serialize as GUIDs.
+
+### C# scripting
+Game code is **plain C#** — any `.cs` file under the project, exactly like Unity. No engine rebuild, no special project setup.
+
+- **Live hot reload.** Scripts compile to a **collectible `AssemblyLoadContext`** and reload on window-focus regain or `Ctrl+R`. Compile-*first*: on an error nothing changes and the message lands in the console as `Assets/…​.cs(line,col): error CSxxxx`; on success the live scene round-trips through YAML onto the new types.
+- **Reload during play** — unlike Unity, a reload does **not** stop play. Play-mode spawns and mutated values survive; lifecycle restarts on the new types. The pre-play snapshot is untouched, so *Stop* still returns to the edit scene.
+- **Sandboxed** — a script exception never crashes the engine (`ScriptGuard` catches every lifecycle dispatch, logs a portable-PDB stack, and auto-disables a callback that throws 3× in a row).
+- **Zero wiring** — a new `Behaviour` shows up in the Add-Component menu and deserializes from scenes automatically; drag a `.cs` tile onto an entity to attach it. An engine-managed `Scripts.csproj` at the project root lets any IDE open game code as a real project.
+
+### Networking & gameplay
+A from-scratch, **server-authoritative** multiplayer stack modeled on Photon Fusion / Unreal — not a wrapper around an existing library.
+
+- **Topologies:** offline / client / server / **host** (listen-server), all behind one `NetworkManager`.
+- **Ownership & authority** — `NetworkObject` carries state/input authority; `NetworkBehaviour` exposes `IsOwner` / `HasStateAuthority` / autonomous-vs-simulated-proxy and lifecycle hooks (`OnSpawned`, `OnStartServer/Client/LocalPlayer`, `NetworkTick`, `OnOwnershipChanged`, interest gained/lost).
+- **Replication via source generator** — mark a field `[Networked]` or a method `[Rpc]` and a **Roslyn generator** emits the changemask delta (de)serialization at compile time (bit-packed through `BitReader`/`BitWriter`; up to 32 networked fields per behaviour, enforced with a diagnostic).
+- **Client prediction + server reconciliation** — sequenced `NetworkInput` with a server inbox and last-processed-seq, plus reconnect tokens with a TTL.
+- **Pluggable transport** (`ITransport`): **LiteNetLib** UDP, an in-process **Loopback** (single-process host), and a **Simulated** transport that injects latency/loss for testing.
+- **Gameplay framework** — Unreal-style `Pawn` / `PlayerController` (possession model) / `PlayerState` / `GameState` on top of the netcode.
 
 ### Physics
 - **BepuPhysics 2** behind an `IPhysicsWorld` abstraction — rigidbodies, box/sphere/capsule/mesh colliders (with auto-fit), triggers, continuous collision, and `OnCollision*` / `OnTrigger*` contact events on behaviours.
@@ -75,6 +93,7 @@ The engine is fully operable **headlessly**, with a CLI (`bal`) and an MCP serve
 - **Graphics:** DirectX 12 + DXR via [Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows) (hardware ray tracing required for GI)
 - **Math & audio:** OpenTK (`OpenTK.Mathematics` + OpenAL bindings)
 - **Physics:** BepuPhysics 2
+- **Networking:** LiteNetLib (UDP transport) + a compile-time replication source generator
 - **Asset import:** AssimpNet, StbImageSharp, Magick.NET
 - **Serialization:** YamlDotNet (scenes) + System.Text.Json
 - **Editor UI:** ImGui.NET on a DX12 backend
@@ -103,23 +122,30 @@ dotnet run --project BallisticEngine.Cli -- --help
 
 ---
 
-## 📂 Project layout
+## 🏗️ Architecture
 
-The engine is a single library (`BallisticEngine.csproj`) plus thin executables, layered by strict dependency rules that are auditable by grep:
+The engine is **one library** (`BallisticEngine.csproj`) plus thin executables. The design rule is a **strict, one-directional dependency layering that is auditable by `grep`** — each layer may reference only the ones below it, and every third-party dependency is quarantined to a single folder so it can never leak into engine logic:
 
-| Project / folder | Role |
+| Layer / project | May depend on | Never touches |
+|---|---|---|
+| `Shared/`, `ToolKit/` | BCL only | everything else |
+| `Abstraction/` | `Shared` + math | GPU calls, file formats |
+| `Engine/` | `Abstraction`, `Shared` | Assimp/Stb/Magick, backend, asset I/O |
+| `BallisticEngine.DX12/` | `Engine` types, Vortice/DX12 | asset-import libraries |
+| `Physics/` | `Abstraction`, BepuPhysics | Engine internals |
+| `AssetPipeline/` | everything + Assimp/Stb/Magick | direct GPU upload |
+
+So the renderer and the physics engine are **injected implementations of abstractions** (`IPhysicsWorld`, the render backend), not hard references — the DX12 backend was swapped in for a deleted OpenGL one without touching `Engine/`. `AssetPipeline/` is the *only* place allowed to touch Assimp/Stb/Magick; `Physics/` the *only* place allowed to touch BepuPhysics; one file owns the job scheduler. Core patterns mirror Unity: **Entity / Behaviour** components, an edit/play split, `SceneBehaviour`s for scene-wide systems, and reflection-driven serialization + inspector.
+
+**Executables** are thin shells over that library:
+
+| Project | Role |
 |---|---|
-| `Abstraction/`, `Shared/`, `ToolKit/` | Engine-agnostic types and BCL-only utilities |
-| `Engine/` | Core: entities, components, scenes, rendering data, volumes, physics components |
-| `BallisticEngine.DX12/` | The DX12 + DXR backend (renderer, GI, embedded HLSL) |
-| `Physics/` | BepuPhysics 2 implementation of `IPhysicsWorld` |
-| `AssetPipeline/` | Import (Assimp / Stb / Magick), scripting compilation, Unity import |
-| `BallisticEngine.Runtime/` | Standalone player executable |
-| `BallisticEngine.Editor/` | ImGui editor executable |
+| `BallisticEngine.Runtime/` | Standalone player |
+| `BallisticEngine.Editor/` | ImGui editor |
 | `BallisticEngine.Cli/` | `bal` — the headless agent CLI |
 | `BallisticEngine.Mcp/` | MCP server bridging to the editor |
-
-The only third-party leaks are contained: `AssetPipeline/` is the sole place allowed to touch Assimp/Stb/Magick, `Physics/` the sole place allowed to touch BepuPhysics.
+| `BallisticEngine.SourceGen/` | Roslyn generator for `[Networked]`/`[Rpc]` replication |
 
 ---
 
