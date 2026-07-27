@@ -13,14 +13,34 @@ Ballistic Engine is a solo project exploring how far a modern, real-time engine 
 
 ---
 
-## 🎥 Media
+## 🖼️ Gallery
 
-<img src="https://github.com/user-attachments/assets/b0a6f0ff-ceb6-424b-92cb-0abdaebef505" width="49%" />
-<img src="https://github.com/user-attachments/assets/ee589419-5371-4b64-a08b-a24ffeb6cb74" width="49%" />
+All shots below are **live frames** straight from the editor / runtime — hardware ray-traced global illumination, no offline bake.
 
-![Screenshot](https://github.com/user-attachments/assets/816fb1af-331c-4cb8-96e8-f26593459c94)
+### Sun Temple
 
-🎬 **[Watch on YouTube](https://www.youtube.com/watch?v=6uzjT07534k)**
+![Sun Temple — the domed sanctuary, lit entirely by the sky and bounced indirect light](Docs/media/suntemple-dome-exterior.jpg)
+
+<p align="center">
+  <img src="Docs/media/suntemple-dome-interior.jpg" width="49%" />
+  <img src="Docs/media/suntemple-statue-backlit.jpg" width="49%" />
+</p>
+
+![Sun Temple — aerial view of the sanctuary](Docs/media/suntemple-aerial.jpg)
+
+### Bistro
+
+<p align="center"><img src="Docs/media/bistro-corner-cafe.jpg" width="70%" /></p>
+
+![Bistro exterior — a Parisian street at 1080p, running at ~490 FPS in the editor viewport](Docs/media/bistro-street.jpg)
+
+### The editor
+
+![The Ballistic editor — hierarchy, attribute-driven inspector, console, and a live ray-traced viewport](Docs/media/editor-overview.jpg)
+
+🎬 **[Watch it in motion on YouTube →](https://www.youtube.com/watch?v=6uzjT07534k)**
+
+<sub>Sun Temple and Bistro are open test scenes from the NVIDIA ORCA library.</sub>
 
 ---
 
