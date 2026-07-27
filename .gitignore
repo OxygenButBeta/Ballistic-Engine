@@ -5,8 +5,18 @@
 # Regenerable asset import cache
 SampleProject/Library/
 
-# Local Claude Code session settings
+# Local Claude Code session settings + private agent notes
 .claude/
+CLAUDE.md
+
+# IDE / user-specific settings (Rider)
+.idea/
+*.DotSettings.user
+
+# Stray build-artifact / archive / personal-run cruft
+bin-altcheck/
+*.rar
+run-blackhollow.ps1
 
 # ImGui editor layout persistence (per-machine)
 imgui.ini
