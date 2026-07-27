@@ -28,12 +28,6 @@ All shots below are **live frames** straight from the editor / runtime — hardw
 
 ![Sun Temple — aerial view of the sanctuary](Docs/media/suntemple-aerial.jpg)
 
-### Bistro
-
-<p align="center"><img src="Docs/media/bistro-corner-cafe.jpg" width="70%" /></p>
-
-![Bistro exterior — a Parisian street at 1080p, running at ~490 FPS in the editor viewport](Docs/media/bistro-street.jpg)
-
 ### The editor
 
 ![The Ballistic editor — hierarchy, attribute-driven inspector, console, and a live ray-traced viewport](Docs/media/editor-overview.jpg)
