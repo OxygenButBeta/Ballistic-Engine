@@ -38,8 +38,6 @@ All shots below are **live frames** straight from the editor / runtime — hardw
 
 ![The Ballistic editor — hierarchy, attribute-driven inspector, console, and a live ray-traced viewport](Docs/media/editor-overview.jpg)
 
-🎬 **[Watch it in motion on YouTube →](https://www.youtube.com/watch?v=6uzjT07534k)**
-
 <sub>Sun Temple and Bistro are open test scenes from the NVIDIA ORCA library.</sub>
 
 ---
